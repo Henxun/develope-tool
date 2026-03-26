@@ -1,0 +1,25 @@
+@import "tailwindcss";
+
+:root {
+  --background: #eff4f8;
+  --foreground: #14212b;
+  --card: rgba(255, 255, 255, 0.72);
+  --card-border: rgba(28, 55, 73, 0.18);
+  --accent: #11617d;
+}
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --font-sans: var(--font-sora);
+  --font-mono: var(--font-space-mono);
+}
+
+body {
+  background:
+    radial-gradient(circle at 8% 10%, rgba(23, 170, 199, 0.22), transparent 34%),
+    radial-gradient(circle at 92% 80%, rgba(17, 97, 125, 0.26), transparent 37%),
+    linear-gradient(165deg, #f7fbfe 0%, #eaf2f7 46%, #dde8f1 100%);
+  color: var(--foreground);
+  font-family: var(--font-sora), "Segoe UI", sans-serif;
+}

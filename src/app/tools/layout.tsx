@@ -4,7 +4,7 @@ import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { useEffect } from "react";
 import RecentTools from "@/components/recent-tools";
-import { TOOL_ITEMS, pushRecentTool } from "@/lib/tools";
+import { pushRecentTool, useVisibleTools } from "@/lib/tools";
 
 function navButtonClass(active: boolean): string {
   if (active) {
@@ -19,6 +19,7 @@ export default function ToolsLayout({
   children: React.ReactNode;
 }>) {
   const pathname = usePathname();
+  const visibleTools = useVisibleTools();
 
   useEffect(() => {
     pushRecentTool(pathname);
@@ -34,7 +35,7 @@ export default function ToolsLayout({
           <Link href="/tools" className={navButtonClass(pathname === "/tools")}>
             工具列表
           </Link>
-          {TOOL_ITEMS.map((item) => (
+          {visibleTools.map((item) => (
             <Link key={item.href} href={item.href} className={navButtonClass(pathname === item.href)}>
               {item.shortLabel}
             </Link>

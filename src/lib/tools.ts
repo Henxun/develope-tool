@@ -3,6 +3,7 @@ export type ToolItem = {
   title: string;
   shortLabel: string;
   description: string;
+  windowsOnly?: boolean;
 };
 
 export const TOOL_ITEMS: ToolItem[] = [
@@ -18,10 +19,39 @@ export const TOOL_ITEMS: ToolItem[] = [
     shortLabel: "系统/目录",
     description: "读取系统信息、扫描目录，便于调试 Tauri 命令。",
   },
+  {
+    href: "/tools/windows-migrate",
+    title: "Windows 程序迁移工具",
+    shortLabel: "程序迁移",
+    description: "迁移已安装程序到新目录，并同步注册表、快捷方式、环境变量。",
+    windowsOnly: true,
+  },
+  {
+    href: "/tools/tool-data-migrate",
+    title: "工具数据迁移",
+    shortLabel: "数据迁移",
+    description: "将如 .claude 等工具数据目录迁移到其它盘，支持软链接或环境变量。",
+    windowsOnly: true,
+  },
 ];
 
 const RECENT_TOOLS_KEY = "devtoolkit.recent-tools";
 const MAX_RECENT_TOOLS = 5;
+
+export function isWindowsPlatform(): boolean {
+  if (typeof window === "undefined") return false;
+  const source = `${window.navigator.platform} ${window.navigator.userAgent}`.toLowerCase();
+  return source.includes("win");
+}
+
+export function getVisibleTools(): ToolItem[] {
+  const windows = isWindowsPlatform();
+  return TOOL_ITEMS.filter((item) => (item.windowsOnly ? windows : true));
+}
+
+export function getDefaultVisibleTools(): ToolItem[] {
+  return TOOL_ITEMS.filter((item) => !item.windowsOnly);
+}
 
 export function getRecentToolHrefs(): string[] {
   if (typeof window === "undefined") return [];
@@ -39,7 +69,8 @@ export function getRecentToolHrefs(): string[] {
 
 export function pushRecentTool(href: string): string[] {
   if (typeof window === "undefined") return [];
-  const isKnownTool = TOOL_ITEMS.some((item) => item.href === href);
+  const visible = getVisibleTools();
+  const isKnownTool = visible.some((item) => item.href === href);
   if (!isKnownTool) return getRecentToolHrefs();
 
   const current = getRecentToolHrefs().filter((item) => item !== href);
@@ -56,3 +87,17 @@ export function pushRecentTool(href: string): string[] {
 export function findToolByHref(href: string) {
   return TOOL_ITEMS.find((item) => item.href === href);
 }
+
+function subscribeNoop(): () => void {
+  return () => {};
+}
+
+export function useIsWindowsPlatform(): boolean {
+  return useSyncExternalStore(subscribeNoop, isWindowsPlatform, () => false);
+}
+
+export function useVisibleTools(): ToolItem[] {
+  const windows = useIsWindowsPlatform();
+  return TOOL_ITEMS.filter((item) => (item.windowsOnly ? windows : true));
+}
+import { useSyncExternalStore } from "react";

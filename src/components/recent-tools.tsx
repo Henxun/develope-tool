@@ -2,7 +2,7 @@
 
 import Link from "next/link";
 import { useEffect, useState } from "react";
-import { findToolByHref, getRecentToolHrefs } from "@/lib/tools";
+import { findToolByHref, getRecentToolHrefs, useVisibleTools } from "@/lib/tools";
 
 type RecentToolsProps = {
   title?: string;
@@ -14,6 +14,7 @@ export default function RecentTools({
   emptyText = "暂无最近使用记录",
 }: RecentToolsProps) {
   const [recentHrefs, setRecentHrefs] = useState<string[]>([]);
+  const visibleToolHrefs = new Set(useVisibleTools().map((item) => item.href));
 
   useEffect(() => {
     const sync = () => setRecentHrefs(getRecentToolHrefs());
@@ -26,7 +27,10 @@ export default function RecentTools({
     };
   }, []);
 
-  const recent = recentHrefs.map((href) => findToolByHref(href)).filter((item) => item !== undefined);
+  const recent = recentHrefs
+    .filter((href) => visibleToolHrefs.has(href))
+    .map((href) => findToolByHref(href))
+    .filter((item) => item !== undefined);
 
   return (
     <div className="rounded-2xl border border-slate-200 bg-white/75 p-4">

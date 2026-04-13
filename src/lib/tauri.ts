@@ -33,3 +33,9 @@ export function archiveFilterExtension(format: string): string {
   if (format === "tar.xz") return "xz";
   return format;
 }
+
+export function isWindowsRuntime(): boolean {
+  if (typeof window === "undefined") return false;
+  const source = `${window.navigator.platform} ${window.navigator.userAgent}`.toLowerCase();
+  return source.includes("win");
+}

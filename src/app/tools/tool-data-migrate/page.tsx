@@ -31,6 +31,7 @@ type QuickPreset = {
 
 const QUICK_PRESETS: QuickPreset[] = [
   { label: ".claude", toolName: "Claude", folderName: ".claude", strategy: "both", envVarName: "CLAUDE_CONFIG_DIR" },
+  { label: ".codex", toolName: "codex", folderName: ".codex", strategy: "symlink" },
   { label: ".dotnet", toolName: "dotnet", folderName: ".dotnet", strategy: "symlink" },
   { label: ".nuget", toolName: "nuget", folderName: ".nuget", strategy: "symlink" },
   { label: ".opencode", toolName: "opencode", folderName: ".opencode", strategy: "both", envVarName: "OPENCODE_HOME" },
@@ -243,7 +244,7 @@ export default function ToolDataMigratePage() {
   return (
     <main className="rounded-3xl border border-[var(--card-border)] bg-[var(--card)] p-6 shadow-[0_24px_65px_-35px_rgba(17,97,125,0.55)] backdrop-blur-xl sm:p-8">
       <h1 className="text-3xl font-semibold tracking-tight">工具数据迁移</h1>
-      <p className="mt-3 text-sm text-slate-700">支持 `.dotnet`、`.nuget`、`.opencode`、`.rustup`、`.trae-cn` 等目录一键迁移。</p>
+      <p className="mt-3 text-sm text-slate-700">支持 `.codex`、`.dotnet`、`.nuget`、`.opencode`、`.rustup`、`.trae-cn` 等目录一键迁移。</p>
 
       <section className="mt-4 rounded-2xl border border-slate-200 bg-white/75 p-4">
         <h2 className="text-sm font-semibold">一键迁移快捷按钮</h2>

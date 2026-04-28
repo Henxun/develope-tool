@@ -120,6 +120,14 @@ export default function ToolDataMigratePage() {
   const elapsedSeconds = Math.floor((loadingTick * 350) / 1000);
   const hasLogs = useMemo(() => taskLogs.length > 0, [taskLogs.length]);
 
+  const checkLocked = async (sourceDir: string): Promise<string[]> => {
+    try {
+      return await invokeTauri<string[]>("check_directory_locked", { dirPath: sourceDir });
+    } catch {
+      return [];
+    }
+  };
+
   const executeMigration = async (payload: {
     toolName: string;
     sourceDir: string;
@@ -128,6 +136,16 @@ export default function ToolDataMigratePage() {
     envVarName: string | null;
     dryRun: boolean;
   }) => {
+    if (!payload.dryRun) {
+      const lockedFiles = await checkLocked(payload.sourceDir);
+      if (lockedFiles.length > 0) {
+        const msg = lockedFiles.length <= 5
+          ? lockedFiles.join("\n")
+          : `${lockedFiles.slice(0, 5).join("\n")}\n...及其他 ${lockedFiles.length - 5} 个文件`;
+        throw new Error(`源目录被其它进程占用，请先关闭相关程序后重试：\n${msg}`);
+      }
+    }
+
     const data = await invokeTauri<ToolDataMigrationResult>("migrate_tool_data", {
       request: payload,
     });

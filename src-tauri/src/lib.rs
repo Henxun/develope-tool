@@ -7,14 +7,13 @@ use std::{
     fs::{self, File},
     io,
     path::{Component, Path, PathBuf},
+    time::Instant,
 };
+use tauri::Emitter;
 use tar::{Archive as TarArchive, Builder as TarBuilder};
 use walkdir::WalkDir;
 use xz2::{read::XzDecoder, write::XzEncoder};
 use zip::{write::FileOptions, CompressionMethod, ZipArchive, ZipWriter};
-
-#[cfg(windows)]
-use tauri::Emitter;
 
 #[cfg(windows)]
 use windows_sys::Win32::{
@@ -132,6 +131,34 @@ struct ToolMigrationLogEvent {
     level: String,
     message: String,
     timestamp: String,
+}
+
+// ── Disk heatmap scan structures ──
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DiskNode {
+    name: String,
+    size: u64,
+    node_type: String,
+    children: Vec<DiskNode>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DiskScanResult {
+    root: DiskNode,
+    total_size: u64,
+    total_files: u64,
+    total_dirs: u64,
+    scan_duration_ms: u64,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DiskScanProgressEvent {
+    current_path: String,
+    items_scanned: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -373,6 +400,59 @@ fn detect_program_references(request: ProgramDetectRequest) -> Result<ProgramDet
     {
         detect_program_references_windows(request)
     }
+}
+
+#[tauri::command]
+fn check_directory_locked(dir_path: String) -> Result<Vec<String>, String> {
+    #[cfg(not(windows))]
+    {
+        let _ = dir_path;
+        return Err("目录占用检测仅支持 Windows 平台".to_string());
+    }
+
+    #[cfg(windows)]
+    {
+        let path = dir_path.trim();
+        if path.is_empty() {
+            return Err("路径不能为空".to_string());
+        }
+        let source = PathBuf::from(path);
+        if !source.is_absolute() {
+            return Err("路径必须是绝对路径".to_string());
+        }
+        if !source.is_dir() {
+            return Err("路径必须是目录".to_string());
+        }
+
+        check_directory_locked_windows(&source)
+    }
+}
+
+#[cfg(windows)]
+fn check_directory_locked_windows(source: &Path) -> Result<Vec<String>, String> {
+    // Try rename the directory to a temp name and back.
+    // On Windows, if ANY file or subdirectory inside is held open by another process,
+    // or if the directory itself is a working directory of a process,
+    // fs::rename will fail with PermissionDenied / SharingViolation.
+    let temp_name = source.with_extension(format!("{}.locktest", uuid_lock_test_suffix()));
+    match fs::rename(source, &temp_name) {
+        Ok(_) => {
+            let _ = fs::rename(&temp_name, source);
+            Ok(Vec::new())
+        }
+        Err(e) => {
+            Ok(vec![format!("{} (目录被占用: {})", source.display(), e)])
+        }
+    }
+}
+
+#[cfg(windows)]
+fn uuid_lock_test_suffix() -> String {
+    use std::time::SystemTime;
+    let dur = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default();
+    format!("{:x}", dur.as_millis())
 }
 
 #[tauri::command]
@@ -677,6 +757,192 @@ fn emit_tool_migration_log(window: &tauri::Window, level: &str, message: &str) {
     };
 
     let _ = window.emit("tool-data-migrate-log", payload);
+}
+
+// ── Disk heatmap scan implementation ──
+
+fn emit_disk_scan_progress(window: &tauri::Window, current_path: &str, items_scanned: u64) {
+    let payload = DiskScanProgressEvent {
+        current_path: current_path.to_string(),
+        items_scanned,
+    };
+    let _ = window.emit("disk-scan-progress", payload);
+}
+
+fn scan_directory_recursive(
+    path: &Path,
+    depth: usize,
+    max_depth: Option<usize>,
+    include_hidden: bool,
+    window: &tauri::Window,
+    items_scanned: &mut u64,
+) -> Result<DiskNode, String> {
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| path.display().to_string());
+
+    let mut dir_children: Vec<DiskNode> = Vec::new();
+    let mut file_children: Vec<DiskNode> = Vec::new();
+    let mut total_size: u64 = 0;
+    let can_recurse = max_depth.map_or(true, |max| depth < max);
+
+    if can_recurse {
+        let entries = match fs::read_dir(path) {
+            Ok(e) => e,
+            Err(_) => {
+                return Ok(DiskNode {
+                    name,
+                    size: 0,
+                    node_type: "folder".to_string(),
+                    children: vec![],
+                });
+            }
+        };
+
+        for entry in entries.filter_map(Result::ok) {
+            let file_type = match entry.file_type() {
+                Ok(ft) => ft,
+                Err(_) => continue,
+            };
+
+            // Skip symlinks to avoid cycles
+            if file_type.is_symlink() {
+                continue;
+            }
+
+            let file_name = entry.file_name().to_string_lossy().to_string();
+
+            // Skip hidden files/dirs if not included
+            if !include_hidden && file_name.starts_with('.') {
+                continue;
+            }
+
+            if file_type.is_dir() {
+                match scan_directory_recursive(
+                    &entry.path(),
+                    depth + 1,
+                    max_depth,
+                    include_hidden,
+                    window,
+                    items_scanned,
+                ) {
+                    Ok(child) => {
+                        total_size += child.size;
+                        dir_children.push(child);
+                    }
+                    Err(_) => continue,
+                }
+            } else if file_type.is_file() {
+                let file_size = match entry.metadata() {
+                    Ok(m) => m.len(),
+                    Err(_) => continue,
+                };
+                total_size += file_size;
+                let ext = entry
+                    .path()
+                    .extension()
+                    .map(|e| e.to_string_lossy().to_ascii_lowercase())
+                    .unwrap_or_default();
+                file_children.push(DiskNode {
+                    name: file_name,
+                    size: file_size,
+                    node_type: if ext.is_empty() {
+                        "other".to_string()
+                    } else {
+                        ext
+                    },
+                    children: vec![],
+                });
+            }
+
+            *items_scanned += 1;
+            if *items_scanned % 500 == 0 {
+                emit_disk_scan_progress(
+                    window,
+                    &entry.path().display().to_string(),
+                    *items_scanned,
+                );
+            }
+        }
+    }
+
+    // Sort children by size descending (largest first)
+    dir_children.sort_by(|a, b| b.size.cmp(&a.size));
+    file_children.sort_by(|a, b| b.size.cmp(&a.size));
+
+    let mut children = dir_children;
+    children.extend(file_children);
+
+    Ok(DiskNode {
+        name,
+        size: total_size,
+        node_type: "folder".to_string(),
+        children,
+    })
+}
+
+fn count_tree_items(node: &DiskNode) -> (u64, u64) {
+    let mut files: u64 = 0;
+    let mut dirs: u64 = 0;
+    for child in &node.children {
+        if child.node_type == "folder" {
+            dirs += 1;
+            let (f, d) = count_tree_items(child);
+            files += f;
+            dirs += d;
+        } else {
+            files += 1;
+        }
+    }
+    (files, dirs)
+}
+
+#[tauri::command]
+fn scan_disk_usage(
+    window: tauri::Window,
+    root_path: String,
+    max_depth: Option<usize>,
+    include_hidden: Option<bool>,
+) -> Result<DiskScanResult, String> {
+    let root = PathBuf::from(root_path.trim());
+    if root.as_os_str().is_empty() {
+        return Err("路径不能为空".to_string());
+    }
+    if !root.is_absolute() {
+        return Err("路径必须是绝对路径".to_string());
+    }
+    if !root.is_dir() {
+        return Err("路径必须是目录".to_string());
+    }
+
+    let max_depth = max_depth.filter(|&d| d > 0);
+    let include_hidden = include_hidden.unwrap_or(false);
+
+    let start = Instant::now();
+    let mut items_scanned: u64 = 0;
+
+    emit_disk_scan_progress(&window, &root.display().to_string(), 0);
+
+    let root_node = scan_directory_recursive(
+        &root,
+        0,
+        max_depth,
+        include_hidden,
+        &window,
+        &mut items_scanned,
+    )?;
+
+    let elapsed = start.elapsed();
+    let (total_files, total_dirs) = count_tree_items(&root_node);
+
+    Ok(DiskScanResult {
+        total_size: root_node.size,
+        total_files,
+        total_dirs,
+        scan_duration_ms: elapsed.as_millis() as u64,
+        root: root_node,
+    })
 }
 
 #[cfg(windows)]
@@ -1909,7 +2175,9 @@ pub fn run() {
             relaunch_as_admin,
             detect_program_references,
             migrate_installed_program,
-            migrate_tool_data
+            migrate_tool_data,
+            scan_disk_usage,
+            check_directory_locked
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

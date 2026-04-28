@@ -175,6 +175,18 @@ export default function WindowsMigrationToolPage() {
 
     setLoading(true);
     try {
+      if (!dryRun) {
+        const lockedFiles = await invokeTauri<string[]>("check_directory_locked", { dirPath: sourceDir.trim() });
+        if (lockedFiles.length > 0) {
+          const msg = lockedFiles.length <= 5
+            ? lockedFiles.join("\n")
+            : `${lockedFiles.slice(0, 5).join("\n")}\n...及其他 ${lockedFiles.length - 5} 个文件`;
+          setError(`源目录被其它进程占用，请先关闭相关程序后重试：\n${msg}`);
+          setLoading(false);
+          return;
+        }
+      }
+
       const migrationResult = await invokeTauri<ProgramMigrationResult>("migrate_installed_program", { request: payload });
       setResult(migrationResult);
     } catch (err) {

@@ -33,6 +33,12 @@ export const TOOL_ITEMS: ToolItem[] = [
     description: "将如 .claude 等工具数据目录迁移到其它盘，支持软链接或环境变量。",
     windowsOnly: true,
   },
+  {
+    href: "/tools/disk-heatmap",
+    title: "磁盘分析热力图",
+    shortLabel: "磁盘热力图",
+    description: "可视化磁盘使用分布，按文件类型着色，支持钻入查看子目录。",
+  },
 ];
 
 const RECENT_TOOLS_KEY = "devtoolkit.recent-tools";

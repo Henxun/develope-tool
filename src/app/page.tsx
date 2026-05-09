@@ -2,7 +2,9 @@
 
 import Link from "next/link";
 import RecentTools from "@/components/recent-tools";
-import { useVisibleTools } from "@/lib/tools";
+import { initPlatformDetection, useVisibleTools } from "@/lib/tools";
+
+initPlatformDetection();
 
 export default function Home() {
   const visibleTools = useVisibleTools();

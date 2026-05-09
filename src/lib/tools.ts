@@ -1,3 +1,29 @@
+"use client";
+
+import { useSyncExternalStore } from "react";
+
+let cachedIsWindows: boolean | null = null;
+
+export async function initPlatformDetection(): Promise<void> {
+  if (typeof window !== "undefined" && "__TAURI_INTERNALS__" in window) {
+    try {
+      const { platform } = await import("@tauri-apps/plugin-os");
+      const os = await platform();
+      cachedIsWindows = os === "windows";
+    } catch {
+      cachedIsWindows = detectWindowsViaBrowser();
+    }
+  } else {
+    cachedIsWindows = detectWindowsViaBrowser();
+  }
+}
+
+function detectWindowsViaBrowser(): boolean {
+  if (typeof window === "undefined") return false;
+  const source = `${window.navigator.platform} ${window.navigator.userAgent}`.toLowerCase();
+  return source.includes("win");
+}
+
 export type ToolItem = {
   href: string;
   title: string;
@@ -45,9 +71,10 @@ const RECENT_TOOLS_KEY = "devtoolkit.recent-tools";
 const MAX_RECENT_TOOLS = 5;
 
 export function isWindowsPlatform(): boolean {
-  if (typeof window === "undefined") return false;
-  const source = `${window.navigator.platform} ${window.navigator.userAgent}`.toLowerCase();
-  return source.includes("win");
+  if (cachedIsWindows !== null) {
+    return cachedIsWindows;
+  }
+  return detectWindowsViaBrowser();
 }
 
 export function getVisibleTools(): ToolItem[] {
@@ -106,4 +133,3 @@ export function useVisibleTools(): ToolItem[] {
   const windows = useIsWindowsPlatform();
   return TOOL_ITEMS.filter((item) => (item.windowsOnly ? windows : true));
 }
-import { useSyncExternalStore } from "react";

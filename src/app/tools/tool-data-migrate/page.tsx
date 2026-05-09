@@ -77,6 +77,7 @@ export default function ToolDataMigratePage() {
 
   useEffect(() => {
     let unlisten: (() => void) | undefined;
+    let closed = false;
 
     const setup = async () => {
       if (typeof window === "undefined" || !("__TAURI_INTERNALS__" in window)) return;
@@ -90,11 +91,16 @@ export default function ToolDataMigratePage() {
         const line = `[${timeLabel}] ${payload.level.toUpperCase()} ${payload.message}`;
         setTaskLogs((current) => [...current, line].slice(-120));
       });
+      if (closed && unlisten) {
+        unlisten();
+        unlisten = undefined;
+      }
     };
 
     void setup();
 
     return () => {
+      closed = true;
       if (unlisten) {
         unlisten();
       }
@@ -123,8 +129,8 @@ export default function ToolDataMigratePage() {
   const checkLocked = async (sourceDir: string): Promise<string[]> => {
     try {
       return await invokeTauri<string[]>("check_directory_locked", { dirPath: sourceDir });
-    } catch {
-      return [];
+    } catch (err) {
+      throw new Error(`check_directory_locked failed for ${sourceDir}: ${err}`);
     }
   };
 

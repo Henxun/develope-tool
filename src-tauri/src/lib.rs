@@ -2,6 +2,7 @@ use bzip2::{read::BzDecoder, write::BzEncoder, Compression as BzCompression};
 use flate2::{read::GzDecoder, write::GzEncoder, Compression as GzCompression};
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 use std::{
     env,
     fs::{self, File},
@@ -434,25 +435,22 @@ fn check_directory_locked_windows(source: &Path) -> Result<Vec<String>, String> 
     // On Windows, if ANY file or subdirectory inside is held open by another process,
     // or if the directory itself is a working directory of a process,
     // fs::rename will fail with PermissionDenied / SharingViolation.
-    let temp_name = source.with_extension(format!("{}.locktest", uuid_lock_test_suffix()));
+    let temp_name = source.with_extension(format!("{}.locktest", Uuid::new_v4()));
     match fs::rename(source, &temp_name) {
-        Ok(_) => {
-            let _ = fs::rename(&temp_name, source);
-            Ok(Vec::new())
-        }
-        Err(e) => {
-            Ok(vec![format!("{} (目录被占用: {})", source.display(), e)])
-        }
+        Ok(_) => match fs::rename(&temp_name, source) {
+            Ok(_) => Ok(Vec::new()),
+            Err(e) => Err(format!(
+                "目录锁定检测失败: 无法将临时目录从 {} 恢复到原位置 {}: {}\n\
+                恢复提示: 请手动将 {} 重命名回 {}",
+                temp_name.display(),
+                source.display(),
+                e,
+                temp_name.display(),
+                source.display()
+            )),
+        },
+        Err(e) => Ok(vec![format!("{} (目录被占用: {})", source.display(), e)]),
     }
-}
-
-#[cfg(windows)]
-fn uuid_lock_test_suffix() -> String {
-    use std::time::SystemTime;
-    let dur = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap_or_default();
-    format!("{:x}", dur.as_millis())
 }
 
 #[tauri::command]
@@ -657,7 +655,7 @@ fn migrate_tool_data_windows(
     let mut warnings = Vec::new();
 
     let mut moved = false;
-    if !request.dry_run {
+    if !request.dry_run && strategy != "env" {
         emit_tool_migration_log(window, "info", "正在迁移目录数据");
         if target.exists() {
             if !target.is_dir() {
@@ -676,16 +674,14 @@ fn migrate_tool_data_windows(
             moved = true;
         }
         emit_tool_migration_log(window, "success", "目录迁移完成");
-    } else {
+    } else if request.dry_run {
         emit_tool_migration_log(window, "info", "dry-run 模式：跳过实际移动");
     }
 
     let mut symlink_created = false;
     if strategy == "symlink" || strategy == "both" {
         emit_tool_migration_log(window, "info", "正在处理软链接步骤");
-        if request.dry_run {
-            symlink_created = true;
-        } else {
+        if !request.dry_run {
             symlink_created = create_directory_symlink(&source, &target, &mut warnings)?;
         }
         emit_tool_migration_log(
@@ -693,6 +689,8 @@ fn migrate_tool_data_windows(
             "info",
             if symlink_created {
                 "软链接已创建"
+            } else if request.dry_run {
+                "dry-run 模式：跳过软链接创建"
             } else {
                 "软链接未创建（可能已存在或权限不足）"
             },
@@ -713,9 +711,7 @@ fn migrate_tool_data_windows(
             return Err("环境变量名称不能为空".to_string());
         }
 
-        if request.dry_run {
-            env_var_updated = true;
-        } else {
+        if !request.dry_run {
             set_user_environment_var(&env_var_name, &target_str)?;
             unsafe {
                 env::set_var(&env_var_name, &target_str);
@@ -725,7 +721,11 @@ fn migrate_tool_data_windows(
         emit_tool_migration_log(
             window,
             "info",
-            &format!("环境变量处理完成: {}", env_var_name),
+            &format!(
+                "环境变量处理{}: {}",
+                if request.dry_run { "跳过(dry-run)" } else { "完成" },
+                env_var_name
+            ),
         );
     }
 

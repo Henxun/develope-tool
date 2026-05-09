@@ -44,7 +44,12 @@ jobs:
 
       - name: Get version from package.json
         id: get_version
-        run: echo "VERSION=$(node -p "require('./package.json').version")" >> $GITHUB_OUTPUT
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const pkg = JSON.parse(fs.readFileSync('./package.json', 'utf8'));
+            core.setOutput('VERSION', pkg.version);
 
       - name: Build Tauri
         uses: tauri-apps/tauri-action@v0

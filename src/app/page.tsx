@@ -1,8 +1,14 @@
+"use client";
+
 import Link from "next/link";
 import RecentTools from "@/components/recent-tools";
-import { TOOL_ITEMS } from "@/lib/tools";
+import { initPlatformDetection, useVisibleTools } from "@/lib/tools";
+
+initPlatformDetection();
 
 export default function Home() {
+  const visibleTools = useVisibleTools();
+
   return (
     <main className="mx-auto flex min-h-screen w-full max-w-5xl flex-col px-4 py-10 sm:px-8">
       <div className="rounded-3xl border border-[var(--card-border)] bg-[var(--card)] p-8 shadow-[0_24px_65px_-35px_rgba(17,97,125,0.55)] backdrop-blur-xl">
@@ -13,7 +19,7 @@ export default function Home() {
         </p>
 
         <div className="mt-7 grid grid-cols-1 gap-4 sm:grid-cols-2">
-          {TOOL_ITEMS.map((item) => (
+          {visibleTools.map((item) => (
             <Link
               key={item.href}
               href={item.href}

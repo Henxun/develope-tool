@@ -12,15 +12,17 @@
     "tauri:build": "tauri build"
   },
   "dependencies": {
+    "@nivo/treemap": "^0.99.0",
     "@tauri-apps/api": "^2.8.0",
     "@tauri-apps/plugin-dialog": "^2.4.1",
+    "@tauri-apps/plugin-os": "^2",
     "next": "16.2.1",
     "react": "19.2.4",
     "react-dom": "19.2.4"
   },
   "devDependencies": {
-    "@tauri-apps/cli": "^2.8.3",
     "@tailwindcss/postcss": "^4",
+    "@tauri-apps/cli": "^2.8.3",
     "@types/node": "^20",
     "@types/react": "^19",
     "@types/react-dom": "^19",

@@ -1,17 +1,33 @@
 use bzip2::{read::BzDecoder, write::BzEncoder, Compression as BzCompression};
 use flate2::{read::GzDecoder, write::GzEncoder, Compression as GzCompression};
 use globset::{Glob, GlobSet, GlobSetBuilder};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 use std::{
     env,
     fs::{self, File},
     io,
     path::{Component, Path, PathBuf},
+    time::Instant,
 };
+use tauri::Emitter;
 use tar::{Archive as TarArchive, Builder as TarBuilder};
 use walkdir::WalkDir;
 use xz2::{read::XzDecoder, write::XzEncoder};
 use zip::{write::FileOptions, CompressionMethod, ZipArchive, ZipWriter};
+
+#[cfg(windows)]
+use windows_sys::Win32::{
+    Foundation::{CloseHandle, HANDLE, HWND},
+    Security::{GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY},
+    System::Threading::{GetCurrentProcess, OpenProcessToken},
+    UI::{Shell::ShellExecuteW, WindowsAndMessaging::SW_SHOWNORMAL},
+};
+#[cfg(windows)]
+use winreg::{
+    enums::{HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, KEY_READ, KEY_WRITE},
+    RegKey, RegValue,
+};
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -37,6 +53,113 @@ struct ArchiveResult {
     processed_count: usize,
     skipped_count: usize,
     format: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ProgramMigrationRequest {
+    app_name: String,
+    source_dir: String,
+    target_dir: String,
+    additional_registry_keys: Vec<String>,
+    additional_shortcut_dirs: Vec<String>,
+    env_var_names: Vec<String>,
+    #[serde(default)]
+    include_machine_registry: bool,
+    dry_run: bool,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ProgramMigrationResult {
+    app_name: String,
+    source_dir: String,
+    target_dir: String,
+    moved: bool,
+    registry_updates: usize,
+    shortcut_updates: usize,
+    env_var_updates: usize,
+    warnings: Vec<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ProgramDetectRequest {
+    app_name: String,
+    source_dir: String,
+    additional_shortcut_dirs: Vec<String>,
+    env_var_names: Vec<String>,
+    include_machine_registry: bool,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ProgramDetectResult {
+    normalized_source_dir: String,
+    registry_keys: Vec<String>,
+    shortcut_files: Vec<String>,
+    env_var_matches: Vec<String>,
+    warnings: Vec<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ToolDataMigrationRequest {
+    tool_name: String,
+    source_dir: String,
+    target_dir: String,
+    strategy: String,
+    env_var_name: Option<String>,
+    dry_run: bool,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ToolDataMigrationResult {
+    tool_name: String,
+    source_dir: String,
+    target_dir: String,
+    strategy: String,
+    moved: bool,
+    symlink_created: bool,
+    env_var_updated: bool,
+    warnings: Vec<String>,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ToolMigrationLogEvent {
+    level: String,
+    message: String,
+    timestamp: String,
+}
+
+// ── Disk heatmap scan structures ──
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DiskNode {
+    name: String,
+    size: u64,
+    node_type: String,
+    children: Vec<DiskNode>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DiskScanResult {
+    root: DiskNode,
+    total_size: u64,
+    total_files: u64,
+    total_dirs: u64,
+    scan_duration_ms: u64,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DiskScanProgressEvent {
+    current_path: String,
+    items_scanned: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -224,6 +347,1486 @@ fn extract_archive(
     })
 }
 
+#[tauri::command]
+fn migrate_installed_program(
+    request: ProgramMigrationRequest,
+) -> Result<ProgramMigrationResult, String> {
+    #[cfg(not(windows))]
+    {
+        let _ = request;
+        return Err("程序迁移工具仅支持 Windows 平台".to_string());
+    }
+
+    #[cfg(windows)]
+    {
+        migrate_installed_program_windows(request)
+    }
+}
+
+#[tauri::command]
+fn is_process_elevated() -> Result<bool, String> {
+    #[cfg(not(windows))]
+    {
+        Ok(false)
+    }
+
+    #[cfg(windows)]
+    {
+        is_process_elevated_windows()
+    }
+}
+
+#[tauri::command]
+fn relaunch_as_admin() -> Result<(), String> {
+    #[cfg(not(windows))]
+    {
+        Err("仅 Windows 支持提权重启".to_string())
+    }
+
+    #[cfg(windows)]
+    {
+        relaunch_as_admin_windows()
+    }
+}
+
+#[tauri::command]
+fn detect_program_references(request: ProgramDetectRequest) -> Result<ProgramDetectResult, String> {
+    #[cfg(not(windows))]
+    {
+        let _ = request;
+        return Err("程序检测仅支持 Windows 平台".to_string());
+    }
+
+    #[cfg(windows)]
+    {
+        detect_program_references_windows(request)
+    }
+}
+
+#[tauri::command]
+fn check_directory_locked(dir_path: String) -> Result<Vec<String>, String> {
+    #[cfg(not(windows))]
+    {
+        let _ = dir_path;
+        return Err("目录占用检测仅支持 Windows 平台".to_string());
+    }
+
+    #[cfg(windows)]
+    {
+        let path = dir_path.trim();
+        if path.is_empty() {
+            return Err("路径不能为空".to_string());
+        }
+        let source = PathBuf::from(path);
+        if !source.is_absolute() {
+            return Err("路径必须是绝对路径".to_string());
+        }
+        if !source.is_dir() {
+            return Err("路径必须是目录".to_string());
+        }
+
+        check_directory_locked_windows(&source)
+    }
+}
+
+#[cfg(windows)]
+fn check_directory_locked_windows(source: &Path) -> Result<Vec<String>, String> {
+    // Try rename the directory to a temp name and back.
+    // On Windows, if ANY file or subdirectory inside is held open by another process,
+    // or if the directory itself is a working directory of a process,
+    // fs::rename will fail with PermissionDenied / SharingViolation.
+    let temp_name = source.with_extension(format!("{}.locktest", Uuid::new_v4()));
+    match fs::rename(source, &temp_name) {
+        Ok(_) => match fs::rename(&temp_name, source) {
+            Ok(_) => Ok(Vec::new()),
+            Err(e) => Err(format!(
+                "目录锁定检测失败: 无法将临时目录从 {} 恢复到原位置 {}: {}\n\
+                恢复提示: 请手动将 {} 重命名回 {}",
+                temp_name.display(),
+                source.display(),
+                e,
+                temp_name.display(),
+                source.display()
+            )),
+        },
+        Err(e) => Ok(vec![format!("{} (目录被占用: {})", source.display(), e)]),
+    }
+}
+
+#[tauri::command]
+fn migrate_tool_data(
+    window: tauri::Window,
+    request: ToolDataMigrationRequest,
+) -> Result<ToolDataMigrationResult, String> {
+    #[cfg(not(windows))]
+    {
+        let _ = window;
+        let _ = request;
+        return Err("工具数据迁移仅支持 Windows 平台".to_string());
+    }
+
+    #[cfg(windows)]
+    {
+        migrate_tool_data_windows(&window, request)
+    }
+}
+
+#[cfg(windows)]
+fn migrate_installed_program_windows(
+    request: ProgramMigrationRequest,
+) -> Result<ProgramMigrationResult, String> {
+    let app_name = sanitize_app_name(&request.app_name)?;
+    if app_name.is_empty() {
+        return Err("应用名称不能为空".to_string());
+    }
+
+    let source = normalize_existing_dir(&request.source_dir, "源目录")?;
+    let target = normalize_target_dir(&request.target_dir)?;
+    if !source.exists() {
+        return Err("源目录不存在".to_string());
+    }
+    if source == target {
+        return Err("源目录和目标目录不能相同".to_string());
+    }
+    if path_is_nested(&source, &target) || path_is_nested(&target, &source) {
+        return Err("源目录和目标目录不能互相包含".to_string());
+    }
+
+    let additional_registry_keys = request
+        .additional_registry_keys
+        .iter()
+        .map(|value| validate_registry_path(value))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    if request.include_machine_registry && !is_process_elevated_windows()? {
+        return Err("需要管理员权限才能更新 HKLM，请点击“提权并重启”后重试。".to_string());
+    }
+    let additional_shortcut_dirs = request
+        .additional_shortcut_dirs
+        .iter()
+        .map(|value| validate_optional_dir_path(value))
+        .collect::<Result<Vec<_>, _>>()?;
+    let env_var_names = request
+        .env_var_names
+        .iter()
+        .map(|value| validate_env_var_name(value))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let source_str = source.display().to_string();
+    let target_str = target.display().to_string();
+    let mut warnings = Vec::new();
+
+    let mut moved = false;
+    if !request.dry_run {
+        if target.exists() {
+            if !target.is_dir() {
+                return Err("目标路径已存在且不是目录，请更换目标路径".to_string());
+            }
+            if !is_directory_empty(&target)? {
+                return Err("目标目录已存在且非空，请先清理后重试".to_string());
+            }
+            copy_dir_recursive(&source, &target)?;
+            if !try_remove_source_dir(&source, &mut warnings)? {
+                warnings.push("文件已复制到目标目录，但原目录未能自动删除，通常是文件占用导致。请关闭相关程序后手动删除原目录。".to_string());
+            }
+            moved = true;
+        } else {
+            move_directory_with_fallback(&source, &target, &mut warnings)?;
+            moved = true;
+        }
+    }
+
+    let registry_updates = update_windows_registry(
+        &app_name,
+        &source_str,
+        &target_str,
+        &additional_registry_keys,
+        request.include_machine_registry,
+        request.dry_run,
+        &mut warnings,
+    )?;
+
+    let shortcut_updates = update_windows_shortcuts(
+        &source_str,
+        &target_str,
+        &additional_shortcut_dirs,
+        request.dry_run,
+        &mut warnings,
+    )?;
+
+    let env_var_updates = update_windows_environment_vars(
+        &source_str,
+        &target_str,
+        &env_var_names,
+        request.include_machine_registry,
+        request.dry_run,
+        &mut warnings,
+    );
+
+    Ok(ProgramMigrationResult {
+        app_name,
+        source_dir: source_str,
+        target_dir: target_str,
+        moved,
+        registry_updates,
+        shortcut_updates,
+        env_var_updates,
+        warnings,
+    })
+}
+
+#[cfg(windows)]
+fn detect_program_references_windows(
+    request: ProgramDetectRequest,
+) -> Result<ProgramDetectResult, String> {
+    let source = normalize_existing_dir(&request.source_dir, "源目录")?;
+    let source_str = source.display().to_string();
+    let mut warnings = Vec::new();
+
+    let app_name = request.app_name.trim().to_string();
+    let additional_shortcut_dirs = request
+        .additional_shortcut_dirs
+        .iter()
+        .map(|value| validate_optional_dir_path(value))
+        .collect::<Result<Vec<_>, _>>()?;
+    let env_var_names = request
+        .env_var_names
+        .iter()
+        .map(|value| validate_env_var_name(value))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let registry_keys = detect_registry_related_keys(
+        &app_name,
+        &source_str,
+        request.include_machine_registry,
+        &mut warnings,
+    )?;
+    let shortcut_files =
+        detect_shortcut_files(&source_str, &additional_shortcut_dirs, &mut warnings);
+    let env_var_matches = detect_environment_var_matches(
+        &source_str,
+        &env_var_names,
+        request.include_machine_registry,
+        &mut warnings,
+    );
+
+    Ok(ProgramDetectResult {
+        normalized_source_dir: source_str,
+        registry_keys,
+        shortcut_files,
+        env_var_matches,
+        warnings,
+    })
+}
+
+#[cfg(windows)]
+fn migrate_tool_data_windows(
+    window: &tauri::Window,
+    request: ToolDataMigrationRequest,
+) -> Result<ToolDataMigrationResult, String> {
+    emit_tool_migration_log(window, "info", "开始执行工具数据迁移");
+
+    let tool_name = sanitize_app_name(&request.tool_name)?;
+    let strategy = request.strategy.trim().to_ascii_lowercase();
+    if !matches!(strategy.as_str(), "symlink" | "env" | "both") {
+        return Err("迁移策略仅支持 symlink/env/both".to_string());
+    }
+
+    let source_input = expand_windows_env_tokens(request.source_dir.trim());
+    let target_input = expand_windows_env_tokens(request.target_dir.trim());
+
+    let source = normalize_existing_dir(&source_input, "源目录")?;
+    let target = normalize_target_dir(&target_input)?;
+    if source == target {
+        return Err("源目录和目标目录不能相同".to_string());
+    }
+    if path_is_nested(&source, &target) || path_is_nested(&target, &source) {
+        return Err("源目录和目标目录不能互相包含".to_string());
+    }
+
+    emit_tool_migration_log(
+        window,
+        "info",
+        &format!("准备迁移目录: {} -> {}", source.display(), target.display()),
+    );
+
+    let source_str = source.display().to_string();
+    let target_str = target.display().to_string();
+    let mut warnings = Vec::new();
+
+    let mut moved = false;
+    if !request.dry_run && strategy != "env" {
+        emit_tool_migration_log(window, "info", "正在迁移目录数据");
+        if target.exists() {
+            if !target.is_dir() {
+                return Err("目标路径已存在且不是目录".to_string());
+            }
+            if !is_directory_empty(&target)? {
+                return Err("目标目录已存在且非空，请更换目标目录".to_string());
+            }
+            copy_dir_recursive(&source, &target)?;
+            if !try_remove_source_dir(&source, &mut warnings)? {
+                warnings.push("源目录未能自动删除，请手动清理。".to_string());
+            }
+            moved = true;
+        } else {
+            move_directory_with_fallback(&source, &target, &mut warnings)?;
+            moved = true;
+        }
+        emit_tool_migration_log(window, "success", "目录迁移完成");
+    } else if request.dry_run {
+        emit_tool_migration_log(window, "info", "dry-run 模式：跳过实际移动");
+    }
+
+    let mut symlink_created = false;
+    if strategy == "symlink" || strategy == "both" {
+        emit_tool_migration_log(window, "info", "正在处理软链接步骤");
+        if !request.dry_run {
+            symlink_created = create_directory_symlink(&source, &target, &mut warnings)?;
+        }
+        emit_tool_migration_log(
+            window,
+            "info",
+            if symlink_created {
+                "软链接已创建"
+            } else if request.dry_run {
+                "dry-run 模式：跳过软链接创建"
+            } else {
+                "软链接未创建（可能已存在或权限不足）"
+            },
+        );
+    }
+
+    let mut env_var_updated = false;
+    if strategy == "env" || strategy == "both" {
+        emit_tool_migration_log(window, "info", "正在处理环境变量步骤");
+        let env_var_name = request
+            .env_var_name
+            .as_deref()
+            .unwrap_or("CLAUDE_CONFIG_DIR")
+            .trim()
+            .to_string();
+        let env_var_name = validate_env_var_name(&env_var_name)?;
+        if env_var_name.is_empty() {
+            return Err("环境变量名称不能为空".to_string());
+        }
+
+        if !request.dry_run {
+            set_user_environment_var(&env_var_name, &target_str)?;
+            unsafe {
+                env::set_var(&env_var_name, &target_str);
+            }
+            env_var_updated = true;
+        }
+        emit_tool_migration_log(
+            window,
+            "info",
+            &format!(
+                "环境变量处理{}: {}",
+                if request.dry_run { "跳过(dry-run)" } else { "完成" },
+                env_var_name
+            ),
+        );
+    }
+
+    emit_tool_migration_log(window, "success", "工具数据迁移任务完成");
+
+    Ok(ToolDataMigrationResult {
+        tool_name,
+        source_dir: source_str,
+        target_dir: target_str,
+        strategy,
+        moved,
+        symlink_created,
+        env_var_updated,
+        warnings,
+    })
+}
+
+#[cfg(windows)]
+fn emit_tool_migration_log(window: &tauri::Window, level: &str, message: &str) {
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|value| value.as_secs().to_string())
+        .unwrap_or_else(|_| "0".to_string());
+
+    let payload = ToolMigrationLogEvent {
+        level: level.to_string(),
+        message: message.to_string(),
+        timestamp,
+    };
+
+    let _ = window.emit("tool-data-migrate-log", payload);
+}
+
+// ── Disk heatmap scan implementation ──
+
+fn emit_disk_scan_progress(window: &tauri::Window, current_path: &str, items_scanned: u64) {
+    let payload = DiskScanProgressEvent {
+        current_path: current_path.to_string(),
+        items_scanned,
+    };
+    let _ = window.emit("disk-scan-progress", payload);
+}
+
+fn scan_directory_recursive(
+    path: &Path,
+    depth: usize,
+    max_depth: Option<usize>,
+    include_hidden: bool,
+    window: &tauri::Window,
+    items_scanned: &mut u64,
+) -> Result<DiskNode, String> {
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| path.display().to_string());
+
+    let mut dir_children: Vec<DiskNode> = Vec::new();
+    let mut file_children: Vec<DiskNode> = Vec::new();
+    let mut total_size: u64 = 0;
+    let can_recurse = max_depth.map_or(true, |max| depth < max);
+
+    if can_recurse {
+        let entries = match fs::read_dir(path) {
+            Ok(e) => e,
+            Err(_) => {
+                return Ok(DiskNode {
+                    name,
+                    size: 0,
+                    node_type: "folder".to_string(),
+                    children: vec![],
+                });
+            }
+        };
+
+        for entry in entries.filter_map(Result::ok) {
+            let file_type = match entry.file_type() {
+                Ok(ft) => ft,
+                Err(_) => continue,
+            };
+
+            // Skip symlinks to avoid cycles
+            if file_type.is_symlink() {
+                continue;
+            }
+
+            let file_name = entry.file_name().to_string_lossy().to_string();
+
+            // Skip hidden files/dirs if not included
+            if !include_hidden && file_name.starts_with('.') {
+                continue;
+            }
+
+            if file_type.is_dir() {
+                match scan_directory_recursive(
+                    &entry.path(),
+                    depth + 1,
+                    max_depth,
+                    include_hidden,
+                    window,
+                    items_scanned,
+                ) {
+                    Ok(child) => {
+                        total_size += child.size;
+                        dir_children.push(child);
+                    }
+                    Err(_) => continue,
+                }
+            } else if file_type.is_file() {
+                let file_size = match entry.metadata() {
+                    Ok(m) => m.len(),
+                    Err(_) => continue,
+                };
+                total_size += file_size;
+                let ext = entry
+                    .path()
+                    .extension()
+                    .map(|e| e.to_string_lossy().to_ascii_lowercase())
+                    .unwrap_or_default();
+                file_children.push(DiskNode {
+                    name: file_name,
+                    size: file_size,
+                    node_type: if ext.is_empty() {
+                        "other".to_string()
+                    } else {
+                        ext
+                    },
+                    children: vec![],
+                });
+            }
+
+            *items_scanned += 1;
+            if *items_scanned % 500 == 0 {
+                emit_disk_scan_progress(
+                    window,
+                    &entry.path().display().to_string(),
+                    *items_scanned,
+                );
+            }
+        }
+    }
+
+    // Sort children by size descending (largest first)
+    dir_children.sort_by(|a, b| b.size.cmp(&a.size));
+    file_children.sort_by(|a, b| b.size.cmp(&a.size));
+
+    let mut children = dir_children;
+    children.extend(file_children);
+
+    Ok(DiskNode {
+        name,
+        size: total_size,
+        node_type: "folder".to_string(),
+        children,
+    })
+}
+
+fn count_tree_items(node: &DiskNode) -> (u64, u64) {
+    let mut files: u64 = 0;
+    let mut dirs: u64 = 0;
+    for child in &node.children {
+        if child.node_type == "folder" {
+            dirs += 1;
+            let (f, d) = count_tree_items(child);
+            files += f;
+            dirs += d;
+        } else {
+            files += 1;
+        }
+    }
+    (files, dirs)
+}
+
+#[tauri::command]
+fn scan_disk_usage(
+    window: tauri::Window,
+    root_path: String,
+    max_depth: Option<usize>,
+    include_hidden: Option<bool>,
+) -> Result<DiskScanResult, String> {
+    let root = PathBuf::from(root_path.trim());
+    if root.as_os_str().is_empty() {
+        return Err("路径不能为空".to_string());
+    }
+    if !root.is_absolute() {
+        return Err("路径必须是绝对路径".to_string());
+    }
+    if !root.is_dir() {
+        return Err("路径必须是目录".to_string());
+    }
+
+    let max_depth = max_depth.filter(|&d| d > 0);
+    let include_hidden = include_hidden.unwrap_or(false);
+
+    let start = Instant::now();
+    let mut items_scanned: u64 = 0;
+
+    emit_disk_scan_progress(&window, &root.display().to_string(), 0);
+
+    let root_node = scan_directory_recursive(
+        &root,
+        0,
+        max_depth,
+        include_hidden,
+        &window,
+        &mut items_scanned,
+    )?;
+
+    let elapsed = start.elapsed();
+    let (total_files, total_dirs) = count_tree_items(&root_node);
+
+    Ok(DiskScanResult {
+        total_size: root_node.size,
+        total_files,
+        total_dirs,
+        scan_duration_ms: elapsed.as_millis() as u64,
+        root: root_node,
+    })
+}
+
+#[cfg(windows)]
+fn is_directory_empty(path: &Path) -> Result<bool, String> {
+    let mut entries = fs::read_dir(path).map_err(|error| format!("读取目标目录失败: {error}"))?;
+    Ok(entries.next().is_none())
+}
+
+#[cfg(windows)]
+fn sanitize_app_name(value: &str) -> Result<String, String> {
+    let app_name = value.trim();
+    if app_name.is_empty() {
+        return Err("应用名称不能为空".to_string());
+    }
+    if app_name.len() > 120 {
+        return Err("应用名称过长，请控制在 120 字符以内".to_string());
+    }
+
+    let valid = app_name
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || " _-().".contains(ch));
+    if !valid {
+        return Err("应用名称包含非法字符，仅允许字母数字和 _-(). 空格".to_string());
+    }
+
+    Ok(app_name.to_string())
+}
+
+#[cfg(windows)]
+fn normalize_existing_dir(value: &str, label: &str) -> Result<PathBuf, String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err(format!("{label}不能为空"));
+    }
+
+    let path = PathBuf::from(trimmed);
+    if !path.is_absolute() {
+        return Err(format!("{label}必须是绝对路径"));
+    }
+    let canonical = fs::canonicalize(&path).map_err(|error| format!("读取{label}失败: {error}"))?;
+    if !canonical.is_dir() {
+        return Err(format!("{label}必须是目录"));
+    }
+    Ok(canonical)
+}
+
+#[cfg(windows)]
+fn normalize_target_dir(value: &str) -> Result<PathBuf, String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err("目标目录不能为空".to_string());
+    }
+
+    let path = PathBuf::from(trimmed);
+    if !path.is_absolute() {
+        return Err("目标目录必须是绝对路径".to_string());
+    }
+    if path
+        .components()
+        .any(|component| matches!(component, Component::ParentDir))
+    {
+        return Err("目标目录不允许包含 ..".to_string());
+    }
+    Ok(path)
+}
+
+#[cfg(windows)]
+fn path_is_nested(parent: &Path, child: &Path) -> bool {
+    child.starts_with(parent)
+}
+
+#[cfg(windows)]
+fn validate_registry_path(value: &str) -> Result<String, String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Ok(String::new());
+    }
+
+    let upper = trimmed.to_ascii_uppercase();
+    let allowed_prefix = upper.starts_with("HKLM\\")
+        || upper.starts_with("HKEY_LOCAL_MACHINE\\")
+        || upper.starts_with("HKCU\\")
+        || upper.starts_with("HKEY_CURRENT_USER\\");
+    if !allowed_prefix {
+        return Err(format!("非法注册表路径: {trimmed}，仅支持 HKLM/HKCU"));
+    }
+
+    let has_illegal = trimmed
+        .chars()
+        .any(|ch| ch.is_control() || matches!(ch, '"' | '\'' | ';' | '|'));
+    if has_illegal {
+        return Err(format!("注册表路径包含非法字符: {trimmed}"));
+    }
+
+    Ok(trimmed.to_string())
+}
+
+#[cfg(windows)]
+fn validate_optional_dir_path(value: &str) -> Result<String, String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Ok(String::new());
+    }
+    let path = PathBuf::from(trimmed);
+    if !path.is_absolute() {
+        return Err(format!("附加快捷方式目录必须是绝对路径: {trimmed}"));
+    }
+    if path
+        .components()
+        .any(|component| matches!(component, Component::ParentDir))
+    {
+        return Err(format!("附加快捷方式目录包含非法段 .. : {trimmed}"));
+    }
+    Ok(trimmed.to_string())
+}
+
+#[cfg(windows)]
+fn validate_env_var_name(value: &str) -> Result<String, String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Ok(String::new());
+    }
+    let valid = trimmed
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || ch == '_');
+    if !valid {
+        return Err(format!("环境变量名非法: {trimmed}，仅支持字母数字和下划线"));
+    }
+    Ok(trimmed.to_string())
+}
+
+#[cfg(windows)]
+fn move_directory_with_fallback(
+    source: &Path,
+    target: &Path,
+    warnings: &mut Vec<String>,
+) -> Result<(), String> {
+    if let Some(parent) = target.parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent).map_err(|error| format!("创建目标目录失败: {error}"))?;
+        }
+    }
+
+    match fs::rename(source, target) {
+        Ok(_) => Ok(()),
+        Err(_) => {
+            copy_dir_recursive(source, target)?;
+            if !try_remove_source_dir(source, warnings)? {
+                warnings.push("文件已复制到目标目录，但原目录未能自动删除，通常是权限或文件锁导致。请手动删除原目录。".to_string());
+            }
+            Ok(())
+        }
+    }
+}
+
+#[cfg(windows)]
+fn copy_dir_recursive(source: &Path, target: &Path) -> Result<(), String> {
+    fs::create_dir_all(target).map_err(|error| format!("创建目录失败: {error}"))?;
+
+    for entry in fs::read_dir(source).map_err(|error| format!("读取目录失败: {error}"))? {
+        let entry = entry.map_err(|error| format!("读取目录项失败: {error}"))?;
+        let source_path = entry.path();
+        let target_path = target.join(entry.file_name());
+
+        if source_path.is_dir() {
+            copy_dir_recursive(&source_path, &target_path)?;
+        } else {
+            if let Some(parent) = target_path.parent() {
+                fs::create_dir_all(parent).map_err(|error| format!("创建目录失败: {error}"))?;
+            }
+            fs::copy(&source_path, &target_path)
+                .map_err(|error| format!("复制文件失败 ({}): {error}", source_path.display()))?;
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(windows)]
+fn try_remove_source_dir(source: &Path, warnings: &mut Vec<String>) -> Result<bool, String> {
+    match fs::remove_dir_all(source) {
+        Ok(_) => Ok(true),
+        Err(error) => {
+            if error.kind() != io::ErrorKind::PermissionDenied {
+                return Err(format!("删除原目录失败: {error}"));
+            }
+
+            if let Err(attr_error) = clear_readonly_attributes(source) {
+                warnings.push(format!("清理只读属性失败: {attr_error}"));
+            }
+
+            match fs::remove_dir_all(source) {
+                Ok(_) => Ok(true),
+                Err(retry_error) => {
+                    warnings.push(format!("删除原目录失败: {retry_error}"));
+                    Ok(false)
+                }
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+fn clear_readonly_attributes(root: &Path) -> Result<(), String> {
+    for entry in WalkDir::new(root).into_iter().filter_map(Result::ok) {
+        let path = entry.path();
+        let metadata = fs::metadata(path).map_err(|error| format!("读取文件属性失败: {error}"))?;
+        let mut permissions = metadata.permissions();
+        if permissions.readonly() {
+            permissions.set_readonly(false);
+            fs::set_permissions(path, permissions)
+                .map_err(|error| format!("设置文件属性失败: {error}"))?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn expand_windows_env_tokens(value: &str) -> String {
+    let mut result = String::new();
+    let chars = value.chars().collect::<Vec<_>>();
+    let mut idx = 0usize;
+
+    while idx < chars.len() {
+        if chars[idx] != '%' {
+            result.push(chars[idx]);
+            idx += 1;
+            continue;
+        }
+
+        let start = idx + 1;
+        let mut end = start;
+        while end < chars.len() && chars[end] != '%' {
+            end += 1;
+        }
+
+        if end >= chars.len() {
+            result.push(chars[idx]);
+            idx += 1;
+            continue;
+        }
+
+        let key = chars[start..end].iter().collect::<String>();
+        let replacement = env::var(&key).unwrap_or_else(|_| format!("%{key}%"));
+        result.push_str(&replacement);
+        idx = end + 1;
+    }
+
+    result
+}
+
+#[cfg(windows)]
+fn set_user_environment_var(name: &str, value: &str) -> Result<(), String> {
+    let key = RegKey::predef(HKEY_CURRENT_USER)
+        .open_subkey_with_flags("Environment", KEY_READ | KEY_WRITE)
+        .map_err(|error| format!("打开用户环境变量注册表失败: {error}"))?;
+
+    key.set_raw_value(
+        name,
+        &RegValue {
+            bytes: value
+                .encode_utf16()
+                .flat_map(|unit| unit.to_le_bytes())
+                .chain([0, 0])
+                .collect::<Vec<u8>>(),
+            vtype: winreg::enums::RegType::REG_EXPAND_SZ,
+        },
+    )
+    .map_err(|error| format!("写入用户环境变量失败 ({name}): {error}"))
+}
+
+#[cfg(windows)]
+fn create_directory_symlink(
+    source_path: &Path,
+    target_path: &Path,
+    warnings: &mut Vec<String>,
+) -> Result<bool, String> {
+    if source_path.exists() {
+        return Ok(false);
+    }
+
+    if let Some(parent) = source_path.parent() {
+        fs::create_dir_all(parent).map_err(|error| format!("创建软链接父目录失败: {error}"))?;
+    }
+
+    match std::os::windows::fs::symlink_dir(target_path, source_path) {
+        Ok(_) => Ok(true),
+        Err(error) => {
+            warnings.push(format!("创建目录软链接失败: {error}"));
+            Ok(false)
+        }
+    }
+}
+
+#[cfg(windows)]
+fn update_windows_registry(
+    app_name: &str,
+    source_dir: &str,
+    target_dir: &str,
+    additional_registry_keys: &[String],
+    include_machine_registry: bool,
+    dry_run: bool,
+    warnings: &mut Vec<String>,
+) -> Result<usize, String> {
+    let mut updates = 0usize;
+
+    let mut roots: Vec<(RegKey, &str)> = Vec::new();
+
+    match RegKey::predef(HKEY_CURRENT_USER).open_subkey_with_flags(
+        "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall",
+        KEY_READ,
+    ) {
+        Ok(key) => roots.push((
+            key,
+            "HKCU\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall",
+        )),
+        Err(error) => warnings.push(format!("读取用户卸载注册表失败: {error}")),
+    }
+
+    if include_machine_registry {
+        match RegKey::predef(HKEY_LOCAL_MACHINE).open_subkey_with_flags(
+            "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall",
+            KEY_READ,
+        ) {
+            Ok(key) => roots.push((
+                key,
+                "HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall",
+            )),
+            Err(error) => warnings.push(format!("读取机器卸载注册表失败: {error}")),
+        }
+    }
+
+    for (root, _) in &mut roots {
+        for subkey_name in root.enum_keys().flatten() {
+            let read_subkey = match root.open_subkey_with_flags(&subkey_name, KEY_READ) {
+                Ok(value) => value,
+                Err(_) => continue,
+            };
+
+            let display_name: String = read_subkey.get_value("DisplayName").unwrap_or_default();
+            let install_location: String =
+                read_subkey.get_value("InstallLocation").unwrap_or_default();
+            let display_icon: String = read_subkey.get_value("DisplayIcon").unwrap_or_default();
+
+            let matched = display_name
+                .to_ascii_lowercase()
+                .contains(&app_name.to_ascii_lowercase())
+                || string_contains_path_ci(&install_location, source_dir)
+                || string_contains_path_ci(&display_icon, source_dir)
+                || key_contains_source_string_values(&read_subkey, source_dir);
+
+            if !matched {
+                continue;
+            }
+
+            let writable_subkey =
+                match root.open_subkey_with_flags(&subkey_name, KEY_READ | KEY_WRITE) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        warnings.push(format!("注册表写入权限不足 ({subkey_name}): {error}"));
+                        continue;
+                    }
+                };
+
+            updates +=
+                rewrite_string_values_in_key(&writable_subkey, source_dir, target_dir, dry_run)?;
+        }
+    }
+
+    for key_path in additional_registry_keys {
+        let trimmed = key_path.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        match open_registry_key_for_write(trimmed) {
+            Ok(key) => {
+                updates += rewrite_string_values_in_key(&key, source_dir, target_dir, dry_run)?;
+            }
+            Err(error) => warnings.push(format!("自定义注册表路径处理失败 ({trimmed}): {error}")),
+        }
+    }
+
+    Ok(updates)
+}
+
+#[cfg(windows)]
+fn detect_registry_related_keys(
+    app_name: &str,
+    source_dir: &str,
+    include_machine_registry: bool,
+    warnings: &mut Vec<String>,
+) -> Result<Vec<String>, String> {
+    let mut roots: Vec<(RegKey, &str)> = Vec::new();
+    let mut results = Vec::new();
+
+    match RegKey::predef(HKEY_CURRENT_USER).open_subkey_with_flags(
+        "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall",
+        KEY_READ,
+    ) {
+        Ok(key) => roots.push((
+            key,
+            "HKCU\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall",
+        )),
+        Err(error) => warnings.push(format!("读取用户卸载注册表失败: {error}")),
+    }
+
+    if include_machine_registry {
+        match RegKey::predef(HKEY_LOCAL_MACHINE).open_subkey_with_flags(
+            "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall",
+            KEY_READ,
+        ) {
+            Ok(key) => roots.push((
+                key,
+                "HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall",
+            )),
+            Err(error) => warnings.push(format!("读取机器卸载注册表失败: {error}")),
+        }
+    }
+
+    for (root, root_path) in &mut roots {
+        for subkey_name in root.enum_keys().flatten() {
+            let read_subkey = match root.open_subkey_with_flags(&subkey_name, KEY_READ) {
+                Ok(value) => value,
+                Err(_) => continue,
+            };
+
+            let display_name: String = read_subkey.get_value("DisplayName").unwrap_or_default();
+            let install_location: String =
+                read_subkey.get_value("InstallLocation").unwrap_or_default();
+            let display_icon: String = read_subkey.get_value("DisplayIcon").unwrap_or_default();
+
+            let app_match = if app_name.trim().is_empty() {
+                false
+            } else {
+                display_name
+                    .to_ascii_lowercase()
+                    .contains(&app_name.to_ascii_lowercase())
+            };
+
+            let matched = app_match
+                || string_contains_path_ci(&install_location, source_dir)
+                || string_contains_path_ci(&display_icon, source_dir)
+                || key_contains_source_string_values(&read_subkey, source_dir);
+
+            if matched {
+                results.push(format!("{root_path}\\{subkey_name}"));
+            }
+        }
+    }
+
+    results.sort();
+    results.dedup();
+    Ok(results)
+}
+
+#[cfg(windows)]
+fn key_contains_source_string_values(key: &RegKey, source_dir: &str) -> bool {
+    key.enum_values().flatten().any(|(name, _)| {
+        let value: Result<String, _> = key.get_value(&name);
+        matches!(value, Ok(content) if string_contains_path_ci(&content, source_dir))
+    })
+}
+
+#[cfg(windows)]
+fn open_registry_key_for_write(path: &str) -> Result<RegKey, String> {
+    let upper = path.to_ascii_uppercase();
+    if let Some(rest) = upper.strip_prefix("HKLM\\") {
+        return RegKey::predef(HKEY_LOCAL_MACHINE)
+            .open_subkey_with_flags(rest, KEY_READ | KEY_WRITE)
+            .map_err(|error| error.to_string());
+    }
+    if let Some(rest) = upper.strip_prefix("HKEY_LOCAL_MACHINE\\") {
+        return RegKey::predef(HKEY_LOCAL_MACHINE)
+            .open_subkey_with_flags(rest, KEY_READ | KEY_WRITE)
+            .map_err(|error| error.to_string());
+    }
+    if let Some(rest) = upper.strip_prefix("HKCU\\") {
+        return RegKey::predef(HKEY_CURRENT_USER)
+            .open_subkey_with_flags(rest, KEY_READ | KEY_WRITE)
+            .map_err(|error| error.to_string());
+    }
+    if let Some(rest) = upper.strip_prefix("HKEY_CURRENT_USER\\") {
+        return RegKey::predef(HKEY_CURRENT_USER)
+            .open_subkey_with_flags(rest, KEY_READ | KEY_WRITE)
+            .map_err(|error| error.to_string());
+    }
+
+    Err("仅支持 HKLM/HKCU 路径".to_string())
+}
+
+#[cfg(windows)]
+fn rewrite_string_values_in_key(
+    key: &RegKey,
+    source_dir: &str,
+    target_dir: &str,
+    dry_run: bool,
+) -> Result<usize, String> {
+    let mut updates = 0usize;
+    for value_name in key.enum_values().flatten().map(|(name, _)| name) {
+        let value: Result<String, _> = key.get_value(&value_name);
+        let Ok(current) = value else { continue };
+
+        if !string_contains_path_ci(&current, source_dir) {
+            continue;
+        }
+
+        updates += 1;
+        if dry_run {
+            continue;
+        }
+
+        let replaced = replace_path_ci(&current, source_dir, target_dir);
+        key.set_value(&value_name, &replaced)
+            .map_err(|error| format!("更新注册表值失败 ({value_name}): {error}"))?;
+    }
+
+    Ok(updates)
+}
+
+#[cfg(windows)]
+fn update_windows_shortcuts(
+    source_dir: &str,
+    target_dir: &str,
+    additional_shortcut_dirs: &[String],
+    dry_run: bool,
+    warnings: &mut Vec<String>,
+) -> Result<usize, String> {
+    let affected_files = detect_shortcut_files(source_dir, additional_shortcut_dirs, warnings);
+    let affected = affected_files.len();
+
+    if affected > 0 && !dry_run {
+        warnings.push(format!(
+            "检测到 {affected} 个快捷方式引用旧路径。为降低安全风险，已禁用 PowerShell 自动改写，请手动重建或修改快捷方式到: {target_dir}"
+        ));
+    }
+
+    Ok(affected)
+}
+
+#[cfg(windows)]
+fn detect_shortcut_files(
+    source_dir: &str,
+    additional_shortcut_dirs: &[String],
+    warnings: &mut Vec<String>,
+) -> Vec<String> {
+    let mut search_dirs: Vec<String> = vec![
+        env::var("APPDATA")
+            .map(|value| format!("{value}\\Microsoft\\Windows\\Start Menu"))
+            .unwrap_or_default(),
+        env::var("PROGRAMDATA")
+            .map(|value| format!("{value}\\Microsoft\\Windows\\Start Menu"))
+            .unwrap_or_default(),
+        env::var("USERPROFILE")
+            .map(|value| format!("{value}\\Desktop"))
+            .unwrap_or_default(),
+        env::var("PUBLIC")
+            .map(|value| format!("{value}\\Desktop"))
+            .unwrap_or_default(),
+    ];
+
+    search_dirs.extend(
+        additional_shortcut_dirs
+            .iter()
+            .map(|item| item.trim().to_string())
+            .filter(|item| !item.is_empty()),
+    );
+
+    search_dirs.retain(|dir| !dir.is_empty());
+    search_dirs.sort();
+    search_dirs.dedup();
+
+    let mut files = Vec::new();
+    for dir in &search_dirs {
+        let dir_path = PathBuf::from(dir);
+        if !dir_path.exists() {
+            continue;
+        }
+
+        for entry in WalkDir::new(&dir_path)
+            .into_iter()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.path().is_file())
+        {
+            let path = entry.path();
+            let ext = path
+                .extension()
+                .map(|value| value.to_string_lossy().to_ascii_lowercase())
+                .unwrap_or_default();
+            if ext != "lnk" {
+                continue;
+            }
+
+            let bytes = match fs::read(path) {
+                Ok(value) => value,
+                Err(error) => {
+                    warnings.push(format!("读取快捷方式失败 ({}): {error}", path.display()));
+                    continue;
+                }
+            };
+
+            if shortcut_bytes_reference_source(&bytes, source_dir) {
+                files.push(path.display().to_string());
+            }
+        }
+    }
+
+    files.sort();
+    files.dedup();
+    files
+}
+
+#[cfg(windows)]
+fn shortcut_bytes_reference_source(bytes: &[u8], source_dir: &str) -> bool {
+    if source_dir.is_empty() {
+        return false;
+    }
+
+    let source_utf8 = source_dir.as_bytes();
+    if bytes
+        .windows(source_utf8.len())
+        .any(|window| window == source_utf8)
+    {
+        return true;
+    }
+
+    let source_utf16le = source_dir
+        .encode_utf16()
+        .flat_map(|value| value.to_le_bytes())
+        .collect::<Vec<u8>>();
+    if source_utf16le.is_empty() {
+        return false;
+    }
+
+    bytes
+        .windows(source_utf16le.len())
+        .any(|window| window == source_utf16le)
+}
+
+#[cfg(windows)]
+fn update_windows_environment_vars(
+    source_dir: &str,
+    target_dir: &str,
+    env_var_names: &[String],
+    include_machine_scope: bool,
+    dry_run: bool,
+    warnings: &mut Vec<String>,
+) -> usize {
+    let mut updates = 0usize;
+    let mut names = env_var_names
+        .iter()
+        .map(|item| item.trim().to_string())
+        .filter(|item| !item.is_empty())
+        .collect::<Vec<_>>();
+
+    if names.is_empty() {
+        names.push("Path".to_string());
+    }
+
+    let user_env = RegKey::predef(HKEY_CURRENT_USER)
+        .open_subkey_with_flags("Environment", KEY_READ | KEY_WRITE)
+        .ok();
+    let machine_env = if include_machine_scope {
+        RegKey::predef(HKEY_LOCAL_MACHINE)
+            .open_subkey_with_flags(
+                "SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Environment",
+                KEY_READ | KEY_WRITE,
+            )
+            .ok()
+    } else {
+        None
+    };
+
+    for name in names {
+        if let Some(key) = &user_env {
+            updates += rewrite_env_var_value(key, &name, source_dir, target_dir, dry_run, warnings);
+        }
+        if let Some(key) = &machine_env {
+            updates += rewrite_env_var_value(key, &name, source_dir, target_dir, dry_run, warnings);
+        }
+    }
+
+    updates
+}
+
+#[cfg(windows)]
+fn detect_environment_var_matches(
+    source_dir: &str,
+    env_var_names: &[String],
+    include_machine_scope: bool,
+    warnings: &mut Vec<String>,
+) -> Vec<String> {
+    let mut names = env_var_names
+        .iter()
+        .map(|item| item.trim().to_string())
+        .filter(|item| !item.is_empty())
+        .collect::<Vec<_>>();
+    if names.is_empty() {
+        names.push("Path".to_string());
+    }
+
+    let user_env = RegKey::predef(HKEY_CURRENT_USER)
+        .open_subkey_with_flags("Environment", KEY_READ)
+        .ok();
+    let machine_env = if include_machine_scope {
+        RegKey::predef(HKEY_LOCAL_MACHINE)
+            .open_subkey_with_flags(
+                "SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Environment",
+                KEY_READ,
+            )
+            .ok()
+    } else {
+        None
+    };
+
+    let mut matches = Vec::new();
+    for name in names {
+        if let Some(key) = &user_env {
+            let value: Result<String, _> = key.get_value(&name);
+            if let Ok(content) = value {
+                if string_contains_path_ci(&content, source_dir) {
+                    matches.push(format!("HKCU\\Environment\\{name}"));
+                }
+            }
+        }
+
+        if let Some(key) = &machine_env {
+            let value: Result<String, _> = key.get_value(&name);
+            if let Ok(content) = value {
+                if string_contains_path_ci(&content, source_dir) {
+                    matches.push(format!(
+                        "HKLM\\SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Environment\\{name}"
+                    ));
+                }
+            } else {
+                warnings.push(format!("读取机器环境变量失败: {name}"));
+            }
+        }
+    }
+
+    matches.sort();
+    matches.dedup();
+    matches
+}
+
+#[cfg(windows)]
+fn rewrite_env_var_value(
+    key: &RegKey,
+    name: &str,
+    source_dir: &str,
+    target_dir: &str,
+    dry_run: bool,
+    warnings: &mut Vec<String>,
+) -> usize {
+    let current: Result<String, _> = key.get_value(name);
+    let Ok(current) = current else { return 0 };
+
+    if !string_contains_path_ci(&current, source_dir) {
+        return 0;
+    }
+
+    if dry_run {
+        return 1;
+    }
+
+    let replaced = replace_path_ci(&current, source_dir, target_dir);
+    match key.set_raw_value(
+        name,
+        &RegValue {
+            bytes: replaced
+                .encode_utf16()
+                .flat_map(|value| value.to_le_bytes())
+                .chain([0, 0])
+                .collect::<Vec<u8>>(),
+            vtype: winreg::enums::RegType::REG_EXPAND_SZ,
+        },
+    ) {
+        Ok(_) => 1,
+        Err(error) => {
+            warnings.push(format!("更新环境变量失败 ({name}): {error}"));
+            0
+        }
+    }
+}
+
+#[cfg(windows)]
+fn string_contains_path_ci(text: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return false;
+    }
+    text.to_ascii_lowercase()
+        .contains(&needle.to_ascii_lowercase())
+}
+
+#[cfg(windows)]
+fn replace_path_ci(text: &str, needle: &str, replacement: &str) -> String {
+    if needle.is_empty() {
+        return text.to_string();
+    }
+
+    let text_lower = text.to_ascii_lowercase();
+    let needle_lower = needle.to_ascii_lowercase();
+
+    let mut result = String::with_capacity(text.len());
+    let mut cursor = 0usize;
+
+    while let Some(relative_pos) = text_lower[cursor..].find(&needle_lower) {
+        let start = cursor + relative_pos;
+        result.push_str(&text[cursor..start]);
+        result.push_str(replacement);
+        cursor = start + needle.len();
+    }
+
+    result.push_str(&text[cursor..]);
+    result
+}
+
+#[cfg(windows)]
+fn is_process_elevated_windows() -> Result<bool, String> {
+    let mut token: HANDLE = std::ptr::null_mut();
+    let process = unsafe { GetCurrentProcess() };
+
+    let opened = unsafe { OpenProcessToken(process, TOKEN_QUERY, &mut token as *mut HANDLE) };
+    if opened == 0 {
+        return Err("无法读取当前进程令牌".to_string());
+    }
+
+    let mut elevation = TOKEN_ELEVATION { TokenIsElevated: 0 };
+    let mut return_length: u32 = 0;
+    let result = unsafe {
+        GetTokenInformation(
+            token,
+            TokenElevation,
+            &mut elevation as *mut _ as *mut _,
+            std::mem::size_of::<TOKEN_ELEVATION>() as u32,
+            &mut return_length as *mut u32,
+        )
+    };
+
+    unsafe {
+        CloseHandle(token);
+    }
+
+    if result == 0 {
+        return Err("无法判断是否为管理员权限".to_string());
+    }
+
+    Ok(elevation.TokenIsElevated != 0)
+}
+
+#[cfg(windows)]
+fn relaunch_as_admin_windows() -> Result<(), String> {
+    if is_process_elevated_windows()? {
+        return Ok(());
+    }
+
+    let exe_path = env::current_exe().map_err(|error| format!("读取当前程序路径失败: {error}"))?;
+    let exe = exe_path.to_string_lossy().to_string();
+
+    let verb = to_wide("runas");
+    let file = to_wide(&exe);
+
+    let result = unsafe {
+        ShellExecuteW(
+            0 as HWND,
+            verb.as_ptr(),
+            file.as_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            SW_SHOWNORMAL,
+        )
+    };
+
+    if (result as isize) <= 32 {
+        return Err("提权启动被取消或失败，请以管理员身份运行后重试。".to_string());
+    }
+
+    std::process::exit(0);
+}
+
+#[cfg(windows)]
+fn to_wide(value: &str) -> Vec<u16> {
+    value.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
 fn build_exclude_set(patterns: &[String]) -> Result<GlobSet, String> {
     let mut builder = GlobSetBuilder::new();
     for raw in patterns {
@@ -231,7 +1834,8 @@ fn build_exclude_set(patterns: &[String]) -> Result<GlobSet, String> {
         if pattern.is_empty() {
             continue;
         }
-        let glob = Glob::new(pattern).map_err(|error| format!("过滤条件无效 ({pattern}): {error}"))?;
+        let glob =
+            Glob::new(pattern).map_err(|error| format!("过滤条件无效 ({pattern}): {error}"))?;
         builder.add(glob);
     }
     builder
@@ -443,7 +2047,8 @@ fn extract_zip(
         if let Some(parent) = destination.parent() {
             fs::create_dir_all(parent).map_err(|error| format!("创建目录失败: {error}"))?;
         }
-        let mut output = File::create(&destination).map_err(|error| format!("创建文件失败: {error}"))?;
+        let mut output =
+            File::create(&destination).map_err(|error| format!("创建文件失败: {error}"))?;
         io::copy(&mut entry, &mut output).map_err(|error| format!("写入文件失败: {error}"))?;
         processed += 1;
     }
@@ -565,7 +2170,14 @@ pub fn run() {
             get_system_info,
             list_directory,
             compress_archive,
-            extract_archive
+            extract_archive,
+            is_process_elevated,
+            relaunch_as_admin,
+            detect_program_references,
+            migrate_installed_program,
+            migrate_tool_data,
+            scan_disk_usage,
+            check_directory_locked
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

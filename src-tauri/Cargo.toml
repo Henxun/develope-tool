@@ -14,12 +14,25 @@ tauri-build = { version = "2", features = [] }
 
 [dependencies]
 bzip2 = "0.5"
+uuid = { version = "1", features = ["v4"] }
 flate2 = "1"
 globset = "0.4"
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 tauri = { version = "2", features = [] }
 tauri-plugin-dialog = "2"
+tauri-plugin-os = "2"
 tar = "0.4"
 walkdir = "2"
 xz2 = "0.1"
 zip = { version = "0.6", default-features = true }
+
+[target.'cfg(windows)'.dependencies]
+winreg = "0.55"
+windows-sys = { version = "0.60", features = [
+  "Win32_Foundation",
+  "Win32_Security",
+  "Win32_System_Threading",
+  "Win32_UI_Shell",
+  "Win32_UI_WindowsAndMessaging",
+] }

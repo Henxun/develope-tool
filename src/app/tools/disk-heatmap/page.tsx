@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { TreeMapHtml } from "@nivo/treemap";
 import { listen } from "@tauri-apps/api/event";
 import { invokeTauri, toSinglePath } from "@/lib/tauri";
@@ -388,7 +388,6 @@ function extractErrorMessage(error: unknown, fallback: string): string {
 interface TreemapNodeProps {
   node: ComputedNode;
   dim: boolean;
-  selected: boolean;
   ageColor: string;
   onZoomIn: (node: ComputedNode) => void;
   onContext: (event: React.MouseEvent, node: ComputedNode) => void;
@@ -396,20 +395,18 @@ interface TreemapNodeProps {
   onHoverLeave: () => void;
 }
 
-function TreemapNode({
+// Memoized so hovering one block doesn't re-render the other ~2000 blocks.
+// The hover highlight (white fill + green corners) is done purely in CSS via the
+// `.dh-block:hover` rules in globals — no React state, no re-render on mouse move.
+const TreemapNode = memo(function TreemapNode({
   node,
   dim,
-  selected,
   ageColor,
   onZoomIn,
   onContext,
   onHoverEnter,
   onHoverLeave,
 }: TreemapNodeProps) {
-  // Keep this component identity-stable across Nivo's remounts:
-  // props change → re-render; but Nivo's transition key lets it
-  // be reused rather than completely destroyed.  This avoids a
-  // fresh DOM every render which blocks the browser .
   const isFolder = node.data.nodeType === "folder";
   const color = getCategoryColor(node.data.nodeType);
   const label = node.data.name;
@@ -424,18 +421,15 @@ function TreemapNode({
   }, [node, onZoomIn]);
 
   // Cushion effect: a soft top-left highlight + bottom-right shade over the base color.
-  // Selected block goes bright white (SpaceSniffer selection look).
-  const cushion = selected
-    ? "radial-gradient(120% 120% at 30% 24%, #ffffff 0%, #f4f8ff 70%, #e8f0fb 100%)"
-    : `radial-gradient(120% 120% at 28% 22%, rgba(255,255,255,0.55) 0%, rgba(255,255,255,0) 48%), ` +
-      `linear-gradient(135deg, rgba(255,255,255,0.30) 0%, rgba(0,0,0,0.22) 100%), ${color}`;
+  const cushion =
+    `radial-gradient(120% 120% at 28% 22%, rgba(255,255,255,0.55) 0%, rgba(255,255,255,0) 48%), ` +
+    `linear-gradient(135deg, rgba(255,255,255,0.30) 0%, rgba(0,0,0,0.22) 100%), ${color}`;
 
-  const textColor = selected ? "#1f2937" : "rgba(255,255,255,0.96)";
-  const textShadow = selected ? "none" : "0 1px 2px rgba(0,0,0,0.5)";
   const fontPx = Math.min(12, Math.max(9, h * 0.16));
 
   return (
     <div
+      className="dh-block"
       style={{
         position: "absolute",
         left: node.x ?? 0,
@@ -443,11 +437,9 @@ function TreemapNode({
         width: w,
         height: h,
         backgroundImage: cushion,
-        backgroundColor: selected ? "#ffffff" : color,
+        backgroundColor: color,
         borderRadius: 2,
-        boxShadow: selected
-          ? "0 0 0 1px rgba(34,197,94,0.9), 0 2px 8px rgba(0,0,0,0.25)"
-          : "inset 0 1px 1px rgba(255,255,255,0.45), inset 0 -2px 3px rgba(0,0,0,0.22)",
+        boxShadow: "inset 0 1px 1px rgba(255,255,255,0.45), inset 0 -2px 3px rgba(0,0,0,0.22)",
         // Age accent: a thin colored edge (red = old, green = new) along top + left.
         borderTop: `2px solid ${ageColor}`,
         borderLeft: `2px solid ${ageColor}`,
@@ -466,8 +458,6 @@ function TreemapNode({
         // the view (e.g. *.mp4 in a folder with none) looks like a black void.
         opacity: dim ? 0.4 : 1,
         filter: dim ? "grayscale(0.85)" : undefined,
-        transition: "opacity 0.15s",
-        zIndex: selected ? 10 : undefined,
       }}
       onMouseEnter={() => onHoverEnter(node)}
       onMouseLeave={onHoverLeave}
@@ -475,27 +465,24 @@ function TreemapNode({
       onContextMenu={(event) => onContext(event, node)}
       title={`${label} — ${formatFileSize(node.data.size)}`}
     >
-      {/* Green corner triangles on the selected block */}
-      {selected && (
-        <>
-          <span style={cornerTriangleStyle("tl")} />
-          <span style={cornerTriangleStyle("tr")} />
-          <span style={cornerTriangleStyle("bl")} />
-          <span style={cornerTriangleStyle("br")} />
-        </>
-      )}
+      {/* Green corner triangles, shown on hover via CSS */}
+      <span className="dh-corner dh-corner-tl" />
+      <span className="dh-corner dh-corner-tr" />
+      <span className="dh-corner dh-corner-bl" />
+      <span className="dh-corner dh-corner-br" />
       {showName && (
         <span
+          className="dh-label"
           style={{
             fontSize: fontPx,
             fontWeight: 500,
-            color: textColor,
+            color: "rgba(255,255,255,0.96)",
             maxWidth: "100%",
             whiteSpace: "nowrap",
             overflow: "hidden",
             textOverflow: "ellipsis",
             lineHeight: 1.25,
-            textShadow,
+            textShadow: "0 1px 2px rgba(0,0,0,0.5)",
           }}
         >
           {label}
@@ -503,11 +490,12 @@ function TreemapNode({
       )}
       {showSize && (
         <span
+          className="dh-label"
           style={{
             fontSize: Math.max(8, fontPx - 1),
-            color: selected ? "#475569" : "rgba(255,255,255,0.88)",
+            color: "rgba(255,255,255,0.88)",
             lineHeight: 1.25,
-            textShadow,
+            textShadow: "0 1px 2px rgba(0,0,0,0.5)",
           }}
         >
           {formatFileSize(node.data.size)}
@@ -515,29 +503,7 @@ function TreemapNode({
       )}
     </div>
   );
-}
-
-// Small green corner triangle for the selected block (SpaceSniffer marker).
-function cornerTriangleStyle(corner: "tl" | "tr" | "bl" | "br"): React.CSSProperties {
-  const size = 9;
-  const green = "#22c55e";
-  const base: React.CSSProperties = {
-    position: "absolute",
-    width: 0,
-    height: 0,
-    pointerEvents: "none",
-  };
-  switch (corner) {
-    case "tl":
-      return { ...base, top: 0, left: 0, borderTop: `${size}px solid ${green}`, borderRight: `${size}px solid transparent` };
-    case "tr":
-      return { ...base, top: 0, right: 0, borderTop: `${size}px solid ${green}`, borderLeft: `${size}px solid transparent` };
-    case "bl":
-      return { ...base, bottom: 0, left: 0, borderBottom: `${size}px solid ${green}`, borderRight: `${size}px solid transparent` };
-    case "br":
-      return { ...base, bottom: 0, right: 0, borderBottom: `${size}px solid ${green}`, borderLeft: `${size}px solid transparent` };
-  }
-}
+});
 
 // ── Page component ──
 
@@ -558,12 +524,12 @@ export default function DiskHeatmapPage() {
   const [appliedFilter, setAppliedFilter] = useState("");
   const [hideNonMatching, setHideNonMatching] = useState(false);
 
-  // Selected (highlighted) node path — set on hover, SpaceSniffer-style.
-  const [selectedPath, setSelectedPath] = useState<string | null>(null);
-
   // Context menu state
   const [contextMenu, setContextMenu] = useState<ContextMenuState | null>(null);
   const [actionMessage, setActionMessage] = useState("");
+
+  // Stable no-op-ish hover-leave so nodeComponent's deps stay constant.
+  const hoverLeave = useCallback(() => setHoveredNode(null), []);
 
   // Measure the treemap container ourselves and feed explicit dimensions to the
   // non-responsive TreeMapHtml. Nivo's ResponsiveTreeMapHtml relies on an internal
@@ -641,7 +607,6 @@ export default function DiskHeatmapPage() {
     setProgress(null);
     setZoomPath([]);
     setHoveredNode(null);
-    setSelectedPath(null);
     setContextMenu(null);
     setActionMessage("");
 
@@ -845,15 +810,11 @@ export default function DiskHeatmapPage() {
         <TreemapNode
           node={node}
           dim={filterActive && !isMatch}
-          selected={selectedPath === node.data.path}
           ageColor={getAgeEdgeColor(node.data.modifiedSecs, ageRange.min, ageRange.max)}
           onZoomIn={handleZoomIn}
           onContext={handleNodeContext}
-          onHoverEnter={(n) => {
-            setHoveredNode(n);
-            setSelectedPath(n.data.path);
-          }}
-          onHoverLeave={() => setHoveredNode(null)}
+          onHoverEnter={setHoveredNode}
+          onHoverLeave={hoverLeave}
         />
       );
     },
@@ -862,12 +823,11 @@ export default function DiskHeatmapPage() {
       matchingPaths,
       filterActive,
       hideNonMatching,
-      selectedPath,
       ageRange,
       handleZoomIn,
       handleNodeContext,
       setHoveredNode,
-      setSelectedPath,
+      hoverLeave,
     ],
   );
 

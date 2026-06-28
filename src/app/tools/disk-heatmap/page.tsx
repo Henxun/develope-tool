@@ -1006,6 +1006,7 @@ export default function DiskHeatmapPage() {
               tile="squarify"
               margin={{ top: 2, right: 2, bottom: 2, left: 2 }}
               colors={() => ""}
+              onClick={(nivoNode: ComputedNode) => handleZoomIn(nivoNode)}
               nodeComponent={(props) => {
                 const node = (props as unknown as { node: ComputedNode }).node;
                 // Don't render a wrapper block for the view root — show its
@@ -1015,8 +1016,6 @@ export default function DiskHeatmapPage() {
                 if (node.data.id === currentRoot.path) {
                   return <div style={{ display: "none" }} />;
                 }
-                // Also suppress the synthetic "其它 (N 项)" leaf when it has
-                // no area assigned (Nivo assigns value 0 → won't render).
                 const isMatch = matchingPaths.has(node.data.path);
                 if (filterActive && hideNonMatching && !isMatch) {
                   return <div style={{ display: "none" }} />;

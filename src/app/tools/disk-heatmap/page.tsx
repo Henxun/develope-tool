@@ -13,6 +13,7 @@ type DiskNode = {
   path: string;
   size: number;
   nodeType: string;
+  modifiedSecs: number;
   children: DiskNode[];
 };
 
@@ -40,6 +41,7 @@ type TreemapDatum = {
   path: string;
   nodeType: string;
   size: number;
+  modifiedSecs: number;
   value?: number;
   children?: TreemapDatum[];
 };
@@ -62,18 +64,19 @@ type ContextMenuState = {
 };
 
 // ── Color mapping ──
+// Pastel palette tuned to SpaceSniffer's lighter look (soft blues/greens/etc.).
 
 const CATEGORY_COLORS: Record<string, string> = {
-  documents: "#4e79a7",
-  images: "#f28e2b",
-  video: "#e15759",
-  audio: "#76b7b2",
-  code: "#59a14f",
-  archives: "#edc948",
-  data: "#b07aa1",
-  system: "#ff9da7",
-  other: "#9c755f",
-  folder: "#bab0ac",
+  documents: "#7fa8d4",
+  images: "#f3b15b",
+  video: "#8fbce0",
+  audio: "#86cfc9",
+  code: "#8cc98a",
+  archives: "#f0db8c",
+  data: "#c79fc0",
+  system: "#f3b6bc",
+  other: "#b8a894",
+  folder: "#cfd6da",
 };
 
 const CATEGORY_LABELS: Record<string, string> = {
@@ -116,6 +119,17 @@ function getCategoryColor(nodeType: string): string {
   return CATEGORY_COLORS[getFileCategory(nodeType)] ?? CATEGORY_COLORS.other;
 }
 
+// Map a modified-time (epoch secs) to a red→green edge color, where the oldest
+// item in the scan is red and the newest is green. Used for SpaceSniffer-style
+// age accents on block edges.
+function getAgeEdgeColor(modifiedSecs: number, minSecs: number, maxSecs: number): string {
+  if (modifiedSecs <= 0 || maxSecs <= minSecs) return "rgba(0,0,0,0)";
+  const t = Math.max(0, Math.min(1, (modifiedSecs - minSecs) / (maxSecs - minSecs)));
+  // 0 (old) → red hue 0, 1 (new) → green hue 120
+  const hue = Math.round(t * 120);
+  return `hsl(${hue}, 80%, 45%)`;
+}
+
 // ── Data transformation ──
 
 // Build nested Nivo data, capped at `maxDepth` so the rendered DOM stays bounded.
@@ -127,6 +141,7 @@ function transformToNivoData(node: DiskNode, depth: number, maxDepth: number): T
     path: node.path,
     nodeType: node.nodeType,
     size: node.size,
+    modifiedSecs: node.modifiedSecs,
   };
 
   if (node.children.length === 0 || depth >= maxDepth) {
@@ -139,6 +154,22 @@ function transformToNivoData(node: DiskNode, depth: number, maxDepth: number): T
   };
 }
 
+// Min/max modified-time across all nodes, for age-edge normalization.
+function modifiedRange(node: DiskNode): { min: number; max: number } {
+  let min = Infinity;
+  let max = 0;
+  const walk = (n: DiskNode) => {
+    if (n.modifiedSecs > 0) {
+      if (n.modifiedSecs < min) min = n.modifiedSecs;
+      if (n.modifiedSecs > max) max = n.modifiedSecs;
+    }
+    n.children.forEach(walk);
+  };
+  walk(node);
+  if (!isFinite(min)) min = 0;
+  return { min, max };
+}
+
 function findChildNode(root: DiskNode, path: string[]): DiskNode | null {
   if (path.length === 0) return root;
   const child = root.children.find((c) => c.name === path[0]);
@@ -146,21 +177,75 @@ function findChildNode(root: DiskNode, path: string[]): DiskNode | null {
   return findChildNode(child, path.slice(1));
 }
 
-// Build a predicate for a name filter: glob (* / ?) → regex, otherwise substring.
-function buildNameMatcher(pattern: string): ((name: string) => boolean) | null {
-  const trimmed = pattern.trim();
-  if (!trimmed) return null;
-  if (trimmed.includes("*") || trimmed.includes("?")) {
-    const escaped = trimmed.replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*").replace(/\?/g, ".");
-    try {
-      const re = new RegExp(`^${escaped}$`, "i");
-      return (name) => re.test(name);
-    } catch {
-      return null;
+// Combined SpaceSniffer-style filter. Terms are ';'-separated and AND-combined:
+//   - name globs:  *.mp4, GOPR*, ?ello.txt   (also bare substrings, e.g. "report")
+//   - size compare: >500mb, <1gb, >=2.5GB     (units: b/kb/mb/gb/tb, default bytes)
+// Returns a predicate over a leaf (name + size), or null when the query is empty.
+type LeafPredicate = (name: string, size: number) => boolean;
+
+const SIZE_UNITS: Record<string, number> = {
+  b: 1,
+  kb: 1024,
+  mb: 1024 ** 2,
+  gb: 1024 ** 3,
+  tb: 1024 ** 4,
+};
+
+function globToRegExp(glob: string): RegExp | null {
+  const escaped = glob.replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*").replace(/\?/g, ".");
+  try {
+    return new RegExp(`^${escaped}$`, "i");
+  } catch {
+    return null;
+  }
+}
+
+function parseFilterQuery(query: string): LeafPredicate | null {
+  const terms = query
+    .split(";")
+    .map((t) => t.trim())
+    .filter(Boolean);
+  if (terms.length === 0) return null;
+
+  const predicates: LeafPredicate[] = [];
+
+  for (const term of terms) {
+    const sizeMatch = term.match(/^(>=|<=|>|<)\s*([\d.]+)\s*(b|kb|mb|gb|tb)?$/i);
+    if (sizeMatch) {
+      const [, op, numStr, unitRaw] = sizeMatch;
+      const num = parseFloat(numStr);
+      if (!isFinite(num)) continue;
+      const unit = (unitRaw ?? "b").toLowerCase();
+      const threshold = num * (SIZE_UNITS[unit] ?? 1);
+      predicates.push((_name, size) => {
+        switch (op) {
+          case ">":
+            return size > threshold;
+          case ">=":
+            return size >= threshold;
+          case "<":
+            return size < threshold;
+          case "<=":
+            return size <= threshold;
+          default:
+            return true;
+        }
+      });
+      continue;
+    }
+
+    // Name term: glob if it contains * or ?, else substring.
+    if (term.includes("*") || term.includes("?")) {
+      const re = globToRegExp(term);
+      if (re) predicates.push((name) => re.test(name));
+    } else {
+      const lower = term.toLowerCase();
+      predicates.push((name) => name.toLowerCase().includes(lower));
     }
   }
-  const lower = trimmed.toLowerCase();
-  return (name) => name.toLowerCase().includes(lower);
+
+  if (predicates.length === 0) return null;
+  return (name, size) => predicates.every((p) => p(name, size));
 }
 
 // Remove a node by path and recompute ancestor sizes (no rescan).
@@ -233,19 +318,31 @@ function extractErrorMessage(error: unknown, fallback: string): string {
 interface TreemapNodeProps {
   node: ComputedNode;
   dim: boolean;
+  selected: boolean;
+  ageColor: string;
   onZoomIn: (node: ComputedNode) => void;
   onContext: (event: React.MouseEvent, node: ComputedNode) => void;
   onHoverEnter: (node: ComputedNode) => void;
   onHoverLeave: () => void;
 }
 
-function TreemapNode({ node, dim, onZoomIn, onContext, onHoverEnter, onHoverLeave }: TreemapNodeProps) {
+function TreemapNode({
+  node,
+  dim,
+  selected,
+  ageColor,
+  onZoomIn,
+  onContext,
+  onHoverEnter,
+  onHoverLeave,
+}: TreemapNodeProps) {
   const isFolder = node.data.nodeType === "folder";
   const color = getCategoryColor(node.data.nodeType);
   const label = node.data.name;
   const w = node.width ?? 0;
   const h = node.height ?? 0;
-  const showLabel = w > 50 && h > 18;
+  const showName = w > 46 && h > 16;
+  const showSize = w > 60 && h > 30;
   const clickCountRef = useRef(0);
   const clickTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
@@ -263,9 +360,15 @@ function TreemapNode({ node, dim, onZoomIn, onContext, onHoverEnter, onHoverLeav
   }, [node, onZoomIn]);
 
   // Cushion effect: a soft top-left highlight + bottom-right shade over the base color.
-  const cushion =
-    `radial-gradient(120% 120% at 28% 22%, rgba(255,255,255,0.45) 0%, rgba(255,255,255,0) 45%), ` +
-    `linear-gradient(135deg, rgba(255,255,255,0.22) 0%, rgba(0,0,0,0.32) 100%), ${color}`;
+  // Selected block goes bright white (SpaceSniffer selection look).
+  const cushion = selected
+    ? "radial-gradient(120% 120% at 30% 24%, #ffffff 0%, #f4f8ff 70%, #e8f0fb 100%)"
+    : `radial-gradient(120% 120% at 28% 22%, rgba(255,255,255,0.55) 0%, rgba(255,255,255,0) 48%), ` +
+      `linear-gradient(135deg, rgba(255,255,255,0.30) 0%, rgba(0,0,0,0.22) 100%), ${color}`;
+
+  const textColor = selected ? "#1f2937" : "rgba(255,255,255,0.96)";
+  const textShadow = selected ? "none" : "0 1px 2px rgba(0,0,0,0.5)";
+  const fontPx = Math.min(12, Math.max(9, h * 0.16));
 
   return (
     <div
@@ -276,17 +379,27 @@ function TreemapNode({ node, dim, onZoomIn, onContext, onHoverEnter, onHoverLeav
         width: w,
         height: h,
         backgroundImage: cushion,
-        backgroundColor: color,
+        backgroundColor: selected ? "#ffffff" : color,
         borderRadius: 2,
-        boxShadow: "inset 0 1px 1px rgba(255,255,255,0.35), inset 0 -2px 3px rgba(0,0,0,0.30)",
-        border: "1px solid rgba(0,0,0,0.18)",
+        boxShadow: selected
+          ? "0 0 0 1px rgba(34,197,94,0.9), 0 2px 8px rgba(0,0,0,0.25)"
+          : "inset 0 1px 1px rgba(255,255,255,0.45), inset 0 -2px 3px rgba(0,0,0,0.22)",
+        // Age accent: a thin colored edge (red = old, green = new) along top + left.
+        borderTop: `2px solid ${ageColor}`,
+        borderLeft: `2px solid ${ageColor}`,
+        borderRight: "1px solid rgba(0,0,0,0.16)",
+        borderBottom: "1px solid rgba(0,0,0,0.16)",
         overflow: "hidden",
         cursor: isFolder ? "pointer" : "default",
         display: "flex",
-        alignItems: "flex-start",
-        padding: showLabel ? "3px 5px" : "0",
+        flexDirection: "column",
+        alignItems: "center",
+        justifyContent: "center",
+        textAlign: "center",
+        padding: "2px 4px",
         opacity: dim ? 0.16 : 1,
         transition: "opacity 0.15s",
+        zIndex: selected ? 10 : undefined,
       }}
       onMouseEnter={() => onHoverEnter(node)}
       onMouseLeave={onHoverLeave}
@@ -294,23 +407,68 @@ function TreemapNode({ node, dim, onZoomIn, onContext, onHoverEnter, onHoverLeav
       onContextMenu={(event) => onContext(event, node)}
       title={`${label} — ${formatFileSize(node.data.size)}`}
     >
-      {showLabel && (
+      {/* Green corner triangles on the selected block */}
+      {selected && (
+        <>
+          <span style={cornerTriangleStyle("tl")} />
+          <span style={cornerTriangleStyle("tr")} />
+          <span style={cornerTriangleStyle("bl")} />
+          <span style={cornerTriangleStyle("br")} />
+        </>
+      )}
+      {showName && (
         <span
           style={{
-            fontSize: Math.min(11, h * 0.4),
-            color: "rgba(255,255,255,0.95)",
+            fontSize: fontPx,
+            fontWeight: 500,
+            color: textColor,
+            maxWidth: "100%",
             whiteSpace: "nowrap",
             overflow: "hidden",
             textOverflow: "ellipsis",
-            lineHeight: 1.2,
-            textShadow: "0 1px 2px rgba(0,0,0,0.55)",
+            lineHeight: 1.25,
+            textShadow,
           }}
         >
           {label}
         </span>
       )}
+      {showSize && (
+        <span
+          style={{
+            fontSize: Math.max(8, fontPx - 1),
+            color: selected ? "#475569" : "rgba(255,255,255,0.88)",
+            lineHeight: 1.25,
+            textShadow,
+          }}
+        >
+          {formatFileSize(node.data.size)}
+        </span>
+      )}
     </div>
   );
+}
+
+// Small green corner triangle for the selected block (SpaceSniffer marker).
+function cornerTriangleStyle(corner: "tl" | "tr" | "bl" | "br"): React.CSSProperties {
+  const size = 9;
+  const green = "#22c55e";
+  const base: React.CSSProperties = {
+    position: "absolute",
+    width: 0,
+    height: 0,
+    pointerEvents: "none",
+  };
+  switch (corner) {
+    case "tl":
+      return { ...base, top: 0, left: 0, borderTop: `${size}px solid ${green}`, borderRight: `${size}px solid transparent` };
+    case "tr":
+      return { ...base, top: 0, right: 0, borderTop: `${size}px solid ${green}`, borderLeft: `${size}px solid transparent` };
+    case "bl":
+      return { ...base, bottom: 0, left: 0, borderBottom: `${size}px solid ${green}`, borderRight: `${size}px solid transparent` };
+    case "br":
+      return { ...base, bottom: 0, right: 0, borderBottom: `${size}px solid ${green}`, borderLeft: `${size}px solid transparent` };
+  }
 }
 
 // ── Page component ──
@@ -328,11 +486,13 @@ export default function DiskHeatmapPage() {
   const [viewScale, setViewScale] = useState(1);
   const [renderDepth, setRenderDepth] = useState(3);
 
-  // Filtering state
-  const [filterCategories, setFilterCategories] = useState<Set<string>>(new Set());
-  const [minSizeMb, setMinSizeMb] = useState(0);
-  const [namePattern, setNamePattern] = useState("");
+  // Filtering state — single SpaceSniffer-style combined query (e.g. "*.mp4;>500Mb").
+  const [filterQuery, setFilterQuery] = useState("");
+  const [appliedFilter, setAppliedFilter] = useState("");
   const [hideNonMatching, setHideNonMatching] = useState(false);
+
+  // Selected (highlighted) node path — set on hover, SpaceSniffer-style.
+  const [selectedPath, setSelectedPath] = useState<string | null>(null);
 
   // Context menu state
   const [contextMenu, setContextMenu] = useState<ContextMenuState | null>(null);
@@ -398,6 +558,7 @@ export default function DiskHeatmapPage() {
     setProgress(null);
     setZoomPath([]);
     setHoveredNode(null);
+    setSelectedPath(null);
     setViewScale(1);
     setContextMenu(null);
     setActionMessage("");
@@ -430,14 +591,19 @@ export default function DiskHeatmapPage() {
     return transformToNivoData(currentRoot, 0, renderDepth);
   }, [currentRoot, renderDepth]);
 
-  const minSizeBytes = minSizeMb > 0 ? minSizeMb * 1024 * 1024 : 0;
-  const filterActive = filterCategories.size > 0 || minSizeBytes > 0 || namePattern.trim() !== "";
+  // Age-edge normalization range over the current view.
+  const ageRange = useMemo(() => {
+    if (!currentRoot) return { min: 0, max: 0 };
+    return modifiedRange(currentRoot);
+  }, [currentRoot]);
+
+  const filterPredicate = useMemo(() => parseFilterQuery(appliedFilter), [appliedFilter]);
+  const filterActive = filterPredicate !== null;
 
   // Set of node paths that match the active filter (folders included if any descendant matches).
   const matchingPaths = useMemo(() => {
     const set = new Set<string>();
-    if (!filterActive || !currentRoot) return set;
-    const nameMatcher = buildNameMatcher(namePattern);
+    if (!filterPredicate || !currentRoot) return set;
     const walk = (node: DiskNode): boolean => {
       if (node.nodeType === "folder") {
         let any = false;
@@ -447,16 +613,13 @@ export default function DiskHeatmapPage() {
         if (any) set.add(node.path);
         return any;
       }
-      const catOk = filterCategories.size === 0 || filterCategories.has(getFileCategory(node.nodeType));
-      const sizeOk = node.size >= minSizeBytes;
-      const nameOk = !nameMatcher || nameMatcher(node.name);
-      const ok = catOk && sizeOk && nameOk;
+      const ok = filterPredicate(node.name, node.size);
       if (ok) set.add(node.path);
       return ok;
     };
     walk(currentRoot);
     return set;
-  }, [filterActive, currentRoot, filterCategories, minSizeBytes, namePattern]);
+  }, [filterPredicate, currentRoot]);
 
   const handleZoomIn = useCallback(
     (node: ComputedNode) => {
@@ -597,19 +760,13 @@ export default function DiskHeatmapPage() {
     setViewScale(1);
   }, [zoomPath]);
 
-  const toggleCategory = useCallback((key: string) => {
-    setFilterCategories((prev) => {
-      const next = new Set(prev);
-      if (next.has(key)) next.delete(key);
-      else next.add(key);
-      return next;
-    });
-  }, []);
+  const applyFilter = useCallback(() => {
+    setAppliedFilter(filterQuery);
+  }, [filterQuery]);
 
   const clearFilters = useCallback(() => {
-    setFilterCategories(new Set());
-    setMinSizeMb(0);
-    setNamePattern("");
+    setFilterQuery("");
+    setAppliedFilter("");
     setHideNonMatching(false);
   }, []);
 
@@ -707,29 +864,28 @@ export default function DiskHeatmapPage() {
         </div>
       </div>
 
-      {/* Filter bar */}
+      {/* Filter bar — single combined SpaceSniffer-style query */}
       {scanResult && (
-        <div className="bg-white rounded-xl border border-slate-200 p-4 space-y-3 shadow-sm">
-          <div className="flex items-center gap-3 flex-wrap">
-            <span className="text-sm font-medium text-slate-600">筛选:</span>
+        <div className="bg-white rounded-xl border border-slate-200 p-4 shadow-sm">
+          <div className="flex items-center gap-2 flex-wrap">
+            <span className="text-sm font-medium text-slate-600">Filter</span>
             <input
               type="text"
-              value={namePattern}
-              onChange={(e) => setNamePattern(e.target.value)}
-              placeholder="名称 (支持 * ?，如 *.log)"
-              className="px-3 py-1.5 rounded-lg border border-slate-300 text-sm w-52 focus:outline-none focus:ring-2 focus:ring-blue-400"
+              value={filterQuery}
+              onChange={(e) => setFilterQuery(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") applyFilter();
+              }}
+              placeholder="*.mp4;>500Mb"
+              className="flex-1 min-w-[200px] px-3 py-1.5 rounded-lg border border-slate-300 text-sm font-mono focus:outline-none focus:ring-2 focus:ring-blue-400"
             />
-            <label className="flex items-center gap-1.5 text-sm text-slate-600">
-              <span>最小大小</span>
-              <input
-                type="number"
-                min={0}
-                value={minSizeMb}
-                onChange={(e) => setMinSizeMb(Math.max(0, Number(e.target.value)))}
-                className="w-20 px-2 py-1.5 rounded-lg border border-slate-300 text-sm focus:outline-none focus:ring-2 focus:ring-blue-400"
-              />
-              <span className="text-slate-400">MB</span>
-            </label>
+            <button
+              type="button"
+              onClick={applyFilter}
+              className="px-4 py-1.5 rounded-lg bg-blue-600 hover:bg-blue-700 text-white text-sm font-medium transition-colors"
+            >
+              Filter
+            </button>
             <label className="flex items-center gap-1.5 text-sm text-slate-600 cursor-pointer">
               <input
                 type="checkbox"
@@ -742,33 +898,16 @@ export default function DiskHeatmapPage() {
             <button
               type="button"
               onClick={clearFilters}
-              className="ml-auto px-3 py-1.5 rounded-lg bg-slate-100 hover:bg-slate-200 text-xs font-medium text-slate-600 transition-colors"
+              className="px-3 py-1.5 rounded-lg bg-slate-100 hover:bg-slate-200 text-xs font-medium text-slate-600 transition-colors"
             >
-              清除筛选
+              清除
             </button>
           </div>
-          <div className="flex flex-wrap gap-2">
-            {Object.entries(CATEGORY_LABELS)
-              .filter(([key]) => key !== "folder")
-              .map(([key, label]) => {
-                const active = filterCategories.has(key);
-                return (
-                  <button
-                    key={key}
-                    type="button"
-                    onClick={() => toggleCategory(key)}
-                    className={`px-2.5 py-1 rounded-full text-xs font-medium border transition-colors ${
-                      active
-                        ? "text-white border-transparent"
-                        : "bg-white text-slate-600 border-slate-300 hover:bg-slate-50"
-                    }`}
-                    style={active ? { background: CATEGORY_COLORS[key] } : undefined}
-                  >
-                    {label}
-                  </button>
-                );
-              })}
-          </div>
+          <p className="mt-2 text-xs text-slate-400">
+            语法：名称通配 <code className="font-mono">*.mp4</code>、大小比较{" "}
+            <code className="font-mono">&gt;500Mb</code> / <code className="font-mono">&lt;1gb</code>，多个条件用{" "}
+            <code className="font-mono">;</code> 分隔（同时满足）。
+          </p>
         </div>
       )}
 
@@ -847,6 +986,23 @@ export default function DiskHeatmapPage() {
         </>
       )}
 
+      {/* Folder header strip (SpaceSniffer-style) + treemap container */}
+      {nivoData && currentRoot && (
+        <div
+          className="flex items-center justify-between rounded-t-xl px-4 py-2 text-sm font-medium"
+          style={{
+            background: "linear-gradient(180deg, #f5deb8 0%, #e9c795 100%)",
+            color: "#7a5a2a",
+            border: "1px solid #d8b67e",
+            borderBottom: "none",
+            marginBottom: "-12px",
+          }}
+        >
+          <span className="truncate">{currentRoot.name}</span>
+          <span>{formatFileSize(currentRoot.size)}</span>
+        </div>
+      )}
+
       {/* Treemap container — native wheel listener + right-click zoom-out */}
       <div
         ref={treemapRef}
@@ -883,9 +1039,14 @@ export default function DiskHeatmapPage() {
                   <TreemapNode
                     node={node}
                     dim={filterActive && !isMatch}
+                    selected={selectedPath === node.data.path}
+                    ageColor={getAgeEdgeColor(node.data.modifiedSecs, ageRange.min, ageRange.max)}
                     onZoomIn={handleZoomIn}
                     onContext={handleNodeContext}
-                    onHoverEnter={setHoveredNode}
+                    onHoverEnter={(n) => {
+                      setHoveredNode(n);
+                      setSelectedPath(n.data.path);
+                    }}
                     onHoverLeave={() => setHoveredNode(null)}
                   />
                 );

@@ -142,7 +142,7 @@ function getAgeEdgeColor(modifiedSecs: number, minSecs: number, maxSecs: number)
 //   - per-folder child cap (MAX_CHILDREN_PER_NODE): only the largest N children
 //     are kept; the remainder are folded into one synthetic "其它 (...)" leaf
 const MIN_VISIBLE_FRACTION = 0.001; // 0.1% of parent — below this is invisible anyway
-const MAX_CHILDREN_PER_NODE = 80;
+const MAX_CHILDREN_PER_NODE = 40;     // per-folder: 40×3 << 80×3 → ~64k max vs 512k
 
 function transformToNivoData(node: DiskNode, depth: number, maxDepth: number): TreemapDatum {
   const base = {
@@ -382,6 +382,10 @@ function TreemapNode({
   onHoverEnter,
   onHoverLeave,
 }: TreemapNodeProps) {
+  // Keep this component identity-stable across Nivo's remounts:
+  // props change → re-render; but Nivo's transition key lets it
+  // be reused rather than completely destroyed.  This avoids a
+  // fresh DOM every render which blocks the browser .
   const isFolder = node.data.nodeType === "folder";
   const color = getCategoryColor(node.data.nodeType);
   const label = node.data.name;
@@ -774,6 +778,49 @@ export default function DiskHeatmapPage() {
     return categories;
   }, [nivoData]);
 
+  // Stable nodeComponent ref — assigned once, never re-created on every render.
+  // This prevents Nivo from rebuilding the entire DOM when we drill in/out.
+  const nodeComponent = useCallback(
+    (props: unknown) => {
+      const node = (props as { node: ComputedNode }).node;
+      // Suppress the view-root wrapper block.
+      if (node.data.id === currentRoot?.path) {
+        return <div style={{ display: "none" }} />;
+      }
+      const isMatch = matchingPaths.has(node.data.path);
+      if (filterActive && hideNonMatching && !isMatch) {
+        return <div style={{ display: "none" }} />;
+      }
+      return (
+        <TreemapNode
+          node={node}
+          dim={filterActive && !isMatch}
+          selected={selectedPath === node.data.path}
+          ageColor={getAgeEdgeColor(node.data.modifiedSecs, ageRange.min, ageRange.max)}
+          onZoomIn={handleZoomIn}
+          onContext={handleNodeContext}
+          onHoverEnter={(n) => {
+            setHoveredNode(n);
+            setSelectedPath(n.data.path);
+          }}
+          onHoverLeave={() => setHoveredNode(null)}
+        />
+      );
+    },
+    [
+      currentRoot,
+      matchingPaths,
+      filterActive,
+      hideNonMatching,
+      selectedPath,
+      ageRange,
+      handleZoomIn,
+      handleNodeContext,
+      setHoveredNode,
+      setSelectedPath,
+    ],
+  );
+
   return (
     <div className="space-y-5">
       {/* Header */}
@@ -1007,35 +1054,7 @@ export default function DiskHeatmapPage() {
               margin={{ top: 2, right: 2, bottom: 2, left: 2 }}
               colors={() => ""}
               onClick={(nivoNode: ComputedNode) => handleZoomIn(nivoNode)}
-              nodeComponent={(props) => {
-                const node = (props as unknown as { node: ComputedNode }).node;
-                // Don't render a wrapper block for the view root — show its
-                // children directly (matching SpaceSniffer's "only children of
-                // the current folder" behaviour). The folder header strip already
-                // labels the current location.
-                if (node.data.id === currentRoot.path) {
-                  return <div style={{ display: "none" }} />;
-                }
-                const isMatch = matchingPaths.has(node.data.path);
-                if (filterActive && hideNonMatching && !isMatch) {
-                  return <div style={{ display: "none" }} />;
-                }
-                return (
-                  <TreemapNode
-                    node={node}
-                    dim={filterActive && !isMatch}
-                    selected={selectedPath === node.data.path}
-                    ageColor={getAgeEdgeColor(node.data.modifiedSecs, ageRange.min, ageRange.max)}
-                    onZoomIn={handleZoomIn}
-                    onContext={handleNodeContext}
-                    onHoverEnter={(n) => {
-                      setHoveredNode(n);
-                      setSelectedPath(n.data.path);
-                    }}
-                    onHoverLeave={() => setHoveredNode(null)}
-                  />
-                );
-              }}
+              nodeComponent={nodeComponent}
               animate={false}
             />
           </div>

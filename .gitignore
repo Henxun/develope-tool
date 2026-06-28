@@ -43,3 +43,10 @@ yarn-error.log*
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+
+# SpecKit / Claude Code
+.claude/agent-memory/
+.claude/todos/
+.smith/vault/queue/
+.smith/vault/active-workflows/
+

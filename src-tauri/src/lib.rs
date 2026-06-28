@@ -907,7 +907,7 @@ fn count_tree_items(node: &DiskNode) -> (u64, u64) {
 }
 
 #[tauri::command]
-fn scan_disk_usage(
+async fn scan_disk_usage(
     window: tauri::Window,
     root_path: String,
     max_depth: Option<usize>,
@@ -927,24 +927,33 @@ fn scan_disk_usage(
     let max_depth = max_depth.filter(|&d| d > 0);
     let include_hidden = include_hidden.unwrap_or(false);
 
-    let start = Instant::now();
-    let items_scanned = AtomicU64::new(0);
+    // Run the heavy recursive scan on a blocking thread so it never stalls the
+    // main thread / WebView event loop. A synchronous Tauri command runs on the
+    // main thread, so scanning a large drive (e.g. C:) froze the entire UI until
+    // it finished. `async` + `spawn_blocking` keeps the window responsive while
+    // progress events stream in.
+    tauri::async_runtime::spawn_blocking(move || {
+        let start = Instant::now();
+        let items_scanned = AtomicU64::new(0);
 
-    emit_disk_scan_progress(&window, &root.display().to_string(), 0);
+        emit_disk_scan_progress(&window, &root.display().to_string(), 0);
 
-    let root_node =
-        scan_directory_recursive(&root, 0, max_depth, include_hidden, &window, &items_scanned)?;
+        let root_node =
+            scan_directory_recursive(&root, 0, max_depth, include_hidden, &window, &items_scanned)?;
 
-    let elapsed = start.elapsed();
-    let (total_files, total_dirs) = count_tree_items(&root_node);
+        let elapsed = start.elapsed();
+        let (total_files, total_dirs) = count_tree_items(&root_node);
 
-    Ok(DiskScanResult {
-        total_size: root_node.size,
-        total_files,
-        total_dirs,
-        scan_duration_ms: elapsed.as_millis() as u64,
-        root: root_node,
+        Ok(DiskScanResult {
+            total_size: root_node.size,
+            total_files,
+            total_dirs,
+            scan_duration_ms: elapsed.as_millis() as u64,
+            root: root_node,
+        })
     })
+    .await
+    .map_err(|error| format!("扫描任务执行失败: {error}"))?
 }
 
 // ── Disk heatmap file actions ──

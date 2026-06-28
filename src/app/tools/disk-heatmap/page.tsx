@@ -1008,6 +1008,13 @@ export default function DiskHeatmapPage() {
               colors={() => ""}
               nodeComponent={(props) => {
                 const node = (props as unknown as { node: ComputedNode }).node;
+                // Don't render a wrapper block for the view root — show its
+                // children directly (matching SpaceSniffer's "only children of
+                // the current folder" behaviour). The folder header strip already
+                // labels the current location.
+                if (node.data.id === currentRoot.path) {
+                  return <div style={{ display: "none" }} />;
+                }
                 const isMatch = matchingPaths.has(node.data.path);
                 if (filterActive && hideNonMatching && !isMatch) {
                   return <div style={{ display: "none" }} />;

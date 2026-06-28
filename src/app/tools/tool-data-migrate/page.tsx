@@ -8,10 +8,8 @@ type ToolDataMigrationResult = {
   toolName: string;
   sourceDir: string;
   targetDir: string;
-  strategy: string;
   moved: boolean;
   symlinkCreated: boolean;
-  envVarUpdated: boolean;
   warnings: string[];
 };
 
@@ -25,18 +23,16 @@ type QuickPreset = {
   label: string;
   toolName: string;
   folderName: string;
-  strategy: "symlink" | "env" | "both";
-  envVarName?: string;
 };
 
 const QUICK_PRESETS: QuickPreset[] = [
-  { label: ".claude", toolName: "Claude", folderName: ".claude", strategy: "both", envVarName: "CLAUDE_CONFIG_DIR" },
-  { label: ".codex", toolName: "codex", folderName: ".codex", strategy: "symlink" },
-  { label: ".dotnet", toolName: "dotnet", folderName: ".dotnet", strategy: "symlink" },
-  { label: ".nuget", toolName: "nuget", folderName: ".nuget", strategy: "symlink" },
-  { label: ".opencode", toolName: "opencode", folderName: ".opencode", strategy: "both", envVarName: "OPENCODE_HOME" },
-  { label: ".rustup", toolName: "rustup", folderName: ".rustup", strategy: "both", envVarName: "RUSTUP_HOME" },
-  { label: ".trae-cn", toolName: "trae-cn", folderName: ".trae-cn", strategy: "symlink" },
+  { label: ".claude", toolName: "Claude", folderName: ".claude" },
+  { label: ".codex", toolName: "codex", folderName: ".codex" },
+  { label: ".dotnet", toolName: "dotnet", folderName: ".dotnet" },
+  { label: ".nuget", toolName: "nuget", folderName: ".nuget" },
+  { label: ".opencode", toolName: "opencode", folderName: ".opencode" },
+  { label: ".rustup", toolName: "rustup", folderName: ".rustup" },
+  { label: ".trae-cn", toolName: "trae-cn", folderName: ".trae-cn" },
 ];
 
 function extractErrorMessage(error: unknown, fallback: string): string {
@@ -62,8 +58,6 @@ export default function ToolDataMigratePage() {
   const [toolName, setToolName] = useState("Claude");
   const [sourceDir, setSourceDir] = useState("%USERPROFILE%\\.claude");
   const [targetDir, setTargetDir] = useState("D:\\tool-data\\.claude");
-  const [strategy, setStrategy] = useState("both");
-  const [envVarName, setEnvVarName] = useState("CLAUDE_CONFIG_DIR");
   const [targetRoot, setTargetRoot] = useState("D:\\tool-data");
   const [dryRun, setDryRun] = useState(true);
   const [loading, setLoading] = useState(false);
@@ -138,8 +132,6 @@ export default function ToolDataMigratePage() {
     toolName: string;
     sourceDir: string;
     targetDir: string;
-    strategy: string;
-    envVarName: string | null;
     dryRun: boolean;
   }) => {
     if (!payload.dryRun) {
@@ -197,8 +189,6 @@ export default function ToolDataMigratePage() {
     setToolName(preset.toolName);
     setSourceDir(buildPresetSource(preset.folderName));
     setTargetDir(buildPresetTarget(targetRoot, preset.folderName));
-    setStrategy(preset.strategy);
-    setEnvVarName(preset.envVarName ?? "");
   };
 
   const runQuickMigration = async (preset: QuickPreset) => {
@@ -212,8 +202,6 @@ export default function ToolDataMigratePage() {
         toolName: preset.toolName,
         sourceDir: buildPresetSource(preset.folderName),
         targetDir: buildPresetTarget(targetRoot, preset.folderName),
-        strategy: preset.strategy,
-        envVarName: preset.envVarName ?? null,
         dryRun,
       });
       applyPreset(preset);
@@ -245,8 +233,6 @@ export default function ToolDataMigratePage() {
         toolName: toolName.trim(),
         sourceDir: sourceDir.trim(),
         targetDir: targetDir.trim(),
-        strategy,
-        envVarName: envVarName.trim() || null,
         dryRun,
       });
     } catch (err) {
@@ -268,7 +254,7 @@ export default function ToolDataMigratePage() {
   return (
     <main className="rounded-3xl border border-[var(--card-border)] bg-[var(--card)] p-6 shadow-[0_24px_65px_-35px_rgba(17,97,125,0.55)] backdrop-blur-xl sm:p-8">
       <h1 className="text-3xl font-semibold tracking-tight">工具数据迁移</h1>
-      <p className="mt-3 text-sm text-slate-700">支持 `.codex`、`.dotnet`、`.nuget`、`.opencode`、`.rustup`、`.trae-cn` 等目录一键迁移。</p>
+      <p className="mt-3 text-sm text-slate-700">采用软链接（symlink）方式迁移：支持 `.codex`、`.dotnet`、`.nuget`、`.opencode`、`.rustup`、`.trae-cn` 等目录一键迁移。</p>
 
       <section className="mt-4 rounded-2xl border border-slate-200 bg-white/75 p-4">
         <h2 className="text-sm font-semibold">一键迁移快捷按钮</h2>
@@ -305,14 +291,6 @@ export default function ToolDataMigratePage() {
           <button type="button" onClick={pickSourceDir} className="h-9 rounded-lg border border-slate-300 px-3 text-xs font-medium hover:bg-slate-100">选择源目录</button>
           <input value={targetDir} onChange={(e) => setTargetDir(e.target.value)} className="h-10 rounded-xl border border-slate-300 px-3 text-sm" placeholder="目标目录" />
           <button type="button" onClick={pickTargetParent} className="h-9 rounded-lg border border-slate-300 px-3 text-xs font-medium hover:bg-slate-100">选择目标父目录</button>
-
-          <select value={strategy} onChange={(e) => setStrategy(e.target.value)} className="h-10 rounded-xl border border-slate-300 px-3 text-sm">
-            <option value="symlink">仅软链接</option>
-            <option value="env">仅环境变量</option>
-            <option value="both">软链接 + 环境变量</option>
-          </select>
-
-          <input value={envVarName} onChange={(e) => setEnvVarName(e.target.value)} className="h-10 rounded-xl border border-slate-300 px-3 text-sm" placeholder="环境变量名（例如 CLAUDE_CONFIG_DIR）" />
 
           <label className="flex items-center gap-2 text-sm text-slate-700">
             <input type="checkbox" checked={dryRun} onChange={(e) => setDryRun(e.target.checked)} />
@@ -363,10 +341,8 @@ export default function ToolDataMigratePage() {
         <div className="mt-4 rounded-2xl border border-emerald-200 bg-emerald-50 p-4 text-sm text-emerald-800">
           <p>工具：{result.toolName}</p>
           <p className="mt-1">目录：{result.sourceDir} -&gt; {result.targetDir}</p>
-          <p className="mt-1">策略：{result.strategy}</p>
           <p className="mt-1">移动目录：{result.moved ? "是" : "否（dry-run）"}</p>
           <p className="mt-1">软链接：{result.symlinkCreated ? "已创建" : "未创建"}</p>
-          <p className="mt-1">环境变量：{result.envVarUpdated ? "已更新" : "未更新"}</p>
           {result.warnings.length ? (
             <ul className="mt-2 list-disc space-y-1 pl-5 text-xs text-amber-800">
               {result.warnings.map((item) => (

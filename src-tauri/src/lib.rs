@@ -2,7 +2,6 @@ use bzip2::{read::BzDecoder, write::BzEncoder, Compression as BzCompression};
 use flate2::{read::GzDecoder, write::GzEncoder, Compression as GzCompression};
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use serde::{Deserialize, Serialize};
-use uuid::Uuid;
 use std::{
     env,
     fs::{self, File},
@@ -10,8 +9,9 @@ use std::{
     path::{Component, Path, PathBuf},
     time::Instant,
 };
-use tauri::Emitter;
 use tar::{Archive as TarArchive, Builder as TarBuilder};
+use tauri::Emitter;
+use uuid::Uuid;
 use walkdir::WalkDir;
 use xz2::{read::XzDecoder, write::XzEncoder};
 use zip::{write::FileOptions, CompressionMethod, ZipArchive, ZipWriter};
@@ -108,8 +108,6 @@ struct ToolDataMigrationRequest {
     tool_name: String,
     source_dir: String,
     target_dir: String,
-    strategy: String,
-    env_var_name: Option<String>,
     dry_run: bool,
 }
 
@@ -119,10 +117,8 @@ struct ToolDataMigrationResult {
     tool_name: String,
     source_dir: String,
     target_dir: String,
-    strategy: String,
     moved: bool,
     symlink_created: bool,
-    env_var_updated: bool,
     warnings: Vec<String>,
 }
 
@@ -627,10 +623,6 @@ fn migrate_tool_data_windows(
     emit_tool_migration_log(window, "info", "开始执行工具数据迁移");
 
     let tool_name = sanitize_app_name(&request.tool_name)?;
-    let strategy = request.strategy.trim().to_ascii_lowercase();
-    if !matches!(strategy.as_str(), "symlink" | "env" | "both") {
-        return Err("迁移策略仅支持 symlink/env/both".to_string());
-    }
 
     let source_input = expand_windows_env_tokens(request.source_dir.trim());
     let target_input = expand_windows_env_tokens(request.target_dir.trim());
@@ -655,7 +647,7 @@ fn migrate_tool_data_windows(
     let mut warnings = Vec::new();
 
     let mut moved = false;
-    if !request.dry_run && strategy != "env" {
+    if !request.dry_run {
         emit_tool_migration_log(window, "info", "正在迁移目录数据");
         if target.exists() {
             if !target.is_dir() {
@@ -679,55 +671,21 @@ fn migrate_tool_data_windows(
     }
 
     let mut symlink_created = false;
-    if strategy == "symlink" || strategy == "both" {
-        emit_tool_migration_log(window, "info", "正在处理软链接步骤");
-        if !request.dry_run {
-            symlink_created = create_directory_symlink(&source, &target, &mut warnings)?;
-        }
-        emit_tool_migration_log(
-            window,
-            "info",
-            if symlink_created {
-                "软链接已创建"
-            } else if request.dry_run {
-                "dry-run 模式：跳过软链接创建"
-            } else {
-                "软链接未创建（可能已存在或权限不足）"
-            },
-        );
+    emit_tool_migration_log(window, "info", "正在处理软链接步骤");
+    if !request.dry_run {
+        symlink_created = create_directory_symlink(&source, &target, &mut warnings)?;
     }
-
-    let mut env_var_updated = false;
-    if strategy == "env" || strategy == "both" {
-        emit_tool_migration_log(window, "info", "正在处理环境变量步骤");
-        let env_var_name = request
-            .env_var_name
-            .as_deref()
-            .unwrap_or("CLAUDE_CONFIG_DIR")
-            .trim()
-            .to_string();
-        let env_var_name = validate_env_var_name(&env_var_name)?;
-        if env_var_name.is_empty() {
-            return Err("环境变量名称不能为空".to_string());
-        }
-
-        if !request.dry_run {
-            set_user_environment_var(&env_var_name, &target_str)?;
-            unsafe {
-                env::set_var(&env_var_name, &target_str);
-            }
-            env_var_updated = true;
-        }
-        emit_tool_migration_log(
-            window,
-            "info",
-            &format!(
-                "环境变量处理{}: {}",
-                if request.dry_run { "跳过(dry-run)" } else { "完成" },
-                env_var_name
-            ),
-        );
-    }
+    emit_tool_migration_log(
+        window,
+        "info",
+        if symlink_created {
+            "软链接已创建"
+        } else if request.dry_run {
+            "dry-run 模式：跳过软链接创建"
+        } else {
+            "软链接未创建（可能已存在或权限不足）"
+        },
+    );
 
     emit_tool_migration_log(window, "success", "工具数据迁移任务完成");
 
@@ -735,10 +693,8 @@ fn migrate_tool_data_windows(
         tool_name,
         source_dir: source_str,
         target_dir: target_str,
-        strategy,
         moved,
         symlink_created,
-        env_var_updated,
         warnings,
     })
 }
@@ -1192,26 +1148,6 @@ fn expand_windows_env_tokens(value: &str) -> String {
     }
 
     result
-}
-
-#[cfg(windows)]
-fn set_user_environment_var(name: &str, value: &str) -> Result<(), String> {
-    let key = RegKey::predef(HKEY_CURRENT_USER)
-        .open_subkey_with_flags("Environment", KEY_READ | KEY_WRITE)
-        .map_err(|error| format!("打开用户环境变量注册表失败: {error}"))?;
-
-    key.set_raw_value(
-        name,
-        &RegValue {
-            bytes: value
-                .encode_utf16()
-                .flat_map(|unit| unit.to_le_bytes())
-                .chain([0, 0])
-                .collect::<Vec<u8>>(),
-            vtype: winreg::enums::RegType::REG_EXPAND_SZ,
-        },
-    )
-    .map_err(|error| format!("写入用户环境变量失败 ({name}): {error}"))
 }
 
 #[cfg(windows)]
@@ -2181,4 +2117,50 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ToolDataMigrationRequest, ToolDataMigrationResult};
+
+    // SC-004: a tool-data migration request deserializes from the symlink-only
+    // payload — i.e. without any `strategy` or `envVarName` fields.
+    #[test]
+    fn request_deserializes_without_strategy_or_env_fields() {
+        let json = r#"{
+            "toolName": "rustup",
+            "sourceDir": "C:/Users/me/.rustup",
+            "targetDir": "D:/tool-data/.rustup",
+            "dryRun": true
+        }"#;
+        let req: ToolDataMigrationRequest =
+            serde_json::from_str(json).expect("request should deserialize");
+        assert_eq!(req.tool_name, "rustup");
+        assert!(req.dry_run);
+    }
+
+    // SC-004: the result serialized to the frontend carries no env-var fields
+    // (`envVarUpdated`) and no `strategy` — symlink-only contract.
+    #[test]
+    fn result_serializes_without_env_fields() {
+        let result = ToolDataMigrationResult {
+            tool_name: "rustup".to_string(),
+            source_dir: "C:/Users/me/.rustup".to_string(),
+            target_dir: "D:/tool-data/.rustup".to_string(),
+            moved: false,
+            symlink_created: false,
+            warnings: vec![],
+        };
+        let value = serde_json::to_value(&result).expect("result should serialize");
+        let obj = value.as_object().expect("result is a JSON object");
+        assert!(
+            !obj.contains_key("envVarUpdated"),
+            "envVarUpdated must be removed"
+        );
+        assert!(!obj.contains_key("strategy"), "strategy must be removed");
+        assert!(
+            obj.contains_key("symlinkCreated"),
+            "symlinkCreated must remain"
+        );
+    }
 }

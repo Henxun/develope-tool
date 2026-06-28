@@ -135,16 +135,31 @@ function getAgeEdgeColor(modifiedSecs: number, minSecs: number, maxSecs: number)
 // Build nested Nivo data, bounded for rendering. Scanning a large drive (e.g. C:)
 // can yield hundreds of thousands of nodes; rendering them all as absolutely
 // positioned <div>s froze the UI after the scan finished. We bound the rendered
-// DOM in three ways so render cost is independent of drive size:
+// DOM so render cost is independent of drive size:
 //   - depth cap (maxDepth): folders past the cap become size-only leaves
 //   - min-size pruning: children smaller than MIN_VISIBLE_FRACTION of the parent
 //     are too small to see, so they are dropped from the visual tree
 //   - per-folder child cap (MAX_CHILDREN_PER_NODE): only the largest N children
 //     are kept; the remainder are folded into one synthetic "其它 (...)" leaf
-const MIN_VISIBLE_FRACTION = 0.001; // 0.1% of parent — below this is invisible anyway
-const MAX_CHILDREN_PER_NODE = 40;     // per-folder: 40×3 << 80×3 → ~64k max vs 512k
+//   - GLOBAL node budget (MAX_TOTAL_NODES): a hard ceiling on total rendered
+//     blocks. Each absolutely-positioned <div> (with gradient + shadow) is
+//     expensive; tens of thousands freeze the WebView. Once the budget is hit,
+//     remaining folders render as single size-only leaves instead of expanding.
+const MIN_VISIBLE_FRACTION = 0.004; // 0.4% of parent — below this is invisible anyway
+const MAX_CHILDREN_PER_NODE = 24;
+const MAX_TOTAL_NODES = 2000; // hard ceiling on rendered blocks, any drive size
 
 function transformToNivoData(node: DiskNode, depth: number, maxDepth: number): TreemapDatum {
+  const budget = { remaining: MAX_TOTAL_NODES };
+  return transformNode(node, depth, maxDepth, budget);
+}
+
+function transformNode(
+  node: DiskNode,
+  depth: number,
+  maxDepth: number,
+  budget: { remaining: number },
+): TreemapDatum {
   const base = {
     id: node.path,
     name: node.name,
@@ -154,7 +169,8 @@ function transformToNivoData(node: DiskNode, depth: number, maxDepth: number): T
     modifiedSecs: node.modifiedSecs,
   };
 
-  if (node.children.length === 0 || depth >= maxDepth) {
+  // Leaf, at depth cap, or out of global node budget → render as a single block.
+  if (node.children.length === 0 || depth >= maxDepth || budget.remaining <= 1) {
     return { ...base, value: node.size };
   }
 
@@ -166,7 +182,12 @@ function transformToNivoData(node: DiskNode, depth: number, maxDepth: number): T
   let hiddenCount = 0;
 
   for (const child of node.children) {
-    if (visible.length < MAX_CHILDREN_PER_NODE && child.size >= threshold) {
+    // Stop taking children once the per-folder cap OR the global budget is hit.
+    if (
+      visible.length < MAX_CHILDREN_PER_NODE &&
+      visible.length < budget.remaining - 1 &&
+      child.size >= threshold
+    ) {
       visible.push(child);
     } else {
       hiddenSize += child.size;
@@ -179,8 +200,11 @@ function transformToNivoData(node: DiskNode, depth: number, maxDepth: number): T
     return { ...base, value: node.size };
   }
 
+  // Reserve budget for the visible children we're about to create.
+  budget.remaining -= visible.length;
+
   const children: TreemapDatum[] = visible.map((child) =>
-    transformToNivoData(child, depth + 1, maxDepth),
+    transformNode(child, depth + 1, maxDepth, budget),
   );
 
   if (hiddenCount > 0 && hiddenSize > 0) {
@@ -414,8 +438,8 @@ function TreemapNode({
     <div
       style={{
         position: "absolute",
-        left: 0,
-        top: 0,
+        left: node.x ?? 0,
+        top: node.y ?? 0,
         width: w,
         height: h,
         backgroundImage: cushion,

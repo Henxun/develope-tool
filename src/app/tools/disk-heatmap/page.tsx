@@ -437,7 +437,11 @@ function TreemapNode({
         justifyContent: "center",
         textAlign: "center",
         padding: "2px 4px",
-        opacity: dim ? 0.16 : 1,
+        // Dimmed (filtered-out) blocks stay visibly muted rather than fading into
+        // the dark container background — otherwise a filter that excludes most of
+        // the view (e.g. *.mp4 in a folder with none) looks like a black void.
+        opacity: dim ? 0.4 : 1,
+        filter: dim ? "grayscale(0.85)" : undefined,
         transition: "opacity 0.15s",
         zIndex: selected ? 10 : undefined,
       }}

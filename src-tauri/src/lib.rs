@@ -1,12 +1,14 @@
 use bzip2::{read::BzDecoder, write::BzEncoder, Compression as BzCompression};
 use flate2::{read::GzDecoder, write::GzEncoder, Compression as GzCompression};
 use globset::{Glob, GlobSet, GlobSetBuilder};
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::{
     env,
     fs::{self, File},
     io,
     path::{Component, Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
     time::Instant,
 };
 use tar::{Archive as TarArchive, Builder as TarBuilder};
@@ -136,6 +138,7 @@ struct ToolMigrationLogEvent {
 #[serde(rename_all = "camelCase")]
 struct DiskNode {
     name: String,
+    path: String,
     size: u64,
     node_type: String,
     children: Vec<DiskNode>,
@@ -149,6 +152,13 @@ struct DiskScanResult {
     total_files: u64,
     total_dirs: u64,
     scan_duration_ms: u64,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct FileActionResult {
+    success: bool,
+    message: String,
 }
 
 #[derive(Clone, Serialize)]
@@ -731,97 +741,115 @@ fn scan_directory_recursive(
     max_depth: Option<usize>,
     include_hidden: bool,
     window: &tauri::Window,
-    items_scanned: &mut u64,
+    items_scanned: &AtomicU64,
 ) -> Result<DiskNode, String> {
     let name = path
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| path.display().to_string());
+    let self_path = path.display().to_string();
 
-    let mut dir_children: Vec<DiskNode> = Vec::new();
-    let mut file_children: Vec<DiskNode> = Vec::new();
-    let mut total_size: u64 = 0;
     let can_recurse = max_depth.map_or(true, |max| depth < max);
 
-    if can_recurse {
-        let entries = match fs::read_dir(path) {
-            Ok(e) => e,
-            Err(_) => {
-                return Ok(DiskNode {
-                    name,
-                    size: 0,
-                    node_type: "folder".to_string(),
-                    children: vec![],
-                });
-            }
+    if !can_recurse {
+        return Ok(DiskNode {
+            name,
+            path: self_path,
+            size: 0,
+            node_type: "folder".to_string(),
+            children: vec![],
+        });
+    }
+
+    let entries = match fs::read_dir(path) {
+        Ok(e) => e,
+        Err(_) => {
+            return Ok(DiskNode {
+                name,
+                path: self_path,
+                size: 0,
+                node_type: "folder".to_string(),
+                children: vec![],
+            });
+        }
+    };
+
+    // Partition immediate entries into subdirectories (recursed in parallel) and
+    // files (cheap metadata reads handled inline).
+    let mut sub_dirs: Vec<PathBuf> = Vec::new();
+    let mut file_children: Vec<DiskNode> = Vec::new();
+
+    for entry in entries.filter_map(Result::ok) {
+        let file_type = match entry.file_type() {
+            Ok(ft) => ft,
+            Err(_) => continue,
         };
 
-        for entry in entries.filter_map(Result::ok) {
-            let file_type = match entry.file_type() {
-                Ok(ft) => ft,
+        // Skip symlinks to avoid cycles
+        if file_type.is_symlink() {
+            continue;
+        }
+
+        let file_name = entry.file_name().to_string_lossy().to_string();
+
+        // Skip hidden files/dirs if not included
+        if !include_hidden && file_name.starts_with('.') {
+            continue;
+        }
+
+        if file_type.is_dir() {
+            sub_dirs.push(entry.path());
+        } else if file_type.is_file() {
+            let file_size = match entry.metadata() {
+                Ok(m) => m.len(),
                 Err(_) => continue,
             };
+            let ext = entry
+                .path()
+                .extension()
+                .map(|e| e.to_string_lossy().to_ascii_lowercase())
+                .unwrap_or_default();
+            file_children.push(DiskNode {
+                name: file_name,
+                path: entry.path().display().to_string(),
+                size: file_size,
+                node_type: if ext.is_empty() {
+                    "other".to_string()
+                } else {
+                    ext
+                },
+                children: vec![],
+            });
 
-            // Skip symlinks to avoid cycles
-            if file_type.is_symlink() {
-                continue;
-            }
-
-            let file_name = entry.file_name().to_string_lossy().to_string();
-
-            // Skip hidden files/dirs if not included
-            if !include_hidden && file_name.starts_with('.') {
-                continue;
-            }
-
-            if file_type.is_dir() {
-                match scan_directory_recursive(
-                    &entry.path(),
-                    depth + 1,
-                    max_depth,
-                    include_hidden,
-                    window,
-                    items_scanned,
-                ) {
-                    Ok(child) => {
-                        total_size += child.size;
-                        dir_children.push(child);
-                    }
-                    Err(_) => continue,
-                }
-            } else if file_type.is_file() {
-                let file_size = match entry.metadata() {
-                    Ok(m) => m.len(),
-                    Err(_) => continue,
-                };
-                total_size += file_size;
-                let ext = entry
-                    .path()
-                    .extension()
-                    .map(|e| e.to_string_lossy().to_ascii_lowercase())
-                    .unwrap_or_default();
-                file_children.push(DiskNode {
-                    name: file_name,
-                    size: file_size,
-                    node_type: if ext.is_empty() {
-                        "other".to_string()
-                    } else {
-                        ext
-                    },
-                    children: vec![],
-                });
-            }
-
-            *items_scanned += 1;
-            if *items_scanned % 500 == 0 {
-                emit_disk_scan_progress(
-                    window,
-                    &entry.path().display().to_string(),
-                    *items_scanned,
-                );
+            let count = items_scanned.fetch_add(1, Ordering::Relaxed) + 1;
+            if count % 500 == 0 {
+                emit_disk_scan_progress(window, &entry.path().display().to_string(), count);
             }
         }
     }
+
+    // Recurse into subdirectories in parallel.
+    let mut dir_children: Vec<DiskNode> = sub_dirs
+        .into_par_iter()
+        .filter_map(|child_path| {
+            let count = items_scanned.fetch_add(1, Ordering::Relaxed) + 1;
+            if count % 500 == 0 {
+                emit_disk_scan_progress(window, &child_path.display().to_string(), count);
+            }
+            scan_directory_recursive(
+                &child_path,
+                depth + 1,
+                max_depth,
+                include_hidden,
+                window,
+                items_scanned,
+            )
+            .ok()
+        })
+        .collect();
+
+    let total_size: u64 = dir_children.iter().map(|c| c.size).sum::<u64>()
+        + file_children.iter().map(|c| c.size).sum::<u64>();
 
     // Sort children by size descending (largest first)
     dir_children.sort_by(|a, b| b.size.cmp(&a.size));
@@ -832,6 +860,7 @@ fn scan_directory_recursive(
 
     Ok(DiskNode {
         name,
+        path: self_path,
         size: total_size,
         node_type: "folder".to_string(),
         children,
@@ -876,18 +905,12 @@ fn scan_disk_usage(
     let include_hidden = include_hidden.unwrap_or(false);
 
     let start = Instant::now();
-    let mut items_scanned: u64 = 0;
+    let items_scanned = AtomicU64::new(0);
 
     emit_disk_scan_progress(&window, &root.display().to_string(), 0);
 
-    let root_node = scan_directory_recursive(
-        &root,
-        0,
-        max_depth,
-        include_hidden,
-        &window,
-        &mut items_scanned,
-    )?;
+    let root_node =
+        scan_directory_recursive(&root, 0, max_depth, include_hidden, &window, &items_scanned)?;
 
     let elapsed = start.elapsed();
     let (total_files, total_dirs) = count_tree_items(&root_node);
@@ -898,6 +921,125 @@ fn scan_disk_usage(
         total_dirs,
         scan_duration_ms: elapsed.as_millis() as u64,
         root: root_node,
+    })
+}
+
+// ── Disk heatmap file actions ──
+
+fn validate_action_path(path: &str) -> Result<PathBuf, String> {
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        return Err("路径不能为空".to_string());
+    }
+    let buf = PathBuf::from(trimmed);
+    if !buf.is_absolute() {
+        return Err("路径必须是绝对路径".to_string());
+    }
+    if !buf.exists() {
+        return Err("路径不存在".to_string());
+    }
+    Ok(buf)
+}
+
+#[tauri::command]
+fn open_path(path: String) -> Result<FileActionResult, String> {
+    let target = validate_action_path(&path)?;
+    let target_str = target.display().to_string();
+
+    #[cfg(windows)]
+    {
+        let result = unsafe {
+            ShellExecuteW(
+                0 as HWND,
+                to_wide("open").as_ptr(),
+                to_wide(&target_str).as_ptr(),
+                std::ptr::null(),
+                std::ptr::null(),
+                SW_SHOWNORMAL,
+            )
+        };
+        if (result as isize) <= 32 {
+            return Err(format!("打开失败: {target_str}"));
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open")
+            .arg(&target_str)
+            .spawn()
+            .map_err(|error| format!("打开失败: {error}"))?;
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        std::process::Command::new("xdg-open")
+            .arg(&target_str)
+            .spawn()
+            .map_err(|error| format!("打开失败: {error}"))?;
+    }
+
+    Ok(FileActionResult {
+        success: true,
+        message: format!("已打开 {target_str}"),
+    })
+}
+
+#[tauri::command]
+fn reveal_in_file_manager(path: String) -> Result<FileActionResult, String> {
+    let target = validate_action_path(&path)?;
+    let target_str = target.display().to_string();
+
+    #[cfg(windows)]
+    {
+        // explorer /select,<path> opens the folder with the item highlighted.
+        std::process::Command::new("explorer")
+            .arg(format!("/select,{target_str}"))
+            .spawn()
+            .map_err(|error| format!("在文件管理器中显示失败: {error}"))?;
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open")
+            .args(["-R", &target_str])
+            .spawn()
+            .map_err(|error| format!("在文件管理器中显示失败: {error}"))?;
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        // No portable "select" on Linux; open the containing directory.
+        let parent = target
+            .parent()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| target_str.clone());
+        std::process::Command::new("xdg-open")
+            .arg(&parent)
+            .spawn()
+            .map_err(|error| format!("在文件管理器中显示失败: {error}"))?;
+    }
+
+    Ok(FileActionResult {
+        success: true,
+        message: format!("已在文件管理器中显示 {target_str}"),
+    })
+}
+
+#[tauri::command]
+fn delete_path(path: String) -> Result<FileActionResult, String> {
+    let target = validate_action_path(&path)?;
+
+    // Refuse to delete a filesystem/drive root (no parent component).
+    if target.parent().is_none() {
+        return Err("禁止删除驱动器根目录".to_string());
+    }
+
+    trash::delete(&target).map_err(|error| format!("删除失败: {error}"))?;
+
+    Ok(FileActionResult {
+        success: true,
+        message: format!("已移至回收站 {}", target.display()),
     })
 }
 
@@ -2113,7 +2255,10 @@ pub fn run() {
             migrate_installed_program,
             migrate_tool_data,
             scan_disk_usage,
-            check_directory_locked
+            check_directory_locked,
+            open_path,
+            reveal_in_file_manager,
+            delete_path
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -2121,7 +2266,7 @@ pub fn run() {
 
 #[cfg(test)]
 mod tests {
-    use super::{ToolDataMigrationRequest, ToolDataMigrationResult};
+    use super::{validate_action_path, ToolDataMigrationRequest, ToolDataMigrationResult};
 
     // SC-004: a tool-data migration request deserializes from the symlink-only
     // payload — i.e. without any `strategy` or `envVarName` fields.
@@ -2162,5 +2307,19 @@ mod tests {
             obj.contains_key("symlinkCreated"),
             "symlinkCreated must remain"
         );
+    }
+
+    // File-action path validation must reject empty and relative paths before any
+    // filesystem mutation (open / reveal / delete share this guard).
+    #[test]
+    fn validate_action_path_rejects_empty() {
+        assert!(validate_action_path("").is_err());
+        assert!(validate_action_path("   ").is_err());
+    }
+
+    #[test]
+    fn validate_action_path_rejects_relative() {
+        assert!(validate_action_path("relative/path").is_err());
+        assert!(validate_action_path("./foo").is_err());
     }
 }

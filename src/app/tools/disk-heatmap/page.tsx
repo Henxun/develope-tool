@@ -389,20 +389,10 @@ function TreemapNode({
   const h = node.height ?? 0;
   const showName = w > 46 && h > 16;
   const showSize = w > 60 && h > 30;
-  const clickCountRef = useRef(0);
-  const clickTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
+  // Single left-click on a folder drills in.
   const handleClick = useCallback(() => {
-    clickCountRef.current += 1;
-    if (clickCountRef.current === 1) {
-      clickTimerRef.current = setTimeout(() => {
-        clickCountRef.current = 0;
-      }, 300);
-    } else if (clickCountRef.current >= 2) {
-      if (clickTimerRef.current) clearTimeout(clickTimerRef.current);
-      clickCountRef.current = 0;
-      onZoomIn(node);
-    }
+    onZoomIn(node);
   }, [node, onZoomIn]);
 
   // Cushion effect: a soft top-left highlight + bottom-right shade over the base color.
@@ -529,7 +519,6 @@ export default function DiskHeatmapPage() {
   const [progress, setProgress] = useState<DiskScanProgressEvent | null>(null);
   const [zoomPath, setZoomPath] = useState<string[]>([]);
   const [hoveredNode, setHoveredNode] = useState<ComputedNode | null>(null);
-  const [viewScale, setViewScale] = useState(1);
   const [renderDepth, setRenderDepth] = useState(3);
 
   // Filtering state — single SpaceSniffer-style combined query (e.g. "*.mp4;>500Mb").
@@ -545,12 +534,6 @@ export default function DiskHeatmapPage() {
   const [actionMessage, setActionMessage] = useState("");
 
   const unlistenRef = useRef<(() => void) | null>(null);
-  const isInsideTreemapRef = useRef(false);
-  const treemapRef = useRef<HTMLDivElement>(null);
-
-  const MIN_SCALE = 0.5;
-  const MAX_SCALE = 5;
-  const SCALE_STEP = 0.15;
 
   // Listen for scan progress events
   useEffect(() => {
@@ -605,7 +588,6 @@ export default function DiskHeatmapPage() {
     setZoomPath([]);
     setHoveredNode(null);
     setSelectedPath(null);
-    setViewScale(1);
     setContextMenu(null);
     setActionMessage("");
 
@@ -676,7 +658,6 @@ export default function DiskHeatmapPage() {
       if (childNode && childNode.children.length > 0) {
         setZoomPath((prev) => [...prev, childName]);
         setHoveredNode(null);
-        setViewScale(1);
       }
     },
     [currentRoot],
@@ -765,46 +746,7 @@ export default function DiskHeatmapPage() {
     }
   }, []);
 
-  // ── Wheel zoom: visual scale + prevent page scroll ──
-
-  const handleTreemapMouseEnter = useCallback(() => {
-    isInsideTreemapRef.current = true;
-    document.body.style.overflow = "hidden";
-  }, []);
-
-  const handleTreemapMouseLeave = useCallback(() => {
-    isInsideTreemapRef.current = false;
-    document.body.style.overflow = "";
-  }, []);
-
-  // Native passive:false listener to prevent page scroll + adjust scale
-  useEffect(() => {
-    const el = treemapRef.current;
-    if (!el) return;
-
-    const handler = (event: WheelEvent) => {
-      if (!isInsideTreemapRef.current) return;
-      if (!scanResult) return;
-      if (Math.abs(event.deltaY) < 5) return;
-
-      event.preventDefault();
-      event.stopPropagation();
-
-      setViewScale((prev) => {
-        const delta = event.deltaY < 0 ? SCALE_STEP : -SCALE_STEP;
-        const next = Math.round((prev + delta) * 100) / 100;
-        return Math.min(MAX_SCALE, Math.max(MIN_SCALE, next));
-      });
-    };
-
-    el.addEventListener("wheel", handler, { passive: false });
-    return () => el.removeEventListener("wheel", handler);
-  }, [scanResult]);
-
-  // Reset scale when zoom path changes
-  useEffect(() => {
-    setViewScale(1);
-  }, [zoomPath]);
+  // ── Filtering ──
 
   const applyFilter = useCallback(() => {
     setAppliedFilter(filterQuery);
@@ -838,7 +780,7 @@ export default function DiskHeatmapPage() {
       <div>
         <h2 className="text-xl font-semibold text-slate-800">磁盘分析热力图</h2>
         <p className="text-sm text-slate-500 mt-1">
-          参考 SpaceSniffer 的立体方块热力图：嵌套展示磁盘占用，双击钻入、右键空白处返回上级，支持筛选与右键文件操作。
+          参考 SpaceSniffer 的立体方块热力图：嵌套展示磁盘占用，单击文件夹钻入、右键空白处返回上级，支持筛选与右键文件操作。
         </p>
       </div>
 
@@ -1049,25 +991,14 @@ export default function DiskHeatmapPage() {
         </div>
       )}
 
-      {/* Treemap container — native wheel listener + right-click zoom-out */}
+      {/* Treemap container — left-click drills in, right-click zooms out */}
       <div
-        ref={treemapRef}
-        className="bg-slate-900 rounded-xl overflow-auto shadow-lg relative group"
+        className="bg-slate-900 rounded-xl overflow-hidden shadow-lg relative group"
         style={{ height: nivoData && currentRoot ? 500 : 0, transition: "height 0.2s ease" }}
-        onMouseEnter={handleTreemapMouseEnter}
-        onMouseLeave={handleTreemapMouseLeave}
         onContextMenu={handleContainerContextMenu}
       >
         {nivoData && currentRoot && (
-          <div
-            style={{
-              transform: `scale(${viewScale})`,
-              transformOrigin: "top left",
-              width: `${100 / viewScale}%`,
-              height: `${100 / viewScale}%`,
-              transition: "transform 0.15s ease",
-            }}
-          >
+          <div style={{ width: "100%", height: "100%" }}>
             <ResponsiveTreeMapHtml
               data={nivoData}
               identity="id"
@@ -1110,7 +1041,7 @@ export default function DiskHeatmapPage() {
               </span>
             )}
             <span className="bg-black/60 text-white/70 text-xs px-2 py-1 rounded-md backdrop-blur-sm">
-              {Math.round(viewScale * 100)}% 滚轮缩放 · 双击钻入 · 右键返回
+              单击钻入 · 右键返回
             </span>
           </div>
         )}

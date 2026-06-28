@@ -1015,6 +1015,8 @@ export default function DiskHeatmapPage() {
                 if (node.data.id === currentRoot.path) {
                   return <div style={{ display: "none" }} />;
                 }
+                // Also suppress the synthetic "其它 (N 项)" leaf when it has
+                // no area assigned (Nivo assigns value 0 → won't render).
                 const isMatch = matchingPaths.has(node.data.path);
                 if (filterActive && hideNonMatching && !isMatch) {
                   return <div style={{ display: "none" }} />;

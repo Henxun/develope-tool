@@ -23,3 +23,34 @@ body {
   color: var(--foreground);
   font-family: var(--font-sora), "Segoe UI", sans-serif;
 }
+
+/* ── Disk heatmap block hover highlight (pure CSS, no React re-render) ── */
+.dh-block {
+  transition: opacity 0.15s;
+}
+.dh-block:hover {
+  background-image: radial-gradient(120% 120% at 30% 24%, #ffffff 0%, #f4f8ff 70%, #e8f0fb 100%) !important;
+  background-color: #ffffff !important;
+  box-shadow: 0 0 0 1px rgba(34, 197, 94, 0.9), 0 2px 8px rgba(0, 0, 0, 0.25) !important;
+  z-index: 10;
+}
+/* Hovered block: darken its label text so it stays readable on white */
+.dh-block:hover .dh-label {
+  color: #1f2937 !important;
+  text-shadow: none !important;
+}
+/* Green corner triangles, hidden until hover */
+.dh-corner {
+  position: absolute;
+  width: 0;
+  height: 0;
+  pointer-events: none;
+  opacity: 0;
+}
+.dh-block:hover .dh-corner {
+  opacity: 1;
+}
+.dh-corner-tl { top: 0; left: 0; border-top: 9px solid #22c55e; border-right: 9px solid transparent; }
+.dh-corner-tr { top: 0; right: 0; border-top: 9px solid #22c55e; border-left: 9px solid transparent; }
+.dh-corner-bl { bottom: 0; left: 0; border-bottom: 9px solid #22c55e; border-right: 9px solid transparent; }
+.dh-corner-br { bottom: 0; right: 0; border-bottom: 9px solid #22c55e; border-left: 9px solid transparent; }

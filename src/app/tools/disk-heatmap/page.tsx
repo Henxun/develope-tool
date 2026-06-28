@@ -132,8 +132,18 @@ function getAgeEdgeColor(modifiedSecs: number, minSecs: number, maxSecs: number)
 
 // ── Data transformation ──
 
-// Build nested Nivo data, capped at `maxDepth` so the rendered DOM stays bounded.
-// A folder at the depth cap (or a file) becomes a leaf carrying its own size.
+// Build nested Nivo data, bounded for rendering. Scanning a large drive (e.g. C:)
+// can yield hundreds of thousands of nodes; rendering them all as absolutely
+// positioned <div>s froze the UI after the scan finished. We bound the rendered
+// DOM in three ways so render cost is independent of drive size:
+//   - depth cap (maxDepth): folders past the cap become size-only leaves
+//   - min-size pruning: children smaller than MIN_VISIBLE_FRACTION of the parent
+//     are too small to see, so they are dropped from the visual tree
+//   - per-folder child cap (MAX_CHILDREN_PER_NODE): only the largest N children
+//     are kept; the remainder are folded into one synthetic "其它 (...)" leaf
+const MIN_VISIBLE_FRACTION = 0.001; // 0.1% of parent — below this is invisible anyway
+const MAX_CHILDREN_PER_NODE = 80;
+
 function transformToNivoData(node: DiskNode, depth: number, maxDepth: number): TreemapDatum {
   const base = {
     id: node.path,
@@ -148,22 +158,58 @@ function transformToNivoData(node: DiskNode, depth: number, maxDepth: number): T
     return { ...base, value: node.size };
   }
 
-  return {
-    ...base,
-    children: node.children.map((child) => transformToNivoData(child, depth + 1, maxDepth)),
-  };
+  // Children are already sorted largest-first by the backend. Keep only those
+  // big enough to be visible, then cap the count; fold the rest into "其它".
+  const threshold = node.size * MIN_VISIBLE_FRACTION;
+  const visible: DiskNode[] = [];
+  let hiddenSize = 0;
+  let hiddenCount = 0;
+
+  for (const child of node.children) {
+    if (visible.length < MAX_CHILDREN_PER_NODE && child.size >= threshold) {
+      visible.push(child);
+    } else {
+      hiddenSize += child.size;
+      hiddenCount += 1;
+    }
+  }
+
+  if (visible.length === 0) {
+    // Nothing individually visible — render this folder as a single leaf.
+    return { ...base, value: node.size };
+  }
+
+  const children: TreemapDatum[] = visible.map((child) =>
+    transformToNivoData(child, depth + 1, maxDepth),
+  );
+
+  if (hiddenCount > 0 && hiddenSize > 0) {
+    children.push({
+      id: `${node.path}::__other__`,
+      name: `其它 (${hiddenCount} 项)`,
+      path: node.path,
+      nodeType: "other",
+      size: hiddenSize,
+      modifiedSecs: 0,
+      value: hiddenSize,
+    });
+  }
+
+  return { ...base, children };
 }
 
-// Min/max modified-time across all nodes, for age-edge normalization.
-function modifiedRange(node: DiskNode): { min: number; max: number } {
+// Min/max modified-time across the (bounded) rendered tree, for age-edge
+// normalization. Walks the pruned TreemapDatum tree — not the raw scan tree —
+// so it stays cheap even on huge drives.
+function modifiedRange(node: TreemapDatum): { min: number; max: number } {
   let min = Infinity;
   let max = 0;
-  const walk = (n: DiskNode) => {
+  const walk = (n: TreemapDatum) => {
     if (n.modifiedSecs > 0) {
       if (n.modifiedSecs < min) min = n.modifiedSecs;
       if (n.modifiedSecs > max) max = n.modifiedSecs;
     }
-    n.children.forEach(walk);
+    n.children?.forEach(walk);
   };
   walk(node);
   if (!isFinite(min)) min = 0;
@@ -591,11 +637,11 @@ export default function DiskHeatmapPage() {
     return transformToNivoData(currentRoot, 0, renderDepth);
   }, [currentRoot, renderDepth]);
 
-  // Age-edge normalization range over the current view.
+  // Age-edge normalization range over the bounded rendered tree.
   const ageRange = useMemo(() => {
-    if (!currentRoot) return { min: 0, max: 0 };
-    return modifiedRange(currentRoot);
-  }, [currentRoot]);
+    if (!nivoData) return { min: 0, max: 0 };
+    return modifiedRange(nivoData);
+  }, [nivoData]);
 
   const filterPredicate = useMemo(() => parseFilterQuery(appliedFilter), [appliedFilter]);
   const filterActive = filterPredicate !== null;
@@ -770,21 +816,21 @@ export default function DiskHeatmapPage() {
     setHideNonMatching(false);
   }, []);
 
-  // Collect categories present in current view for legend
+  // Collect categories present in the bounded rendered tree for the legend.
   const presentCategories = useMemo(() => {
-    if (!currentRoot) return new Set<string>();
+    if (!nivoData) return new Set<string>();
     const categories = new Set<string>();
-    const walk = (node: DiskNode) => {
+    const walk = (node: TreemapDatum) => {
       if (node.nodeType === "folder") {
         categories.add("folder");
       } else {
         categories.add(getFileCategory(node.nodeType));
       }
-      node.children.forEach(walk);
+      node.children?.forEach(walk);
     };
-    walk(currentRoot);
+    walk(nivoData);
     return categories;
-  }, [currentRoot]);
+  }, [nivoData]);
 
   return (
     <div className="space-y-5">

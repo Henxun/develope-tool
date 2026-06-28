@@ -141,6 +141,7 @@ struct DiskNode {
     path: String,
     size: u64,
     node_type: String,
+    modified_secs: u64,
     children: Vec<DiskNode>,
 }
 
@@ -735,6 +736,21 @@ fn emit_disk_scan_progress(window: &tauri::Window, current_path: &str, items_sca
     let _ = window.emit("disk-scan-progress", payload);
 }
 
+fn metadata_modified_secs(metadata: &fs::Metadata) -> u64 {
+    metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+fn modified_secs_of(path: &Path) -> u64 {
+    fs::metadata(path)
+        .map(|m| metadata_modified_secs(&m))
+        .unwrap_or(0)
+}
+
 fn scan_directory_recursive(
     path: &Path,
     depth: usize,
@@ -748,6 +764,7 @@ fn scan_directory_recursive(
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| path.display().to_string());
     let self_path = path.display().to_string();
+    let self_modified = modified_secs_of(path);
 
     let can_recurse = max_depth.map_or(true, |max| depth < max);
 
@@ -757,6 +774,7 @@ fn scan_directory_recursive(
             path: self_path,
             size: 0,
             node_type: "folder".to_string(),
+            modified_secs: self_modified,
             children: vec![],
         });
     }
@@ -769,6 +787,7 @@ fn scan_directory_recursive(
                 path: self_path,
                 size: 0,
                 node_type: "folder".to_string(),
+                modified_secs: self_modified,
                 children: vec![],
             });
         }
@@ -800,10 +819,12 @@ fn scan_directory_recursive(
         if file_type.is_dir() {
             sub_dirs.push(entry.path());
         } else if file_type.is_file() {
-            let file_size = match entry.metadata() {
-                Ok(m) => m.len(),
+            let metadata = match entry.metadata() {
+                Ok(m) => m,
                 Err(_) => continue,
             };
+            let file_size = metadata.len();
+            let modified = metadata_modified_secs(&metadata);
             let ext = entry
                 .path()
                 .extension()
@@ -818,6 +839,7 @@ fn scan_directory_recursive(
                 } else {
                     ext
                 },
+                modified_secs: modified,
                 children: vec![],
             });
 
@@ -863,6 +885,7 @@ fn scan_directory_recursive(
         path: self_path,
         size: total_size,
         node_type: "folder".to_string(),
+        modified_secs: self_modified,
         children,
     })
 }

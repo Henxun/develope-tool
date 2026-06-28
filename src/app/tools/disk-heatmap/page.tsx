@@ -413,9 +413,11 @@ function TreemapNode({
   return (
     <div
       style={{
-        boxSizing: "border-box",
-        width: "100%",
-        height: "100%",
+        position: "absolute",
+        left: 0,
+        top: 0,
+        width: w,
+        height: h,
         backgroundImage: cushion,
         backgroundColor: selected ? "#ffffff" : color,
         borderRadius: 2,

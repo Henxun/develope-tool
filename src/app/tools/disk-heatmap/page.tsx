@@ -10,6 +10,7 @@ import { open } from "@tauri-apps/plugin-dialog";
 
 type DiskNode = {
   name: string;
+  path: string;
   size: number;
   nodeType: string;
   children: DiskNode[];
@@ -28,11 +29,36 @@ type DiskScanProgressEvent = {
   itemsScanned: number;
 };
 
-type NivoNode = {
+type FileActionResult = {
+  success: boolean;
+  message: string;
+};
+
+type TreemapDatum = {
   id: string;
-  value?: number;
+  name: string;
+  path: string;
   nodeType: string;
-  children?: NivoNode[];
+  size: number;
+  value?: number;
+  children?: TreemapDatum[];
+};
+
+// Minimal shape of the computed node Nivo hands to the custom node component.
+// (Nivo's ComputedNode carries more fields; we only read these.)
+interface ComputedNode {
+  id: string;
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  data: TreemapDatum;
+}
+
+type ContextMenuState = {
+  x: number;
+  y: number;
+  node: ComputedNode;
 };
 
 // ── Color mapping ──
@@ -92,21 +118,24 @@ function getCategoryColor(nodeType: string): string {
 
 // ── Data transformation ──
 
-function transformToNivoData(node: DiskNode, parentPath = ""): NivoNode {
-  const currentPath = parentPath ? `${parentPath}/${node.name}` : node.name;
+// Build nested Nivo data, capped at `maxDepth` so the rendered DOM stays bounded.
+// A folder at the depth cap (or a file) becomes a leaf carrying its own size.
+function transformToNivoData(node: DiskNode, depth: number, maxDepth: number): TreemapDatum {
+  const base = {
+    id: node.path,
+    name: node.name,
+    path: node.path,
+    nodeType: node.nodeType,
+    size: node.size,
+  };
 
-  if (node.children.length === 0) {
-    return {
-      id: currentPath,
-      value: node.size,
-      nodeType: node.nodeType,
-    };
+  if (node.children.length === 0 || depth >= maxDepth) {
+    return { ...base, value: node.size };
   }
 
   return {
-    id: currentPath,
-    nodeType: node.nodeType,
-    children: node.children.map((child) => transformToNivoData(child, currentPath)),
+    ...base,
+    children: node.children.map((child) => transformToNivoData(child, depth + 1, maxDepth)),
   };
 }
 
@@ -115,6 +144,58 @@ function findChildNode(root: DiskNode, path: string[]): DiskNode | null {
   const child = root.children.find((c) => c.name === path[0]);
   if (!child) return null;
   return findChildNode(child, path.slice(1));
+}
+
+// Build a predicate for a name filter: glob (* / ?) → regex, otherwise substring.
+function buildNameMatcher(pattern: string): ((name: string) => boolean) | null {
+  const trimmed = pattern.trim();
+  if (!trimmed) return null;
+  if (trimmed.includes("*") || trimmed.includes("?")) {
+    const escaped = trimmed.replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*").replace(/\?/g, ".");
+    try {
+      const re = new RegExp(`^${escaped}$`, "i");
+      return (name) => re.test(name);
+    } catch {
+      return null;
+    }
+  }
+  const lower = trimmed.toLowerCase();
+  return (name) => name.toLowerCase().includes(lower);
+}
+
+// Remove a node by path and recompute ancestor sizes (no rescan).
+function removeNodeByPath(node: DiskNode, targetPath: string): { node: DiskNode; changed: boolean } {
+  if (node.children.length === 0) return { node, changed: false };
+  let changed = false;
+  const newChildren: DiskNode[] = [];
+  for (const child of node.children) {
+    if (child.path === targetPath) {
+      changed = true;
+      continue;
+    }
+    const result = removeNodeByPath(child, targetPath);
+    if (result.changed) changed = true;
+    newChildren.push(result.node);
+  }
+  if (!changed) return { node, changed: false };
+  const newSize = newChildren.reduce((sum, c) => sum + c.size, 0);
+  return { node: { ...node, children: newChildren, size: newSize }, changed: true };
+}
+
+function countItems(node: DiskNode): { files: number; dirs: number } {
+  let files = 0;
+  let dirs = 0;
+  for (const child of node.children) {
+    if (child.nodeType === "folder") {
+      dirs += 1;
+      const sub = countItems(child);
+      files += sub.files;
+      dirs += sub.dirs;
+    } else {
+      files += 1;
+    }
+  }
+  return { files, dirs };
 }
 
 // ── Formatting ──
@@ -147,12 +228,21 @@ function extractErrorMessage(error: unknown, fallback: string): string {
   return fallback;
 }
 
-// ── Custom treemap node ──
+// ── Custom treemap node (cushioned, SpaceSniffer-style) ──
 
-function TreemapNode({ node, onMouseEnter, onMouseLeave, onClick }: any) {
-  const category = node.data.nodeType === "folder" ? "folder" : getFileCategory(node.data.nodeType);
-  const color = CATEGORY_COLORS[category] ?? CATEGORY_COLORS.other;
-  const label = node.id.split("/").pop() ?? node.id;
+interface TreemapNodeProps {
+  node: ComputedNode;
+  dim: boolean;
+  onZoomIn: (node: ComputedNode) => void;
+  onContext: (event: React.MouseEvent, node: ComputedNode) => void;
+  onHoverEnter: (node: ComputedNode) => void;
+  onHoverLeave: () => void;
+}
+
+function TreemapNode({ node, dim, onZoomIn, onContext, onHoverEnter, onHoverLeave }: TreemapNodeProps) {
+  const isFolder = node.data.nodeType === "folder";
+  const color = getCategoryColor(node.data.nodeType);
+  const label = node.data.name;
   const w = node.width ?? 0;
   const h = node.height ?? 0;
   const showLabel = w > 50 && h > 18;
@@ -168,10 +258,14 @@ function TreemapNode({ node, onMouseEnter, onMouseLeave, onClick }: any) {
     } else if (clickCountRef.current >= 2) {
       if (clickTimerRef.current) clearTimeout(clickTimerRef.current);
       clickCountRef.current = 0;
-      // Double click → drill into folder
-      onClick?.();
+      onZoomIn(node);
     }
-  }, [onClick]);
+  }, [node, onZoomIn]);
+
+  // Cushion effect: a soft top-left highlight + bottom-right shade over the base color.
+  const cushion =
+    `radial-gradient(120% 120% at 28% 22%, rgba(255,255,255,0.45) 0%, rgba(255,255,255,0) 45%), ` +
+    `linear-gradient(135deg, rgba(255,255,255,0.22) 0%, rgba(0,0,0,0.32) 100%), ${color}`;
 
   return (
     <div
@@ -181,30 +275,35 @@ function TreemapNode({ node, onMouseEnter, onMouseLeave, onClick }: any) {
         top: node.y ?? 0,
         width: w,
         height: h,
-        background: color,
-        border: `1px solid rgba(0,0,0,0.15)`,
+        backgroundImage: cushion,
+        backgroundColor: color,
+        borderRadius: 2,
+        boxShadow: "inset 0 1px 1px rgba(255,255,255,0.35), inset 0 -2px 3px rgba(0,0,0,0.30)",
+        border: "1px solid rgba(0,0,0,0.18)",
         overflow: "hidden",
-        cursor: node.data.nodeType === "folder" ? "pointer" : "default",
+        cursor: isFolder ? "pointer" : "default",
         display: "flex",
         alignItems: "flex-start",
         padding: showLabel ? "3px 5px" : "0",
+        opacity: dim ? 0.16 : 1,
         transition: "opacity 0.15s",
       }}
-      onMouseEnter={onMouseEnter}
-      onMouseLeave={onMouseLeave}
-      onClick={node.data.nodeType === "folder" ? handleClick : undefined}
-      title={`${label}${node.data.value ? ` — ${formatFileSize(node.data.value)}` : node.data.nodeType === "folder" ? ` — ${formatFileSize(node.data.size)}` : ""}`}
+      onMouseEnter={() => onHoverEnter(node)}
+      onMouseLeave={onHoverLeave}
+      onClick={isFolder ? handleClick : undefined}
+      onContextMenu={(event) => onContext(event, node)}
+      title={`${label} — ${formatFileSize(node.data.size)}`}
     >
       {showLabel && (
         <span
           style={{
             fontSize: Math.min(11, h * 0.4),
-            color: "rgba(255,255,255,0.9)",
+            color: "rgba(255,255,255,0.95)",
             whiteSpace: "nowrap",
             overflow: "hidden",
             textOverflow: "ellipsis",
             lineHeight: 1.2,
-            textShadow: "0 1px 2px rgba(0,0,0,0.4)",
+            textShadow: "0 1px 2px rgba(0,0,0,0.55)",
           }}
         >
           {label}
@@ -225,8 +324,20 @@ export default function DiskHeatmapPage() {
   const [error, setError] = useState("");
   const [progress, setProgress] = useState<DiskScanProgressEvent | null>(null);
   const [zoomPath, setZoomPath] = useState<string[]>([]);
-  const [hoveredNode, setHoveredNode] = useState<any>(null);
+  const [hoveredNode, setHoveredNode] = useState<ComputedNode | null>(null);
   const [viewScale, setViewScale] = useState(1);
+  const [renderDepth, setRenderDepth] = useState(3);
+
+  // Filtering state
+  const [filterCategories, setFilterCategories] = useState<Set<string>>(new Set());
+  const [minSizeMb, setMinSizeMb] = useState(0);
+  const [namePattern, setNamePattern] = useState("");
+  const [hideNonMatching, setHideNonMatching] = useState(false);
+
+  // Context menu state
+  const [contextMenu, setContextMenu] = useState<ContextMenuState | null>(null);
+  const [actionMessage, setActionMessage] = useState("");
+
   const unlistenRef = useRef<(() => void) | null>(null);
   const isInsideTreemapRef = useRef(false);
   const treemapRef = useRef<HTMLDivElement>(null);
@@ -249,6 +360,21 @@ export default function DiskHeatmapPage() {
       unlistenRef.current?.();
     };
   }, []);
+
+  // Close the context menu on any outside click / escape.
+  useEffect(() => {
+    if (!contextMenu) return;
+    const close = () => setContextMenu(null);
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setContextMenu(null);
+    };
+    window.addEventListener("click", close);
+    window.addEventListener("keydown", onKey);
+    return () => {
+      window.removeEventListener("click", close);
+      window.removeEventListener("keydown", onKey);
+    };
+  }, [contextMenu]);
 
   const handlePickDirectory = useCallback(async () => {
     try {
@@ -273,6 +399,8 @@ export default function DiskHeatmapPage() {
     setZoomPath([]);
     setHoveredNode(null);
     setViewScale(1);
+    setContextMenu(null);
+    setActionMessage("");
 
     try {
       const result = await invokeTauri<DiskScanResult>("scan_disk_usage", {
@@ -296,45 +424,137 @@ export default function DiskHeatmapPage() {
     return findChildNode(scanResult.root, zoomPath) ?? scanResult.root;
   }, [scanResult, zoomPath]);
 
-  // Transform current view for Nivo
+  // Transform current view for Nivo (nested to renderDepth)
   const nivoData = useMemo(() => {
     if (!currentRoot) return null;
-    return transformToNivoData(currentRoot, currentRoot.name);
-  }, [currentRoot]);
+    return transformToNivoData(currentRoot, 0, renderDepth);
+  }, [currentRoot, renderDepth]);
 
-  // Breadcrumb items
-  const breadcrumbItems = useMemo(() => {
-    if (!scanResult) return [];
-    const items = [{ name: scanResult.root.name, path: [] as string[] }];
-    for (let i = 0; i < zoomPath.length; i++) {
-      items.push({
-        name: zoomPath[i],
-        path: zoomPath.slice(0, i + 1),
-      });
-    }
-    return items;
-  }, [scanResult, zoomPath]);
+  const minSizeBytes = minSizeMb > 0 ? minSizeMb * 1024 * 1024 : 0;
+  const filterActive = filterCategories.size > 0 || minSizeBytes > 0 || namePattern.trim() !== "";
 
-  const handleBreadcrumbClick = useCallback((path: string[]) => {
-    setZoomPath(path);
-  }, []);
+  // Set of node paths that match the active filter (folders included if any descendant matches).
+  const matchingPaths = useMemo(() => {
+    const set = new Set<string>();
+    if (!filterActive || !currentRoot) return set;
+    const nameMatcher = buildNameMatcher(namePattern);
+    const walk = (node: DiskNode): boolean => {
+      if (node.nodeType === "folder") {
+        let any = false;
+        for (const child of node.children) {
+          if (walk(child)) any = true;
+        }
+        if (any) set.add(node.path);
+        return any;
+      }
+      const catOk = filterCategories.size === 0 || filterCategories.has(getFileCategory(node.nodeType));
+      const sizeOk = node.size >= minSizeBytes;
+      const nameOk = !nameMatcher || nameMatcher(node.name);
+      const ok = catOk && sizeOk && nameOk;
+      if (ok) set.add(node.path);
+      return ok;
+    };
+    walk(currentRoot);
+    return set;
+  }, [filterActive, currentRoot, filterCategories, minSizeBytes, namePattern]);
 
-  const handleNodeDoubleClick = useCallback(
-    (node: any) => {
-      if (!scanResult || !currentRoot) return;
-      // Only drill into folder nodes
-      if (node.data?.nodeType !== "folder") return;
-      const childName = node.id.split("/").pop();
-      if (!childName) return;
+  const handleZoomIn = useCallback(
+    (node: ComputedNode) => {
+      if (!currentRoot) return;
+      if (node.data.nodeType !== "folder") return;
+      const childName = node.data.name;
       const childNode = currentRoot.children.find((c) => c.name === childName && c.nodeType === "folder");
       if (childNode && childNode.children.length > 0) {
-        setZoomPath([...zoomPath, childName]);
+        setZoomPath((prev) => [...prev, childName]);
         setHoveredNode(null);
         setViewScale(1);
       }
     },
-    [scanResult, currentRoot, zoomPath],
+    [currentRoot],
   );
+
+  // Right-click on empty treemap space → zoom out one level (SpaceSniffer-style).
+  const handleContainerContextMenu = useCallback(
+    (event: React.MouseEvent) => {
+      event.preventDefault();
+      setZoomPath((prev) => (prev.length > 0 ? prev.slice(0, -1) : prev));
+    },
+    [],
+  );
+
+  const handleNodeContext = useCallback((event: React.MouseEvent, node: ComputedNode) => {
+    event.preventDefault();
+    event.stopPropagation();
+    setContextMenu({ x: event.clientX, y: event.clientY, node });
+  }, []);
+
+  // ── File actions ──
+
+  const runAction = useCallback(async (command: string, path: string, fallback: string) => {
+    try {
+      const result = await invokeTauri<FileActionResult>(command, { path });
+      setActionMessage(result.message);
+    } catch (e) {
+      setError(extractErrorMessage(e, fallback));
+    }
+  }, []);
+
+  const handleOpen = useCallback(
+    (node: ComputedNode) => {
+      setContextMenu(null);
+      void runAction("open_path", node.data.path, "打开失败");
+    },
+    [runAction],
+  );
+
+  const handleReveal = useCallback(
+    (node: ComputedNode) => {
+      setContextMenu(null);
+      void runAction("reveal_in_file_manager", node.data.path, "在文件管理器中显示失败");
+    },
+    [runAction],
+  );
+
+  const handleCopyPath = useCallback(async (node: ComputedNode) => {
+    setContextMenu(null);
+    try {
+      await navigator.clipboard.writeText(node.data.path);
+      setActionMessage(`已复制路径: ${node.data.path}`);
+    } catch {
+      setError("复制路径失败");
+    }
+  }, []);
+
+  const handleDelete = useCallback(async (node: ComputedNode) => {
+    setContextMenu(null);
+    const target = node.data;
+    const isFolder = target.nodeType === "folder";
+    const confirmed = window.confirm(
+      `确定要删除${isFolder ? "文件夹（含全部内容）" : "文件"}吗？\n${target.path}\n\n该项目将被移至回收站。`,
+    );
+    if (!confirmed) return;
+    try {
+      const result = await invokeTauri<FileActionResult>("delete_path", { path: target.path });
+      setActionMessage(result.message);
+      // Local tree mutation + recompute totals (no rescan).
+      setScanResult((prev) => {
+        if (!prev) return prev;
+        const { node: newRoot, changed } = removeNodeByPath(prev.root, target.path);
+        if (!changed) return prev;
+        const { files, dirs } = countItems(newRoot);
+        return {
+          ...prev,
+          root: newRoot,
+          totalSize: newRoot.size,
+          totalFiles: files,
+          totalDirs: dirs,
+        };
+      });
+      setHoveredNode(null);
+    } catch (e) {
+      setError(extractErrorMessage(e, "删除失败"));
+    }
+  }, []);
 
   // ── Wheel zoom: visual scale + prevent page scroll ──
 
@@ -373,7 +593,25 @@ export default function DiskHeatmapPage() {
   }, [scanResult]);
 
   // Reset scale when zoom path changes
-  useEffect(() => { setViewScale(1); }, [zoomPath]);
+  useEffect(() => {
+    setViewScale(1);
+  }, [zoomPath]);
+
+  const toggleCategory = useCallback((key: string) => {
+    setFilterCategories((prev) => {
+      const next = new Set(prev);
+      if (next.has(key)) next.delete(key);
+      else next.add(key);
+      return next;
+    });
+  }, []);
+
+  const clearFilters = useCallback(() => {
+    setFilterCategories(new Set());
+    setMinSizeMb(0);
+    setNamePattern("");
+    setHideNonMatching(false);
+  }, []);
 
   // Collect categories present in current view for legend
   const presentCategories = useMemo(() => {
@@ -396,7 +634,9 @@ export default function DiskHeatmapPage() {
       {/* Header */}
       <div>
         <h2 className="text-xl font-semibold text-slate-800">磁盘分析热力图</h2>
-        <p className="text-sm text-slate-500 mt-1">可视化磁盘使用分布，按文件类型着色，点击文件夹可钻入查看。</p>
+        <p className="text-sm text-slate-500 mt-1">
+          参考 SpaceSniffer 的立体方块热力图：嵌套展示磁盘占用，双击钻入、右键空白处返回上级，支持筛选与右键文件操作。
+        </p>
       </div>
 
       {/* Controls */}
@@ -434,6 +674,18 @@ export default function DiskHeatmapPage() {
             />
             <span className="text-xs text-slate-400 w-6 text-right">{maxDepth}</span>
           </label>
+          <label className="flex items-center gap-2 text-sm text-slate-600">
+            <span className="font-medium">嵌套层级:</span>
+            <input
+              type="range"
+              min={1}
+              max={8}
+              value={renderDepth}
+              onChange={(e) => setRenderDepth(Number(e.target.value))}
+              className="w-24 accent-emerald-500"
+            />
+            <span className="text-xs text-slate-400 w-4 text-right">{renderDepth}</span>
+          </label>
           <label className="flex items-center gap-2 text-sm text-slate-600 cursor-pointer">
             <input
               type="checkbox"
@@ -455,6 +707,71 @@ export default function DiskHeatmapPage() {
         </div>
       </div>
 
+      {/* Filter bar */}
+      {scanResult && (
+        <div className="bg-white rounded-xl border border-slate-200 p-4 space-y-3 shadow-sm">
+          <div className="flex items-center gap-3 flex-wrap">
+            <span className="text-sm font-medium text-slate-600">筛选:</span>
+            <input
+              type="text"
+              value={namePattern}
+              onChange={(e) => setNamePattern(e.target.value)}
+              placeholder="名称 (支持 * ?，如 *.log)"
+              className="px-3 py-1.5 rounded-lg border border-slate-300 text-sm w-52 focus:outline-none focus:ring-2 focus:ring-blue-400"
+            />
+            <label className="flex items-center gap-1.5 text-sm text-slate-600">
+              <span>最小大小</span>
+              <input
+                type="number"
+                min={0}
+                value={minSizeMb}
+                onChange={(e) => setMinSizeMb(Math.max(0, Number(e.target.value)))}
+                className="w-20 px-2 py-1.5 rounded-lg border border-slate-300 text-sm focus:outline-none focus:ring-2 focus:ring-blue-400"
+              />
+              <span className="text-slate-400">MB</span>
+            </label>
+            <label className="flex items-center gap-1.5 text-sm text-slate-600 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={hideNonMatching}
+                onChange={(e) => setHideNonMatching(e.target.checked)}
+                className="accent-blue-500"
+              />
+              <span>隐藏不匹配</span>
+            </label>
+            <button
+              type="button"
+              onClick={clearFilters}
+              className="ml-auto px-3 py-1.5 rounded-lg bg-slate-100 hover:bg-slate-200 text-xs font-medium text-slate-600 transition-colors"
+            >
+              清除筛选
+            </button>
+          </div>
+          <div className="flex flex-wrap gap-2">
+            {Object.entries(CATEGORY_LABELS)
+              .filter(([key]) => key !== "folder")
+              .map(([key, label]) => {
+                const active = filterCategories.has(key);
+                return (
+                  <button
+                    key={key}
+                    type="button"
+                    onClick={() => toggleCategory(key)}
+                    className={`px-2.5 py-1 rounded-full text-xs font-medium border transition-colors ${
+                      active
+                        ? "text-white border-transparent"
+                        : "bg-white text-slate-600 border-slate-300 hover:bg-slate-50"
+                    }`}
+                    style={active ? { background: CATEGORY_COLORS[key] } : undefined}
+                  >
+                    {label}
+                  </button>
+                );
+              })}
+          </div>
+        </div>
+      )}
+
       {/* Progress */}
       {scanning && progress && (
         <div className="bg-blue-50 border border-blue-200 rounded-lg px-4 py-3 text-sm text-blue-700 flex items-center gap-2">
@@ -468,9 +785,14 @@ export default function DiskHeatmapPage() {
         </div>
       )}
 
-      {/* Error */}
+      {/* Error / action message */}
       {error && (
         <div className="bg-red-50 border border-red-200 rounded-lg px-4 py-3 text-sm text-red-700">{error}</div>
+      )}
+      {actionMessage && !error && (
+        <div className="bg-emerald-50 border border-emerald-200 rounded-lg px-4 py-2 text-sm text-emerald-700">
+          {actionMessage}
+        </div>
       )}
 
       {/* Scan results */}
@@ -505,7 +827,7 @@ export default function DiskHeatmapPage() {
                 <span className="text-slate-400">/</span>
                 <button
                   type="button"
-                  onClick={() => handleBreadcrumbClick(zoomPath.slice(0, i + 1))}
+                  onClick={() => setZoomPath(zoomPath.slice(0, i + 1))}
                   className={`hover:underline ${i === zoomPath.length - 1 ? "text-slate-700 font-medium" : "text-blue-600"}`}
                 >
                   {segment}
@@ -525,13 +847,14 @@ export default function DiskHeatmapPage() {
         </>
       )}
 
-      {/* Treemap container — always in DOM, native wheel listener attached */}
+      {/* Treemap container — native wheel listener + right-click zoom-out */}
       <div
         ref={treemapRef}
         className="bg-slate-900 rounded-xl overflow-auto shadow-lg relative group"
         style={{ height: nivoData && currentRoot ? 500 : 0, transition: "height 0.2s ease" }}
         onMouseEnter={handleTreemapMouseEnter}
         onMouseLeave={handleTreemapMouseLeave}
+        onContextMenu={handleContainerContextMenu}
       >
         {nivoData && currentRoot && (
           <div
@@ -550,10 +873,23 @@ export default function DiskHeatmapPage() {
               tile="squarify"
               margin={{ top: 2, right: 2, bottom: 2, left: 2 }}
               colors={() => ""}
-              nodeComponent={TreemapNode}
-              onClick={handleNodeDoubleClick}
-              onMouseEnter={(node: any) => setHoveredNode(node)}
-              onMouseLeave={() => setHoveredNode(null)}
+              nodeComponent={(props) => {
+                const node = (props as unknown as { node: ComputedNode }).node;
+                const isMatch = matchingPaths.has(node.data.path);
+                if (filterActive && hideNonMatching && !isMatch) {
+                  return <div style={{ display: "none" }} />;
+                }
+                return (
+                  <TreemapNode
+                    node={node}
+                    dim={filterActive && !isMatch}
+                    onZoomIn={handleZoomIn}
+                    onContext={handleNodeContext}
+                    onHoverEnter={setHoveredNode}
+                    onHoverLeave={() => setHoveredNode(null)}
+                  />
+                );
+              }}
               animate={false}
             />
           </div>
@@ -567,28 +903,68 @@ export default function DiskHeatmapPage() {
               </span>
             )}
             <span className="bg-black/60 text-white/70 text-xs px-2 py-1 rounded-md backdrop-blur-sm">
-              {Math.round(viewScale * 100)}% 滚轮缩放 · 双击钻入
+              {Math.round(viewScale * 100)}% 滚轮缩放 · 双击钻入 · 右键返回
             </span>
           </div>
         )}
       </div>
+
+      {/* Context menu */}
+      {contextMenu && (
+        <div
+          className="fixed z-50 min-w-[160px] rounded-lg border border-slate-200 bg-white py-1 shadow-xl text-sm"
+          style={{ left: contextMenu.x, top: contextMenu.y }}
+          onClick={(e) => e.stopPropagation()}
+        >
+          <div className="px-3 py-1.5 text-xs text-slate-400 truncate max-w-[240px]">
+            {contextMenu.node.data.name}
+          </div>
+          <button
+            type="button"
+            onClick={() => handleOpen(contextMenu.node)}
+            className="block w-full px-3 py-1.5 text-left text-slate-700 hover:bg-slate-100"
+          >
+            打开
+          </button>
+          <button
+            type="button"
+            onClick={() => handleReveal(contextMenu.node)}
+            className="block w-full px-3 py-1.5 text-left text-slate-700 hover:bg-slate-100"
+          >
+            在文件管理器中显示
+          </button>
+          <button
+            type="button"
+            onClick={() => handleCopyPath(contextMenu.node)}
+            className="block w-full px-3 py-1.5 text-left text-slate-700 hover:bg-slate-100"
+          >
+            复制路径
+          </button>
+          <div className="my-1 border-t border-slate-100" />
+          <button
+            type="button"
+            onClick={() => handleDelete(contextMenu.node)}
+            className="block w-full px-3 py-1.5 text-left text-red-600 hover:bg-red-50"
+          >
+            删除（移至回收站）
+          </button>
+        </div>
+      )}
 
       {scanResult && (
         <>
           {/* Hovered node detail */}
           {hoveredNode && (
             <div className="bg-white rounded-lg border border-slate-200 px-4 py-3 shadow-sm text-sm flex items-center gap-4">
-              <span className="font-medium text-slate-700">
-                {hoveredNode.id.split("/").pop()}
-              </span>
+              <span className="font-medium text-slate-700">{hoveredNode.data.name}</span>
               <span className="text-slate-500">
-                {hoveredNode.data?.nodeType === "folder"
-                  ? `文件夹 — ${formatFileSize(hoveredNode.data?.size ?? hoveredNode.value ?? 0)}`
-                  : `${hoveredNode.data?.nodeType?.toUpperCase() ?? "文件"} — ${formatFileSize(hoveredNode.value ?? 0)}`}
+                {hoveredNode.data.nodeType === "folder"
+                  ? `文件夹 — ${formatFileSize(hoveredNode.data.size)}`
+                  : `${hoveredNode.data.nodeType.toUpperCase()} — ${formatFileSize(hoveredNode.data.size)}`}
               </span>
               <span
                 className="w-3 h-3 rounded-sm inline-block"
-                style={{ background: getCategoryColor(hoveredNode.data?.nodeType ?? "other") }}
+                style={{ background: getCategoryColor(hoveredNode.data.nodeType) }}
               />
             </div>
           )}
@@ -599,10 +975,7 @@ export default function DiskHeatmapPage() {
               .filter(([key]) => presentCategories.has(key))
               .map(([key, label]) => (
                 <span key={key} className="flex items-center gap-1.5">
-                  <span
-                    className="w-3 h-3 rounded-sm inline-block"
-                    style={{ background: CATEGORY_COLORS[key] }}
-                  />
+                  <span className="w-3 h-3 rounded-sm inline-block" style={{ background: CATEGORY_COLORS[key] }} />
                   {label}
                 </span>
               ))}

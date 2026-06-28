@@ -5,7 +5,7 @@ also_affects:
   - system-02-tauri-backend
 branch: 002-disk-analyzer-spacesniffer
 created: 2026-06-28
-status: in-progress
+status: complete
 ---
 
 # Feature Specification: 磁盘分析功能优化（参考 SpaceSniffer）

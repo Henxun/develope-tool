@@ -1,7 +1,7 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { ResponsiveTreeMapHtml } from "@nivo/treemap";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { TreeMapHtml } from "@nivo/treemap";
 import { listen } from "@tauri-apps/api/event";
 import { invokeTauri, toSinglePath } from "@/lib/tauri";
 import { open } from "@tauri-apps/plugin-dialog";
@@ -537,6 +537,28 @@ export default function DiskHeatmapPage() {
   const [contextMenu, setContextMenu] = useState<ContextMenuState | null>(null);
   const [actionMessage, setActionMessage] = useState("");
 
+  // Measure the treemap container ourselves and feed explicit dimensions to the
+  // non-responsive TreeMapHtml. Nivo's ResponsiveTreeMapHtml relies on an internal
+  // ResizeObserver that, inside the Tauri WebView, can report a width far smaller
+  // than the container on first paint — leaving a large dark band on the right.
+  const TREEMAP_HEIGHT = 500;
+  const treemapBoxRef = useRef<HTMLDivElement | null>(null);
+  const [treemapWidth, setTreemapWidth] = useState(0);
+
+  useLayoutEffect(() => {
+    const el = treemapBoxRef.current;
+    if (!el) return;
+    const measure = () => setTreemapWidth(el.clientWidth);
+    measure();
+    const ro = new ResizeObserver(measure);
+    ro.observe(el);
+    window.addEventListener("resize", measure);
+    return () => {
+      ro.disconnect();
+      window.removeEventListener("resize", measure);
+    };
+  }, [scanResult]);
+
   const unlistenRef = useRef<(() => void) | null>(null);
 
   // Listen for scan progress events
@@ -1041,24 +1063,25 @@ export default function DiskHeatmapPage() {
 
       {/* Treemap container — left-click drills in, right-click zooms out */}
       <div
+        ref={treemapBoxRef}
         className="bg-slate-900 rounded-xl overflow-hidden shadow-lg relative group"
-        style={{ height: nivoData && currentRoot ? 500 : 0, transition: "height 0.2s ease" }}
+        style={{ height: nivoData && currentRoot ? TREEMAP_HEIGHT : 0, transition: "height 0.2s ease" }}
         onContextMenu={handleContainerContextMenu}
       >
-        {nivoData && currentRoot && (
-          <div style={{ width: "100%", height: "100%" }}>
-            <ResponsiveTreeMapHtml
-              data={nivoData}
-              identity="id"
-              value="value"
-              tile="squarify"
-              margin={{ top: 2, right: 2, bottom: 2, left: 2 }}
-              colors={() => ""}
-              onClick={(nivoNode: ComputedNode) => handleZoomIn(nivoNode)}
-              nodeComponent={nodeComponent}
-              animate={false}
-            />
-          </div>
+        {nivoData && currentRoot && treemapWidth > 0 && (
+          <TreeMapHtml
+            width={treemapWidth}
+            height={TREEMAP_HEIGHT}
+            data={nivoData}
+            identity="id"
+            value="value"
+            tile="squarify"
+            margin={{ top: 2, right: 2, bottom: 2, left: 2 }}
+            colors={() => ""}
+            onClick={(nivoNode: ComputedNode) => handleZoomIn(nivoNode)}
+            nodeComponent={nodeComponent}
+            animate={false}
+          />
         )}
         {/* Zoom controls overlay */}
         {nivoData && currentRoot && (

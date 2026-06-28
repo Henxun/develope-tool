@@ -827,7 +827,7 @@ export default function DiskHeatmapPage() {
       <div>
         <h2 className="text-xl font-semibold text-slate-800">磁盘分析热力图</h2>
         <p className="text-sm text-slate-500 mt-1">
-          参考 SpaceSniffer 的立体方块热力图：嵌套展示磁盘占用，单击文件夹钻入、右键空白处返回上级，支持筛选与右键文件操作。
+          参考 SpaceSniffer 的立体方块热力图：嵌套展示磁盘占用，单击钻入、点击标题栏或右键返回上级，支持筛选与右键操作。
         </p>
       </div>
 
@@ -1021,10 +1021,11 @@ export default function DiskHeatmapPage() {
         </>
       )}
 
-      {/* Folder header strip (SpaceSniffer-style) + treemap container */}
+      {/* Folder header strip — click to zoom out one level (SpaceSniffer-style) */}
       {nivoData && currentRoot && (
         <div
-          className="flex items-center justify-between rounded-t-xl px-4 py-2 text-sm font-medium"
+          onClick={() => setZoomPath((prev) => (prev.length > 0 ? prev.slice(0, -1) : prev))}
+          className="flex items-center justify-between rounded-t-xl px-4 py-2 text-sm font-medium cursor-pointer select-none"
           style={{
             background: "linear-gradient(180deg, #f5deb8 0%, #e9c795 100%)",
             color: "#7a5a2a",
@@ -1068,7 +1069,7 @@ export default function DiskHeatmapPage() {
               </span>
             )}
             <span className="bg-black/60 text-white/70 text-xs px-2 py-1 rounded-md backdrop-blur-sm">
-              单击钻入 · 右键返回
+              单击钻入 · 点击标题栏返回上级
             </span>
           </div>
         )}

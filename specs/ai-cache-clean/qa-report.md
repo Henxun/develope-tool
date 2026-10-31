@@ -36,6 +36,20 @@
 - 前端（静态核对 + build）：`tool-cache-card.tsx:45` 按 `cleanable` 拆分 `readonlyCategories`，`:189-205` 渲染「会话与模型数据（仅展示，不清理）」区块；`category-section.tsx:97-119` 对不可清理类别显示「仅展示」徽标与「计算占用」按钮；`page.tsx:540-575` 计算占用时调 `scanAiCacheUsage([toolId], true)` 并把结果合并回卡片（`:810` 绑定）；`e991341` 起 heavy 计算期间禁用重新扫描，避免两路进度混入同一条进度条。
 - 未验：真实 Tauri 页面点按（需开窗应用），按 §4 记为「无法验证」。
 
+### 0.2.2 `5a6fa30` 前端 delta 验收（纯前端，后端未动）
+
+`git show 5a6fa30 --stat` = 4 个前端文件（`page.tsx`、`category-section.tsx`、`clean-result-panel.tsx`、`tool-cache-card.tsx`），**无任何 Rust/后端改动**；`8df1201` 仅新增 1 条测试（9 工具矩阵字面断言），不改产品行为。逐条核对：
+
+| delta 项 | 结论 | 代码证据（当前 HEAD） |
+|---|---|---|
+| 重扫 ↔「计算占用」互斥 | ✅ 双向互斥（代码走查） | ① heavy 入口先查 `scanTaskPendingRef.current`，占用中直接不请求并提示「后台扫描仍在进行，完成前无法计算占用」（`page.tsx:570-573`）；② 主扫描未结束时 measure 按钮经 `scanPending` → `heavyBlocked` 禁用（`page.tsx:858`、`tool-cache-card.tsx:180/206`、`category-section.tsx:117`），并有头部提示「…无法重新扫描或计算占用」（`page.tsx:729`）；③ 「计算占用」进行中重扫按钮 `disabled` 含 `heavyLoading.size > 0`（`page.tsx:718`）；④ 点「停止显示结果」后 `scanTaskPendingRef` 仍为 true（只影响界面，后端扫描继续），因此仍与 heavy 互斥（`page.tsx:295/329`） |
+| 某批命令级 Err → 已删量保留并标注 | ✅ | `runCleanBatches` 逐批 `try/catch`，失败时返回 `{ result: 已完成批次合并值, failure: {batchIndex,batchTotal,message} }`（`page.tsx:143-196`）；真实清理无论成败先 `setCleanResult(合并结果)`，失败再设提示「第 x/y 批清理失败，前 y 批已生效：…」(`page.tsx:656`)；结果面板新增 `failureNotice` 琥珀色横幅渲染（`clean-result-panel.tsx:81-85`），关闭时一并清空 |
+| 预览失败零删除 | ✅ | 预览分批 `dryRun=true`，任一批 Err 即 `setError("第 x/y 批预览失败，未执行任何删除：…")` 并返回，不设置 preview（`page.tsx:607-621`）；dry-run 本身不产生文件系统变更，提示诚实 |
+| 计数不混淆 | ✅ | 失败批次不计入 `merged`（catch 在累加之前返回）；已生效批次 freed/deleted/skipped/failed/items 正常累加 |
+
+- 残留观察（低，非阻塞）：`heavyLoading` 是 Set，允许同时点两个工具的「计算占用」；两次 heavy 扫描各自合并回所属工具卡、不共用进度条，未观察到数据串扰，但确为并发请求——如后续想严格串行可再加一个全局 heavy pending 标记。
+- 未验：真机 Tauri 窗口点按（本机无法开窗）；前端无单测框架，本项证据 = 代码走查 + `npm run lint`/`npm run build` 通过。
+
 ### 0.3 质量门（最终 HEAD `8df1201` 实测）
 
 ```

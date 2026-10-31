@@ -53,11 +53,9 @@
 - 9 个工具：Claude Code、Claude Desktop、Codex CLI、Cursor、GitHub Copilot（VS Code 扩展）、
   GitHub Copilot CLI、Windsurf、Gemini CLI、Ollama。
 - macOS / Linux / Windows 三平台（按编译目标 `cfg!` 选择根目录，不做运行时 OS 插件依赖）。
-- 系统缓存根（D4）：macOS `~/Library/Caches/claude-cli-nodejs`、`~/Library/Caches/Cursor`、
-  `~/Library/Caches/com.exafunction.windsurf`、`~/Library/Logs/Claude`，Linux `~/.cache/claude-cli-nodejs`
-  —— **只按精确白名单条目清理**：固定子路径，或「枚举直接父目录 + 末段单层模式」（如
-  `<项目目录>/--mcp-logs-*`）；**不整根删除、不做整层通配**。
-- 工具矩阵固定 9 个（spec v1.1 / D5）：系统缓存根作为**已有工具的附加根**，不新增工具条目；
+- 系统缓存根（D4）**不进 v1**：v1 不扫描、不清理 macOS `~/Library/Caches`、`~/Library/Logs` 等系统缓存目录；
+  相关设计已评审但未实现，留 v1.1 backlog（§16）。
+- 工具矩阵固定 9 个（spec v1.1 / D5）：不新增工具条目；
   Claude Desktop 的 `claude_desktop_config.json`、扩展安装目录、config/state 文件仅展示/受保护。
 - 存在性检测 + 体积扫描 + 按工具/类别/路径的选择 + dry-run + 永久删除 + 结果与失败明细。
 - 仅清理 cache / logs 两类；sessions / model_cache 只展示占用（`cleanable=false`），不提供删除入口。
@@ -120,8 +118,6 @@ Tool（AI 工具，如 claude-code）
 |---|---|---|---|
 | `Home` | `$HOME` | `$HOME` | `%USERPROFILE%`（回退 `HOMEDRIVE+HOMEPATH`） |
 | `MacApplicationSupport` | `$HOME/Library/Application Support` | — | — |
-| `MacLibraryCaches` | `$HOME/Library/Caches` | — | — |
-| `MacLibraryLogs` | `$HOME/Library/Logs` | — | — |
 | `XdgConfig` | `~/.config`（mac 上部分跨平台 CLI 仍用它） | `$XDG_CONFIG_HOME` 或 `~/.config` | — |
 | `XdgData` | `~/.local/share` | `$XDG_DATA_HOME` 或 `~/.local/share` | — |
 | `XdgCache` | `~/.cache` | `$XDG_CACHE_HOME` 或 `~/.cache` | — |
@@ -159,20 +155,10 @@ Tool（AI 工具，如 claude-code）
 
 > 图例：✅ 已确认；⚠️ 待实测（实现时用 `ls` 核对真实安装，确认后再进白名单，否则注释掉并在 `catalog.rs` 留 TODO）。
 
-**系统缓存根（D4；作为附加根挂在已经存在的 9 个工具上，不新增工具）**
-
-| 工具 | 平台 | 系统缓存根 | 精确白名单条目（相对根） |
-|---|---|---|---|
-| `claude-code` | macOS | `~/Library/Caches/claude-cli-nodejs` | `<项目目录>/--mcp-logs-*` |
-| `claude-code` | macOS | `~/Library/Logs/Claude` | 根目录本身（日志根，唯一特例，§7.9） |
-| `claude-code` | Linux | `~/.cache/claude-cli-nodejs` | `<项目目录>/--mcp-logs-*` |
-| `cursor` | macOS | `~/Library/Caches/Cursor` | `Cache`、`Code Cache`、`CachedData`、`GPUCache`、`DawnGraphiteCache`、`DawnWebGPUCache`、`GrShaderCache`、`ShaderCache` |
-| `windsurf` | macOS | `~/Library/Caches/com.exafunction.windsurf` | 同 Cursor 的系统缓存根条目 |
-| 任一工具 | Windows | — | 结构未实测，v1.2 不启用（不猜路径） |
-
-规则（R15 / §7.9）：只删表中**精确条目**；不删系统缓存根本身（`~/Library/Logs/Claude` 日志根除外）；
-禁止 `*` 或 `*/*` 匹配根下任意子项；未列出的子目录一律不动；根下无匹配条目时显示"无可清理项"，
-**不退回整根删除**。`<项目目录>` 必须来自该根下的实际磁盘枚举（单层目录名，不含分隔符 / `..`）。
+> **系统缓存根（D4）不进 v1**：`~/Library/Caches/claude-cli-nodejs`、`~/Library/Caches/Cursor`、
+> `~/Library/Caches/com.exafunction.windsurf`、`~/Library/Logs/Claude`、`~/.cache/claude-cli-nodejs`
+> 等系统缓存目录 v1 不扫描、不清理（代码中无相关条目）。已评审的设计与测试点移入 v1.1 backlog（§16），
+> 工具矩阵仍固定 9 个（D5）。
 
 ### 5.3 各工具明细（相对根目录的路径 → 类别）
 
@@ -206,16 +192,7 @@ Tool（AI 工具，如 claude-code）
 `workflows/`、`themes/`、`keybindings.json`、`agent-memory/`、`jobs/`、`daemon/`、`CLAUDE.md`、
 `remote-settings.json`、`policy-limits.json`、`stats-cache.json`、以及根同级的 `~/.claude.json`。
 
-**系统缓存根（D4，精确条目；不新增工具）**
-
-| 系统缓存根 | 白名单条目 | 说明 |
-|---|---|---|
-| macOS `~/Library/Caches/claude-cli-nodejs` | `<项目目录>/--mcp-logs-*` | MCP 日志是常见体积大头；只删名称以 `--mcp-logs-` 开头的子目录本身，**不删项目目录、不删缓存根、不做 `*/*` 通配** |
-| macOS `~/Library/Logs/Claude` | 根目录本身（日志根） | 旧版日志输出位置，整目录均为日志；唯一允许"目标是根"的特例（§7.9） |
-| Linux `~/.cache/claude-cli-nodejs` | `<项目目录>/--mcp-logs-*` | 语义同 macOS |
-| Windows | — | 结构未实测，v1.2 不启用（不猜路径） |
-
-> 归属类别：MCP 日志条目归 `logs`（可清理）；Electron 缓存类条目归 `cache`。
+> 系统缓存根（`~/Library/Caches/claude-cli-nodejs` 等）v1 不处理，见 §16 backlog。
 
 #### 5.3.2 Claude Desktop（`claude-desktop`）— Electron 标准布局 ✅/⚠️
 
@@ -224,7 +201,7 @@ Tool（AI 工具，如 claude-code）
 | `Cache` / `Code Cache` / `CachedData` / `GPUCache` / `DawnGraphiteCache` / `DawnWebGPUCache` / `GrShaderCache` / `ShaderCache` | dir | cache ✅ | Chromium 缓存 |
 | `Service Worker/CacheStorage` / `Service Worker/ScriptCache` | dir | cache ✅ | 仅缓存 |
 | `Crashpad` | dir | logs ✅ | 崩溃转储 |
-| `logs` | dir | logs ✅ | 应用日志（mac 上日志也可能在 `~/Library/Logs/Claude`，v2 再加第二个根） |
+| `logs` | dir | logs ✅ | 应用日志（mac 上日志也可能在 `~/Library/Logs/Claude`，属 v1.1 backlog，见 §16） |
 | `IndexedDB` / `Local Storage` | dir | sessions ⚠️ | 本地会话/界面态；v1 仅展示，不提供清理 |
 
 仅展示/受保护（C 类，**不进入可清理类别**，D5）：`claude_desktop_config.json`（MCP 配置）、
@@ -267,10 +244,6 @@ D5 口径：Claude Desktop **只清理上表 Electron 缓存/日志（A 类）**
 `state.vscdb.backup`、`User/settings.json`、`User/keybindings.json`、`extensions/`、`User/globalStorage/storage.json`。
 ⚠️ v2 候选（待实测命名）：`User/globalStorage/anysphere.cursor-*`（向量索引/embeddings 缓存，通常很大）。
 
-**系统缓存根（D4，macOS）**：`~/Library/Caches/Cursor` 下仅白名单 `Cache`、`Code Cache`、`CachedData`、
-`GPUCache`、`DawnGraphiteCache`、`DawnWebGPUCache`、`GrShaderCache`、`ShaderCache`；不删缓存根本身，
-不删未列出子目录，根下无匹配时显示"无可清理项"（§7.9）。
-
 #### 5.3.5 GitHub Copilot — VS Code 扩展（`copilot-vscode`）
 
 | 相对路径（相对 `.../User/globalStorage`） | 类别 | 说明 |
@@ -305,10 +278,6 @@ D5 口径：Claude Desktop **只清理上表 Electron 缓存/日志（A 类）**
 受保护：`User/globalStorage/state.vscdb`（聊天/状态库）、`User/settings.json`、`extensions/`、
 `User/globalStorage/*`（Codeium 登录态等，白名单外自动受保护）；另 `~/.codeium`（账号 token + Cascade 记忆）
 不在扫描范围内。
-
-**系统缓存根（D4，macOS）**：`~/Library/Caches/com.exafunction.windsurf` 下仅白名单 `Cache`、`Code Cache`、
-`CachedData`、`GPUCache`、`DawnGraphiteCache`、`DawnWebGPUCache`、`GrShaderCache`、`ShaderCache`；
-不删缓存根本身、不删未列出子目录（§7.9）。
 
 #### 5.3.8 Gemini CLI（`gemini-cli`）— v1 无 A 类白名单，**完全只读**
 
@@ -560,9 +529,6 @@ pub struct AiCacheCleanProgressEvent {
 
 ### 6.3 命令签名（3 个）
 
-> 系统缓存根（D4）不新增命令、不新增 DTO 字段：它们作为 `roots` 里的额外根出现，每个根自带
-> `categories`（来源 `overrides` / `children_globs`）。`clean` 仍只接收 `{ toolId, category, path }`。
-
 ```rust
 #[tauri::command]
 pub fn get_ai_cache_catalog() -> Result<AiCacheCatalog, String>;
@@ -642,37 +608,21 @@ pub fn current_platform() -> Platform { /* cfg! 分支 */ }
 
 #[derive(Clone, Copy)]
 pub enum BaseDir {
-    Home, MacApplicationSupport, MacLibraryCaches, MacLibraryLogs,
-    XdgConfig, XdgData, XdgCache, AppDataRoaming, LocalAppData,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum RootKind {
-    /// 工具数据根（默认）：`~/.claude`、`~/Library/Application Support/Cursor` 等。
-    ToolData,
-    /// 系统缓存根（D4）：`~/Library/Caches/<app>`、`~/Library/Logs/Claude` 等。
-    /// 只允许精确条目，禁止整根删除 / 整层通配（§7.9）。
-    SystemCache,
+    Home, MacApplicationSupport, XdgConfig, XdgData, XdgCache,
+    AppDataRoaming, LocalAppData,
 }
 
 pub struct RootSpec {
     pub platforms: &'static [Platform],
     pub base: BaseDir,
-    pub relative: &'static str,             // 如 ".claude" / "Cursor/User/globalStorage"
+    pub relative: &'static str,            // 如 ".claude" / "Cursor/User/globalStorage"
     pub env_override: Option<&'static str>, // 如 Some("CLAUDE_CONFIG_DIR")
-    pub kind: RootKind,                     // 新增：ToolData | SystemCache
-    /// 空 = 继承工具级 categories；系统缓存根必须显式给出自己的精确条目。
-    pub overrides: &'static [CategorySpec],
-    /// 仅系统日志根使用（`~/Library/Logs/Claude`）：允许把该根目录本身作为唯一删除目标。
-    pub root_as_target: bool,
 }
 
 pub struct CategorySpec {
     pub category: AiCacheCategory,
-    pub paths: &'static [&'static str],       // 固定子路径 / 末段单层 glob
-    /// 系统缓存根专用：「根下每个直接子目录」内再匹配该末段模式（如 "--mcp-logs-*"）。
-    /// 父目录名由 `read_dir` 实测枚举，配置里**不允许**写 `*` / `*/*` 段。
-    pub children_globs: &'static [&'static str],
+    // label / risk / default_selected / description 由 category_meta(category) 统一提供（DRY）
+    pub paths: &'static [&'static str],    // 相对路径；文件类目标允许末段含 '*'
 }
 
 pub struct ToolSpec {
@@ -697,64 +647,27 @@ const TOOLS: &[ToolSpec] = &[
         id: "claude-code",
         name: "Claude Code",
         vendor: "Anthropic",
-        roots: &[
-            // 工具数据根
-            RootSpec {
-                platforms: ALL_PLATFORMS,
-                base: BaseDir::Home,
-                relative: ".claude",              // Windows 由 Path::join 处理分隔符
-                env_override: Some("CLAUDE_CONFIG_DIR"),
-                kind: RootKind::ToolData,
-                overrides: &[],
-                root_as_target: false,
-            },
-            // D4：macOS 系统缓存根（MCP 日志），只按 `<项目目录>/--mcp-logs-*` 精确条目清理
-            RootSpec {
-                platforms: &[Platform::MacOs],
-                base: BaseDir::MacLibraryCaches,
-                relative: "claude-cli-nodejs",
-                env_override: None,
-                kind: RootKind::SystemCache,
-                overrides: &[CategorySpec {
-                    category: AiCacheCategory::Logs,
-                    paths: &[],
-                    children_globs: &["--mcp-logs-*"],
-                }],
-                root_as_target: false,
-            },
-            // D4：旧版日志根（整目录均为日志，唯一允许 root_as_target 的特例）
-            RootSpec {
-                platforms: &[Platform::MacOs],
-                base: BaseDir::MacLibraryLogs,
-                relative: "Claude",
-                env_override: None,
-                kind: RootKind::SystemCache,
-                overrides: &[CategorySpec {
-                    category: AiCacheCategory::Logs,
-                    paths: &[],
-                    children_globs: &[],
-                }],
-                root_as_target: true,
-            },
-        ],
+        roots: &[RootSpec {
+            platforms: ALL_PLATFORMS,
+            base: BaseDir::Home,
+            relative: ".claude",                  // Windows 由 Path::join 处理分隔符
+            env_override: Some("CLAUDE_CONFIG_DIR"),
+        }],
         categories: &[
             CategorySpec {
                 category: AiCacheCategory::Cache,
                 paths: &["cache", "shell-snapshots", "paste-cache", "image-cache",
                          "todos", "statsig", "logs", "plans", "session-env",
                          "backups", "usage-data"],
-                children_globs: &[],
             },
             CategorySpec {
                 category: AiCacheCategory::Logs,
                 paths: &["debug"],
-                children_globs: &[],
             },
             CategorySpec {
                 category: AiCacheCategory::Sessions,   // 仅展示（is_cleanable=false）
                 paths: &["projects", "file-history", "tasks", "uploads", "dev-mods",
                          "feedback", "feedback-bundles", "history.jsonl"],
-                children_globs: &[],
             },
         ],
         protected: &[".credentials.json", "settings.json", "settings.local.json",
@@ -763,8 +676,7 @@ const TOOLS: &[ToolSpec] = &[
                      "jobs", "daemon", "CLAUDE.md", "remote-settings.json",
                      "policy-limits.json", "stats-cache.json"],
     },
-    // …其余 8 个工具同形状，数据以 §5.3 表为准；D4 系统缓存根只在
-    // claude-code（macOS + Linux）、cursor（macOS）、windsurf（macOS）上挂附加根。
+    // …其余 8 个工具同形状，数据以 §5.3 表为准（v1 不含系统缓存根，见 §16）
 ];
 ```
 
@@ -779,11 +691,9 @@ const TOOLS: &[ToolSpec] = &[
    目录类模板只收 `is_dir()` 的命中项（B1，见 §7.8）。
 4. 白名单匹配（clean 校验用）：解析后的绝对路径与"工具 × 类别 × 实际存在的目标"逐一相等比较
    （Windows 下路径大小写不敏感比较，见 §7.3）。不做"前缀宽松匹配"；模板类型（dir/file）不符同样拒绝。
-5. **根级白名单覆盖**：`root.overrides` 非空时该根使用覆盖后的类别条目（系统缓存根必须显式覆盖）；
-   空时继承 `ToolSpec.categories`。scan 按「根 × 该根的有效类别条目」展开，DTO 中每个 root 自带 categories。
-6. **系统缓存根（D4）**：`kind=SystemCache` 的根只允许 `paths` 固定条目 + `children_globs`
-   （枚举直接子目录后的末段模式）命中；配置里不允许出现 `*` / `*/*` 段；
-   `root_as_target=true` 仅用于 `~/Library/Logs/Claude` 这类日志根（§7.9）。
+
+> 系统缓存根（D4）所需的 `RootKind::SystemCache`、根级 `overrides`、`children_globs` 设计属
+> v1.1 backlog，见 §16；v1 的 `catalog.rs` 不包含这些结构。
 
 ### 6.7 扫描实现（`scan.rs`）
 
@@ -799,9 +709,9 @@ scan_all_with_heavy(platform, lookup, tool_ids, include_heavy, sink):
 `scan_tool`（对每个 resolved root）：
 1. `root.exists()` 为 false → `exists=false`，categories 全空，跳过。
 2. 工具级 `policy.cleanable=false`（降级，§7.7）→ 正常返回数据，但 `cleanable=false` + warnings。
-3. 对每个 root 的**有效 CategorySpec**（`root.overrides` 非空则用覆盖，否则继承工具级）：
+3. 对每个 CategorySpec（v1 所有根的类别条目来自 `ToolSpec.categories`）：
    - `measured = include_heavy || category.is_cleanable()`；未测的展示类别只展开路径、`bytes=0`、`measured=false`。
-   - 解析实际存在的 targets（固定条目 / 末段 glob / 系统缓存根的 `children_globs`；`symlink_metadata` 判断，
+   - 解析实际存在的 targets（固定条目 / 末段 glob；`symlink_metadata` 判断，
      符号链接 → warning，不 follow）；不存在的 target 不返回。
    - 每个 target 调 `measure_bytes()`：目录 `WalkDir::follow_links(false)` 跳过 symlink 条目，
      文件取 `metadata.len()`；同时得出 `last_modified_ms`；`in_use = 最近 10 分钟内有修改`
@@ -994,22 +904,6 @@ clean_all(platform, lookup, request, sink):
 5. 单测（B1 专项）：同名目录存在时 `logs_*.sqlite` 模板不得命中；同名普通文件存在时目录类模板不得命中；
    传"模板命中但类型不符"的路径 → 拒绝且磁盘零变化。
 
-### 7.9 系统缓存根（D4）校验规则
-
-系统缓存根与工具数据根共用校验管线，但额外加硬约束：
-
-1. 白名单只能来自 `RootSpec.overrides` 的 `paths` / `children_globs`；catalog 期断言配置里不出现
-   `*` 作为独立段（`children_globs` 的父目录由 `read_dir` 实测枚举，配置里不写 `*` 段）。
-2. `children_globs` 展开：枚举根下每个直接子目录（跳过 symlink），在该子目录内按末段模式匹配；
-   父目录名必须是单层目录名（不含 `/`、`\`、`..`）；匹配到的目标仍要过 §7.2 全套校验。
-3. **不删系统缓存根本身**：仅 `root_as_target=true` 的日志根（`~/Library/Logs/Claude`）允许目标 == 根；
-   其余系统缓存根（`Caches/<app>`）一律 `ROOT_PROTECTED`，**永不整根删除**。
-4. **不整层通配**：代码中不存在"删根下所有子项"的分支；根下无匹配条目 → 该根 0 项，
-   UI 显示"无可清理项"，**不退回整根删除**。
-5. 降级（§7.7）只针对工具数据根；系统缓存根路径固定，若因异常环境解析到 home / 盘符根，
-   该根同样拒绝并 warning，不进入清理。
-6. 测试：见 §11.6 的 D4 用例（精确条目、项目目录保留、根保留、无关子目录保留、无匹配零删除）。
-
 ---
 
 ## 8. 前端结构
@@ -1146,7 +1040,6 @@ mount
 |---|---|---|
 | catalog（首屏） | < 50ms | 只做路径字符串拼接 + `exists()`，不 walk |
 | 主扫描（9 工具、缓存机 1-5 GB、部分 Cache 目录 10 万文件） | 1–10s | `spawn_blocking` + 工具级 rayon + 事件节流；不建树；不递归 sessions/model_cache |
-| 系统缓存根（D4：MCP 日志 + Electron 缓存） | < 100ms | 固定根 + 精确条目，只 walk 白名单条目，不枚举未列出内容 |
 | 「计算占用」二次扫描（sessions / model_cache） | 按目标体积，可能 10s+ | 单工具粒度触发（`toolIds=[id]`），只扫该工具、只算展示类别，结果合并回卡片 |
 | 清理（永久删除） | 与删除目标体积相关 | 先 `measure_bytes` 再删（一次遍历 + 删除）；≤64 项/批，前端串行分批 |
 | 扫描极端（Cursor Cache 百万文件） | 可能 30s+ | 进度条 + 计时；可「停止显示结果」；不阻塞 UI；真取消 v2 |
@@ -1172,14 +1065,12 @@ mount
 | 12 | Ollama 模型误操作（数 GB 重下载） | 用户代价大 | **v1 `model_cache` 仅展示不可删**；删除入口不存在 | 否 |
 | 13 | 文件/目录类型混淆（B1）：同名目录被文件模板命中并递归删除 | 极高（越界删目录） | 白名单模板类型化（Dir/File）；文件模板只匹配 `is_file()`，目录模板只匹配 `is_dir()`；类型不符拒绝 + B1 专项单测（§7.8） | **是**（修复前阻断上线） |
 | 14 | 单批目标过多（>64）导致长事务/超时 | 部分失败/无响应 | 后端 `MAX_TARGETS_PER_REQUEST=64` 硬限制；前端串行分批并合并结果（§6.10） | 否 |
-| 15 | 系统缓存根被整根 / 通配删除（D4） | 极高（波及未知内容） | 只允许精确条目 + `children_globs`（父目录由枚举得来）；`Caches/<app>` 根永不整根删；无匹配零删除；专项测试（§7.9） | 否 |
-| 16 | Claude Desktop 配置 / 扩展 / 状态被误删（D5） | 高（配置与扩展丢失、需重装） | 它们属于 C 类（仅展示/受保护），不进入可清理类别；Windsurf/Cursor 的扩展目录同理（不在白名单） | 否 |
+| 15 | Claude Desktop 配置 / 扩展 / 状态被误删（D5） | 高（配置与扩展丢失、需重装） | 它们属于 C 类（仅展示/受保护），不进入可清理类别；Windsurf/Cursor 的扩展目录同理（不在白名单） | 否 |
 
 **取舍说明（为什么这样做）**
 
 - **只做白名单删除，不做"目录里除了 X 其余全删"**：少一点清理收益，换掉整类误删风险；符合 constitution 的
-  "security-first"。系统缓存根（D4）同理：只删精确条目（如 `<项目目录>/--mcp-logs-*`），
-  宁可漏清也不整根/整层删除。
+  "security-first"。系统缓存根（D4）已在 v1.1 backlog 中保留同样的"精确条目"原则（§16），v1 不做。
 - **只清 cache / logs，sessions / model_cache 仅展示**：项目定位是"释放磁盘空间"，不是"历史管理"；
   把不可逆的会话/模型删除移出 v1，用"零删除入口"换掉最有价值的误删事故。
 - **v1 永久删除、不做回收站**：回收站不释放空间、还得二次清空，与工具目标矛盾；用 dry-run + 逐路径确认 +
@@ -1260,8 +1151,6 @@ mount
 | 平台 | 用例 | 期望 |
 |---|---|---|
 | macOS | 本机装 Claude Code / Cursor 等 | 自动检测、体积与 `du -sh` 同数量级（±10%）、不卡 UI |
-| macOS | 系统缓存根：`~/Library/Caches/claude-cli-nodejs/<proj>/--mcp-logs-*` | 只清理匹配的 MCP 日志子目录；`<proj>`、缓存根、无关子目录保留 |
-| macOS | `~/Library/Caches/Cursor` 与 `~/Library/Caches/com.exafunction.windsurf` | 只清白名单 Electron 缓存子目录，未列出内容与根保留 |
 | macOS | Claude Desktop 配置与扩展（D5） | `claude_desktop_config.json`、`extensions/`、`config.json`/`state*` 不出现在可清理列表，磁盘不变 |
 | macOS | 用 `tool-data-migrate` 把 `~/.claude` 软链到外盘 | 正常检测到实际路径；删除时不跟随/不越界；给出提示 |
 | macOS | sessions / model_cache 类别 | 只有「计算占用」与「打开目录」，**没有任何删除入口** |
@@ -1273,7 +1162,7 @@ mount
 | 三平台 | 手工 `invoke` 传 `path: "/"` / `"../../x"` / 受保护文件 / 文件模板命中目录 | 全部被拒，无任何删除 |
 | 三平台 | `npm run lint`、`cargo fmt --check`、`cargo clippy`、`cargo test` | 全绿 |
 
-### 11.6 回写新增用例（工具根降级 / 类型匹配 / 分批 / D4 / D5）
+### 11.6 回写新增用例（工具根降级 / 类型匹配 / 分批 / D5）
 
 29. `tool_policy_degrades_on_home_root`：override 指向 `$HOME` → `cleanable=false` + 中文 warning。
 30. `tool_policy_degrades_on_home_ancestor`：override 指向 home 的上级 → 降级。
@@ -1282,15 +1171,11 @@ mount
 33. `degraded_tool_cannot_be_cleaned`：降级工具的 clean 请求 → 命令级 `TOOL_DISABLED`，磁盘零变化。
 34. `catalog_exposes_cleanable_and_warnings`：catalog 与 scan 的 `cleanable` / `warnings` 字段出现在 JSON 中且语义一致。
 35. `file_template_type_mismatch_rejected`（B1）：把同名目录路径按文件模板提交 → `PATH_NOT_ALLOWED`，目录未被删除。
-36. `system_cache_expands_children_globs`（D4）：伪造 `~/Library/Caches/claude-cli-nodejs/<proj>/--mcp-logs-x/`、
-    `<proj>/other/`、`<proj>/` → 只返回 `--mcp-logs-x` 一个 target；`<proj>` 与 `other` 不返回。
-37. `system_cache_never_deletes_root_or_parent`：clean 传缓存根本身或 `<proj>` 目录 → `ROOT_PROTECTED` /
-    `PATH_NOT_ALLOWED`，磁盘零变化。
-38. `system_cache_no_match_is_empty`：根存在但无匹配条目 → 0 个 target，**不退回整根删除**。
-39. `system_cache_exact_subdirs_only`（Cursor）：伪造白名单子目录 + 未列出子目录 → 只返回白名单子目录。
-40. `claude_desktop_config_extensions_not_cleanable`（D5）：`claude_desktop_config.json`、`extensions`、
+36. `claude_desktop_config_extensions_not_cleanable`（D5）：`claude_desktop_config.json`、`extensions`、
     `config.json`、`state*` 不在任何可清理类别；scan 不返回为 target；clean 传入被拒。
-41. `tool_matrix_stays_nine`（D5）：`tools().len() == 9`；系统缓存根不新增工具 id / 不改变工具矩阵。
+37. `tool_matrix_stays_nine`（D5）：`tools().len() == 9`；v1 不新增工具条目（系统缓存根设计属 backlog）。
+
+> 系统缓存根（D4）相关测试点 36–39（旧编号）已移出 v1 验收，见 §16.5。
 
 ---
 
@@ -1301,8 +1186,8 @@ mount
 | D1 | 删除方式 | **v1 只做永久删除**：不提供回收站选项、不引入 `trash` 相关依赖（零新增依赖） | `clean.rs` 用 `fs::remove_dir_all` / `fs::remove_file`；DTO 无 `deletionMode` 字段（§6.2 / §7.6） |
 | D2 | sessions 类别 | **v1 仅展示，不提供清理** | `AiCacheCategory::is_cleanable()` 只对 cache/logs 为 true；`cleanable=false`；clean 命令级 `CATEGORY_NOT_CLEANABLE` |
 | D3 | Ollama model_cache | **v1 仅展示，不提供清理** | 同上；模型体积照常展示，无删除入口 |
-| D4 | 系统缓存根（macOS 等） | **纳入可清理范围，但只按精确白名单条目删除**：Claude Code `<项目目录>/--mcp-logs-*`、`~/Library/Logs/Claude`（日志根）；Cursor / Windsurf `~/Library/Caches/<app>` 下指定的 Electron 缓存子目录；**禁止整根删除 / `*` / `*/*` 通配** | §5.2 系统缓存根表 + §7.9；`RootKind::SystemCache` + `overrides` + `children_globs`；根级保留与无匹配零删除单测 |
-| D5 | 工具矩阵与 Claude Desktop 边界 | **保持 spec v1.1 的 9 工具矩阵不变**；Claude Desktop 的 `claude_desktop_config.json`、扩展安装目录、`config.json` / `state*` 等配置与状态文件归「仅展示 / 受保护」，不进入可清理类别 | §5.2/§5.3.2；系统缓存根作为附加根不新增工具；`tools().len()==9` 单测；C 类 protected |
+| D4 | 系统缓存根（macOS 等） | **最终裁决：不进 v1，留 backlog（v1.1）**。代码中无 `claude-cli-nodejs` / `~/Library/Caches` 条目，v1 不扫描、不清理系统缓存根；已评审的精确条目设计移入 §16（设计已备，未实现） | v1：无相关代码/命令/测试；v1.1：§16（`RootKind::SystemCache` + 根级 `overrides` + `children_globs`，精确条目、禁止整根/通配） |
+| D5 | 工具矩阵与 Claude Desktop 边界 | **保持 spec v1.1 的 9 工具矩阵不变**；Claude Desktop 的 `claude_desktop_config.json`、扩展安装目录、`config.json` / `state*` 等配置与状态文件归「仅展示 / 受保护」，不进入可清理类别 | §5.2/§5.3.2；`tools().len()==9` 单测；C 类 protected |
 | D6 | 白名单文件类目标（Reviewer B1） | **保留文件类目标，但只允许匹配文件，不允许匹配目录** | 模板类型化 Dir/File；`expand_targets` / `template_matches` 复核 `is_file()` / `is_dir()`；类型不符 `PATH_NOT_ALLOWED`；专项单测（§7.8） |
 | D7 | 工具根降级 | 由 env override 得到的 root == home / home 的祖先 / 文件系统根 → 该工具降级为「仅检测」（`cleanable=false`），catalog 与 scan 返回 warnings | §7.7；`tool_policy_for_roots`；clean 命令级 `TOOL_DISABLED`，单条校验再拦一次 |
 | D8 | 清理请求分批 | **单次最多 64 项**，前端负责分批调用并合并结果 | §6.10；后端 `MAX_TARGETS_PER_REQUEST`，超出命令级 `INVALID_ARGUMENT` |
@@ -1313,8 +1198,9 @@ mount
 
 **回写说明**：本版把初稿中的 `deletionMode` / `riskAck` / 默认回收站 / sessions+model_cache 可清理
 等设计全部改为实现口径；DTO 增补 `cleanable` / `inUse` / `lastModifiedMs` / `displayOnlyBytes` /
-`measured` / `totalDisplayOnlyBytes`；并按 spec v1.2 补 D4 系统缓存根（精确条目）与 D5
-（9 工具矩阵不变 + Claude Desktop 配置/扩展/状态仅展示）。QA 验收以本版为准（旧版 plan 的上述字段与行为已作废）。
+`measured` / `totalDisplayOnlyBytes`；**D4 按最终裁决移出 v1**（系统缓存根设计移入 §16 backlog），
+D5（9 工具矩阵不变 + Claude Desktop 配置/扩展/状态仅展示）保留。QA 验收以本版为准
+（旧版 plan 的上述字段与行为已作废）。
 
 ---
 
@@ -1325,8 +1211,8 @@ mount
 
 | 任务 | 内容 | 验收 |
 |---|---|---|
-| T1 | 建 `ai_cache/` 模块骨架；`catalog.rs` 写入 9 个工具常量（⚠️ 条目注释掉）+ 基址/环境变量解析（env 可注入）+ D4 系统缓存根（`RootKind` / `overrides` / `children_globs`，工具仍为 9 个）；`tests.rs` 写 11.1 与 11.6 的 36–41 | `cargo test` 通过；`id` 唯一且共 9 个；claude-code 条目与 §6.6 一致；系统缓存根只含精确条目 |
-| T2 | `clean.rs` 的 `validate_target` + 白名单匹配（含 dir/file 类型匹配，B1）+ 符号链接/root/home 拒绝 + 工具根降级护栏 + 系统缓存根规则（§7.9）；11.2 + §11.6 的 29–41 测试 | 拒绝用例全绿；类型不符/降级工具/缓存根本身均被拒；无 `unwrap()` on user input |
+| T1 | 建 `ai_cache/` 模块骨架；`catalog.rs` 写入 9 个工具常量（⚠️ 条目注释掉）+ 基址/环境变量解析（env 可注入）；**不含任何系统缓存根**（D4 留 v1.1）；`tests.rs` 写 11.1 与 11.6 的 36–37 | `cargo test` 通过；`id` 唯一且共 9 个；claude-code 条目与 §6.6 一致 |
+| T2 | `clean.rs` 的 `validate_target` + 白名单匹配（含 dir/file 类型匹配，B1）+ 符号链接/root/home 拒绝 + 工具根降级护栏；11.2 + §11.6 的 29–37 测试 | 拒绝用例全绿；类型不符/降级工具均被拒；无 `unwrap()` on user input |
 | T3 | `scan.rs`：`measure_bytes` + 并行扫描 + 进度节流 + `includeHeavy` 惰性类别 + `inUse` / `lastModifiedMs`；11.3 测试 | 伪造目录体积精确；主扫描不递归 sessions/model_cache；符号链接不计数 |
 | T4 | `clean_all`：dry-run、永久删除、≤64 项限制、去重、部分失败；三个 command + `lib.rs` 注册；11.4 测试 | dry-run 零副作用；permanent 只删选中；65 项被拒；部分失败整体 Ok |
 | T5 | `tauri.ts` 类型 + 3 个 wrapper；`tools.ts` 条目；`lib/format.ts` | `tsc`/lint 通过；类型与 Rust DTO 字段一一对应 |
@@ -1365,3 +1251,89 @@ mount
   <https://cloud.tencent.com.cn/developer/article/2690085>
 - Electron 系（Claude Desktop / Windsurf）Chromium 缓存目录命名沿用标准 userData 布局，v1 标 ✅，
   实现时以真实安装 `ls` 复核。
+
+---
+
+## 16. v1.1 backlog：系统缓存根清理（设计已备，未实现）
+
+> **状态：不进 v1（D4 最终裁决；对应 spec v1.3 §12「v1.1 backlog」）。**
+> `src-tauri/src/ai_cache/` 中没有任何 `claude-cli-nodejs` /
+> `~/Library/Caches` / `~/Library/Logs` 相关条目；v1 不扫描、不清理系统缓存根。本节保存已评审的设计，
+> 实施前需先改 spec（把 D4 / R15 标到 v1.1）并补测试，再单独开 PR。
+
+### 16.1 目标
+
+在 9 个工具矩阵不变的前提下，为已有工具挂**系统缓存根**（macOS `~/Library/Caches/<app>`、
+`~/Library/Logs/Claude`，Linux `~/.cache/claude-cli-nodejs`），按**精确条目**清理 MCP 日志与
+Electron 系统缓存。收益：Claude Code MCP 日志在异常场景可达数十 GB 级增长。
+
+### 16.2 catalog 设计（v1.1 拟新增）
+
+```rust
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum RootKind {
+    ToolData,      // 默认：~/.claude、~/Library/Application Support/Cursor
+    SystemCache,   // 系统缓存根：只允许精确条目，禁止整根/整层通配
+}
+
+pub struct RootSpec {
+    pub platforms: &'static [Platform],
+    pub base: BaseDir,                      // 新增 BaseDir::MacLibraryCaches / MacLibraryLogs
+    pub relative: &'static str,
+    pub env_override: Option<&'static str>,
+    pub kind: RootKind,
+    /// 空 = 继承工具级 categories；系统缓存根必须显式覆盖。
+    pub overrides: &'static [CategorySpec],
+    /// 仅日志根（~/Library/Logs/Claude）：允许根目录本身作为唯一目标。
+    pub root_as_target: bool,
+}
+
+pub struct CategorySpec {
+    pub category: AiCacheCategory,
+    pub paths: &'static [&'static str],
+    /// 系统缓存根专用：「根下每个直接子目录」内再匹配末段模式（如 "--mcp-logs-*"）。
+    /// 父目录名由 read_dir 实测枚举，配置里不允许写 `*` / `*/*` 段。
+    pub children_globs: &'static [&'static str],
+}
+```
+
+### 16.3 系统缓存根与条目
+
+| 工具 | 平台 | 系统缓存根 | 精确白名单条目（相对根） |
+|---|---|---|---|
+| `claude-code` | macOS | `~/Library/Caches/claude-cli-nodejs` | `<项目目录>/--mcp-logs-*` |
+| `claude-code` | macOS | `~/Library/Logs/Claude` | 根目录本身（日志根，`root_as_target=true`） |
+| `claude-code` | Linux | `~/.cache/claude-cli-nodejs` | `<项目目录>/--mcp-logs-*` |
+| `cursor` | macOS | `~/Library/Caches/Cursor` | `Cache`、`Code Cache`、`CachedData`、`GPUCache`、`DawnGraphiteCache`、`DawnWebGPUCache`、`GrShaderCache`、`ShaderCache` |
+| `windsurf` | macOS | `~/Library/Caches/com.exafunction.windsurf` | 同 Cursor 的系统缓存根条目 |
+| 任一工具 | Windows | — | 结构未实测，不启用（不猜路径） |
+
+`<项目目录>` 必须来自该根下的实际磁盘枚举（单层目录名，不含分隔符 / `..`）；只删名称以 `--mcp-logs-`
+开头的子目录本身——不删项目目录、不删缓存根、不做 `*/*` 通配。
+
+### 16.4 校验规则（原 §7.9）
+
+1. 白名单只能来自 `RootSpec.overrides` 的 `paths` / `children_globs`；catalog 期断言配置里不出现
+   `*` 作为独立段（`children_globs` 的父目录由 `read_dir` 实测枚举）。
+2. `children_globs` 展开：枚举根下每个直接子目录（跳过 symlink），在子目录内按末段模式匹配；
+   父目录名必须是单层目录名；匹配到的目标仍要过 v1 的全套校验（§7.2）。
+3. **不删系统缓存根本身**：仅 `root_as_target=true` 的日志根允许目标 == 根；其余一律 `ROOT_PROTECTED`。
+4. **不整层通配**：没有"删根下所有子项"的分支；根下无匹配条目 → 0 项，UI 显示"无可清理项"，
+   不退回整根删除。
+5. 降级（§7.7）仍只针对工具数据根；系统缓存根解析异常到 home / 盘符根时拒绝并 warning。
+
+### 16.5 测试点（迁出 v1 验收）
+
+- `system_cache_expands_children_globs`：伪造 `~/Library/Caches/claude-cli-nodejs/<proj>/--mcp-logs-x/`、
+  `<proj>/other/`、`<proj>/` → 只返回 `--mcp-logs-x`；`<proj>` 与 `other` 不返回。
+- `system_cache_never_deletes_root_or_parent`：clean 传缓存根本身或 `<proj>` → `ROOT_PROTECTED` /
+  `PATH_NOT_ALLOWED`，磁盘零变化。
+- `system_cache_no_match_is_empty`：根存在但无匹配条目 → 0 个 target，不退回整根删除。
+- `system_cache_exact_subdirs_only`（Cursor）：伪造白名单子目录 + 未列出子目录 → 只返回白名单子目录。
+
+### 16.6 实施前置
+
+- spec 改版（D4 / R15 标 v1.1）与 AC 更新；
+- `catalog.rs` 增加 `RootKind` / `overrides` / `children_globs` 与系统缓存根条目；
+- 上述 4 个单测 + 手工矩阵；
+- 独立 PR，按 architect → senior-qa 流程评审。

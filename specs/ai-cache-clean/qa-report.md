@@ -2,8 +2,8 @@
 
 - 执行人：Tester（测试）
 - 时间：2026-10-31（Asia/Shanghai）
-- 验收基线：**spec v1.3（已提交 `c840ded`，D4 延后到 v1.1 backlog；AC-01~AC-22）**
-- 代码基线：`feat/ai-cache-clean` @ **`e991341`（最终 HEAD）**——含 `89dac87`（D1）、`b8d6bf3`（B1/惰性计算/降级/分批）、`e991341`（heavy 扫描并发口 + 文件系统根降级文案）；此前有 4 笔 docs 提交（spec v1.3 等）
+- 验收基线：**spec v1.4（已提交 `154a71d`，文档与实现对齐：D1 回写、错误码 `TOOL_DISABLED`；D4 在 v1.1 backlog；AC-01~AC-22）**
+- 代码基线：`feat/ai-cache-clean` @ **`5a6fa30`（最终 HEAD）**——含 `89dac87`（D1）、`b8d6bf3`（B1/惰性计算/降级/分批）、`e991341`（heavy 扫描并发口 + 文件系统根文案）、`5a6fa30`（计算占用串行约束 + 分批失败兜底）；另有 spec v1.4 等 docs 提交
 - 验证环境：macOS（Darwin，Apple Silicon）、rustc/cargo 1.99.1、Node v24.21.0
 - 验收方式：Rust 集成测试（真实实现 + 临时夹具 + 注入 env），前端 lint/build + 关键交互代码核对
 
@@ -36,7 +36,7 @@
 - 前端（静态核对 + build）：`tool-cache-card.tsx:45` 按 `cleanable` 拆分 `readonlyCategories`，`:189-205` 渲染「会话与模型数据（仅展示，不清理）」区块；`category-section.tsx:97-119` 对不可清理类别显示「仅展示」徽标与「计算占用」按钮；`page.tsx:540-575` 计算占用时调 `scanAiCacheUsage([toolId], true)` 并把结果合并回卡片（`:810` 绑定）；`e991341` 起 heavy 计算期间禁用重新扫描，避免两路进度混入同一条进度条。
 - 未验：真实 Tauri 页面点按（需开窗应用），按 §4 记为「无法验证」。
 
-### 0.3 质量门（最终 HEAD `e991341` 实测）
+### 0.3 质量门（最终 HEAD `5a6fa30` 实测）
 
 ```
 cargo fmt --check                                   → exit 0
@@ -74,7 +74,7 @@ npm run build                                       → exit 0（静态导出含
 | AC-18 | 无网络 / 无提权 | ✅ 通过（静态） | `ai_cache` 无网络/`Command`/shell 调用（grep 零命中）、无提权路径、删除统一 `std::fs`。未做断网真机（本机环境限制） |
 | AC-19 | 幂等 | ✅ 通过 | 第二次清理 freed=0、deleted=0、skipped=1（`PATH_NOT_FOUND`）、failed=0，无错误；期间新增 B 类文件未受影响 |
 | AC-20 | 隐私 | ✅ 通过（静态） | `ai_cache` 与页面无 `localStorage`/文件写入/上传/遥测（grep 零命中） |
-| AC-21 | override 降级 | ✅ 通过 | `$HOME` 本身 / `$HOME` 上级 / `/`：catalog+scan `cleanable=false`+warning，清理命令级拒绝（实现码 `TOOL_DISABLED`，spec 文本写 `TOOL_DOWNGRADED`，见 N1），文件零变化；普通 override 对照可正常清理 |
+| AC-21 | override 降级 | ✅ 通过 | `$HOME` 本身 / `$HOME` 上级 / `/`：catalog+scan `cleanable=false`+warning，清理命令级拒绝（`TOOL_DISABLED`，spec v1.4 已对齐），文件零变化；普通 override 对照可正常清理 |
 | AC-22 | 分批提交 | ✅ 通过（后端 + 前端代码） | 后端 64 项接受、65 项拒绝；前端 `CLEAN_BATCH_SIZE=64` 串行分批（预览与真删共用 `runCleanBatches`）并合并 freed/deleted/skipped/failed/items/warnings。65 项真机 UI 操作未走查（见 AC-01 原因） |
 
 ### 1.1 v1.1 backlog（不计入 v1 验收）
@@ -104,14 +104,14 @@ npm run build                                       → exit 0（静态导出含
 
 | # | 级别 | 内容 | 建议 |
 |---|---|---|---|
-| N1 | 低 | AC-21 文案：spec 写 `TOOL_DOWNGRADED`，实现返回 `TOOL_DISABLED`（前端只展示中文，功能等价） | 统一 spec 或代码错误码 |
-| N2 | 低 | ~~`ROOT_PROTECTED` 分支不可达~~ 根/主目录仍由白名单先拒（`PATH_NOT_ALLOWED`），保护效果成立；另：**「`/` 降级文案误写为主目录上级」已在最终 HEAD `e991341` 修复**（先判文件系统根，warning 现为「根目录指向文件系统根…」） | 错误码语义如需精确可后续统一 |
+| N1 | ✅ 已解决 | AC-21 错误码：spec v1.4 已把 `TOOL_DOWNGRADED` 改为 `TOOL_DISABLED`，与实现一致 | — |
+| N2 | ✅ 已解决 | 「`/` 降级文案误写为主目录上级」已在 `e991341` 修复（最终实测 warning=「根目录指向文件系统根，已降级为仅检测」）。`ROOT_PROTECTED` 分支仍不可达，但保护效果成立 | 错误码语义如需精确可后续统一 |
 | N3 | 低 | 无权限目录 warning 为「部分内容无法读取（N 项）」，spec 要求「无权限读取」；AC-17 UI 文案未真机验 | 统一文案后补 UI 走查 |
 | N4 | 低 | 工具卡排序在前端实现，后端 `<scan>` 返回 catalog 顺序；AC-02 在 UI 层满足 | 文档注明或后端排序 |
 | N5 | 低 | Claude Desktop `protected` 展示清单缺少 `extensions` / `config.json` / `state*`（spec §4.2.2 列为「仅展示/受保护」）；三者**不可清理、清理被拒**，仅 UI 不展示 | 补 protected 条目（1 行配置） |
-| N6 | 文档 | **spec v1.3 §4.2.1 的 A 类表仍列 `paste-cache`、`usage-data`**（第 192 行），与 D1 裁决（只展示）及实现（`89dac87` 已移入 Sessions）相反 | Product 修这一行，避免后续按 spec 文本误判 |
+| N6 | ✅ 已解决 | spec v1.4 已把 `paste-cache` / `usage-data` 移到 B 类（`Sessions`，只展示、无清理入口），与实现一致 | — |
 
-> 以上均为低危/文档类，**不构成 AC 失败**，不阻塞 v1 验收。其中 **N2（`/` 降级文案）已由 `e991341` 修复并回归**（`ac21_*` 现在打印「根目录指向文件系统根，已降级为仅检测」）；`e991341` 同时堵住「计算占用」进行中仍可重新扫描的并发口（Reviewer ④，`page.tsx` disabled 增加 `heavyLoading.size > 0`）。
+> 剩余 **N3（无权限文案）/N4（排序在后端未实现）/N5（Claude Desktop protected 展示清单缺 3 项）** 均为低危/文档类，**不构成 AC 失败**。最终 HEAD `5a6fa30` 另修：`runCleanBatches` 某批命令级失败时保留前序批次结果并明确提示「第 x 批失败，前 y 批已生效」；「计算占用」在后台扫描未结束时不再并发请求（前端代码核对，真机 UI 未验证）。
 
 ---
 
@@ -194,6 +194,6 @@ S5 最后事件 processed=2 freed=100（processed = deleted+skipped+failed）
 
 ## 6. 签署
 
-**结论（最终 HEAD `e991341`）：spec v1.3 口径下 通过 19 条 / 失败 0 条 / 无法验证 3 条（本机无 GUI 走查与真实 5 GB 场景）；必测 8/8 通过；质量门全绿。** D1、D5 已按裁决验证通过，D4 已按裁决排除（backlog）。建议：Product 修 spec §4.2.1 的 `paste-cache`/`usage-data` 一行（N6）与顺手处理 N1–N5 文案/展示项；真机 UI 走查由有 GUI 的机器补 7 状态截图后即可交付。
+**结论（最终 HEAD `5a6fa30`，spec v1.4）：通过 19 条 / 失败 0 条 / 无法验证 3 条（本机无 GUI 走查与真实 5 GB 场景）；必测 8/8 通过；质量门全绿。** D1、D5 已按裁决验证通过，D4 已按裁决排除（v1.1 backlog）。剩余 N3/N4/N5 为低危文案/展示项，不阻塞交付；真机 UI 走查由有 GUI 的机器补 7 状态截图后即可交付。
 
 Tester · 2026-10-31

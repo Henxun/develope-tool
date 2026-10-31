@@ -386,15 +386,27 @@ fn policy_rejects_home_ancestor_and_allows_inside_home() {
 #[cfg(unix)]
 #[test]
 fn policy_rejects_filesystem_root() {
+    // home 存在时 `/` 同时是 home 的上级；文案必须按"文件系统根"给（N2）。
+    let temp = TempDir::new("policy-fs-root");
+    let home = temp.path().join("home");
+    fs::create_dir_all(&home).expect("创建临时 HOME 失败");
     let policy = catalog::tool_policy_for_roots(
         &[catalog::ResolvedRoot {
             path: PathBuf::from("/"),
             exists: true,
         }],
-        None,
+        Some(&home),
     );
     assert!(!policy.cleanable, "文件系统根必须降级");
-    assert!(policy.warnings.iter().any(|warning| warning.contains("根")));
+    let warning = policy.warnings.first().expect("应有降级 warning");
+    assert!(
+        warning.contains("文件系统根"),
+        "根目录是 / 时应提示文件系统根：{warning}"
+    );
+    assert!(
+        !warning.contains("上级"),
+        "根目录是 / 时不应误写成主目录的上级：{warning}"
+    );
 }
 
 #[test]

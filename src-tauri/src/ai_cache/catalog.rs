@@ -366,6 +366,13 @@ pub struct ToolPolicy {
 /// 删除它们是不可接受的，因此该工具整体降级为仅检测。
 fn unsafe_root_reason(root: &Path, home: Option<&Path>) -> Option<String> {
     let canonical_root = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    // 先判文件系统根：`/` 同时是 home 的上级，若先判上级会给出错误原因文案。
+    if canonical_root.parent().is_none() {
+        return Some(format!(
+            "根目录指向文件系统根，已降级为仅检测（不提供清理）：{}",
+            root.display()
+        ));
+    }
     if let Some(home) = home {
         let canonical_home = fs::canonicalize(home).unwrap_or_else(|_| home.to_path_buf());
         if path_eq(&canonical_root, &canonical_home) {
@@ -380,12 +387,6 @@ fn unsafe_root_reason(root: &Path, home: Option<&Path>) -> Option<String> {
                 root.display()
             ));
         }
-    }
-    if canonical_root.parent().is_none() {
-        return Some(format!(
-            "根目录是文件系统根，已降级为仅检测（不提供清理）：{}",
-            root.display()
-        ));
     }
     None
 }

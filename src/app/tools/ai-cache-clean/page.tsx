@@ -668,7 +668,7 @@ export default function AiCacheCleanPage() {
               <button
                 type="button"
                 onClick={() => void runScan("manual")}
-                disabled={cleaning || previewLoading || scanTaskPending}
+                disabled={cleaning || previewLoading || scanTaskPending || heavyLoading.size > 0}
                 title={scanTaskPending ? "后台扫描任务仍在进行，完成前无法重新扫描" : undefined}
                 className="h-9 rounded-xl bg-[var(--accent)] px-3 text-sm font-medium text-white transition hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-60"
               >

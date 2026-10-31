@@ -1,6 +1,8 @@
 # AI 智能体缓存清理 — 技术方案（plan.md）
 
 - 状态：已按实现回写（2026-10-31，对齐 Chief 裁决与已合并实现；QA 以本版为准）
+- D4 系统缓存根：按终裁**不进 v1**，设计移入 §16（v1.1 backlog），不进入 v1 验收
+- 代码基线：HEAD `5ed9d30`；§12 每条裁决已对照代码逐条核对（D1/D2/D3/D5–D10 已实现，D4 未实现）
 - 特性分支：`feat/ai-cache-clean`（基于 `main`）
 - 目标读者：Coder（实现）、Reviewer（设计/安全审查）、Tester（验收）
 - 约束来源：`.specify/memory/constitution.md`、`CLAUDE.md`、`AGENTS.md`
@@ -170,7 +172,7 @@ Tool（AI 工具，如 claude-code）
 | 相对路径 | 类型 | 类别 | 说明 |
 |---|---|---|---|
 | `shell-snapshots` | dir | cache ✅ | shell 启动快照，干净退出即删，崩溃遗留 |
-| `paste-cache` | dir | cache ✅ | 大段粘贴内容缓存 |
+| `paste-cache` | dir | sessions ❌ | **D10（群内亦称 D1，已裁决）**：大段历史粘贴内容属用户可见痕迹 → v1 仅展示、不清理；`catalog.rs` 已从 Cache 移到 Sessions |
 | `image-cache` | dir | cache ✅ | 旧版本粘贴图片缓存（≥2.1.274 已移到临时目录） |
 | `todos` / `statsig` / `logs` | dir | cache ✅ | 旧版本遗留目录，官方称已不再写入 |
 | `cache` | dir | cache ✅ | 如 `changelog.md`，后台自动刷新 |
@@ -178,7 +180,7 @@ Tool（AI 工具，如 claude-code）
 | `plans` | dir | cache ✅ | plan mode 草稿文件（官方：删除无用户可见损失） |
 | `session-env` | dir | cache ✅ | 每会话环境元数据 |
 | `backups` | dir | cache ✅ | `~/.claude.json` 的历史备份（最多 5 份，损坏时可救配置；风险自担） |
-| `usage-data` | dir | cache ✅ | `/insights` 报告与缓存分析数据（官方列入自动清理目录） |
+| `usage-data` | dir | sessions ❌ | **D10（群内亦称 D1，已裁决）**：`/insights` 历史报告与分析数据 → v1 仅展示、不清理（同属 Sessions） |
 | `projects` | dir | sessions ❌ | 会话 transcript（含 system prompt/工具输出，**含明文敏感信息**）+ 每项目 auto memory |
 | `file-history` | dir | sessions ❌ | 编辑前快照，删后历史会话的 checkpoint 回滚失效 |
 | `tasks` | dir | sessions ❌ | 任务清单（可能仍有在用任务） |
@@ -569,7 +571,7 @@ await invokeTauri<AiCacheScanResult>("scan_ai_cache_usage", {
 // 清理（先 dry-run；单次 ≤ 64 项，超出前端分批）
 await invokeTauri<AiCacheCleanResult>("clean_ai_caches", {
   request: {
-    targets: [{ toolId: "claude-code", category: "cache", path: "/Users/me/.claude/paste-cache" }],
+    targets: [{ toolId: "claude-code", category: "cache", path: "/Users/me/.claude/image-cache" }],
     dryRun: true,
   },
 });
@@ -656,9 +658,8 @@ const TOOLS: &[ToolSpec] = &[
         categories: &[
             CategorySpec {
                 category: AiCacheCategory::Cache,
-                paths: &["cache", "shell-snapshots", "paste-cache", "image-cache",
-                         "todos", "statsig", "logs", "plans", "session-env",
-                         "backups", "usage-data"],
+                paths: &["cache", "shell-snapshots", "image-cache", "todos", "statsig",
+                         "logs", "plans", "session-env", "backups"],
             },
             CategorySpec {
                 category: AiCacheCategory::Logs,
@@ -666,8 +667,9 @@ const TOOLS: &[ToolSpec] = &[
             },
             CategorySpec {
                 category: AiCacheCategory::Sessions,   // 仅展示（is_cleanable=false）
-                paths: &["projects", "file-history", "tasks", "uploads", "dev-mods",
-                         "feedback", "feedback-bundles", "history.jsonl"],
+                // D10（群内 D1）：paste-cache / usage-data 是用户可见痕迹，v1 仅展示、不清理
+                paths: &["paste-cache", "usage-data", "projects", "file-history", "tasks",
+                         "uploads", "dev-mods", "feedback", "feedback-bundles", "history.jsonl"],
             },
         ],
         protected: &[".credentials.json", "settings.json", "settings.local.json",
@@ -1111,13 +1113,13 @@ mount
 9. `validate_rejects_outside_root`：把 `/tmp/other/...` 传成 claude-code 目标 → `PATH_NOT_ALLOWED`。
 10. `validate_rejects_root_itself`：传 root 本身 → 拒。
 11. `validate_rejects_non_allowlisted_subdir`：`<root>/settings.json`（受保护）→ 拒。
-12. `validate_rejects_symlink_target`：`<root>/paste-cache` 换成指向外部目录的符号链接 → `PATH_IS_SYMLINK`（Unix 用 `std::os::unix::fs::symlink`；Windows 用 `std::os::windows::fs::symlink_dir`，`cfg` 分开或 `#[cfg(unix)]` 标注）。
+12. `validate_rejects_symlink_target`：`<root>/image-cache` 换成指向外部目录的符号链接（用仍在 A 类的目标；`paste-cache` 已属仅展示类别） → `PATH_IS_SYMLINK`（Unix 用 `std::os::unix::fs::symlink`；Windows 用 `std::os::windows::fs::symlink_dir`，`cfg` 分开或 `#[cfg(unix)]` 标注）。
 13. `validate_rejects_file_bypass`：把 `history.jsonl` 标成 `cache` 类别 → 拒（类别不符白名单）。
 
 ### 11.3 扫描
 
 14. `scan_missing_root_is_not_error`：临时 HOME/根不存在 → `detected=false`、字节 0、无 Err。
-15. `scan_sums_only_allowlisted_dirs`：伪造根目录：`paste-cache/a.bin`(100B)、`settings.json`(999B)、
+15. `scan_sums_only_allowlisted_dirs`：伪造根目录：`image-cache/a.bin`(100B)、`settings.json`(999B)、
     `random/x.bin`(50B) → cache 类别 100B，settings/random 不计。
 16. `scan_skips_symlink_children`：cache 目录内放符号链接指向外部大文件 → 体积不计、无 panic。
 17. `scan_real_files_and_glob`：`logs_1.sqlite`(10B) + `logs_2.sqlite`(20B) 命中 `logs_*.sqlite` → 30B；
@@ -1133,7 +1135,7 @@ mount
 ### 11.4 清理
 
 20. `clean_dry_run_touches_nothing`：`dryRun=true` 后文件仍存在；items 全 `would_delete`；`freedBytes` 正确。
-21. `clean_permanent_removes_only_selected`：只删 `paste-cache`，`settings.json` 与 `random/` 仍在。
+21. `clean_permanent_removes_only_selected`：只删 `image-cache`，`settings.json` 与 `random/` 仍在。
 22. `clean_rejects_display_only_categories`：targets 含 sessions / model_cache → 命令级 `Err(CATEGORY_NOT_CLEANABLE)`，
     磁盘零变化。
 23. `clean_skips_symlinked_target`：目标是符号链接 → `Skipped/PATH_IS_SYMLINK`，外部目录未受影响。
@@ -1164,6 +1166,8 @@ mount
 
 ### 11.6 回写新增用例（工具根降级 / 类型匹配 / 分批 / D5）
 
+> 本节是设计期用例清单（编号便于与评审/QA 对照）；已落地的单测名以 `src-tauri/src/ai_cache/tests.rs` 为准，行为覆盖一致。
+
 29. `tool_policy_degrades_on_home_root`：override 指向 `$HOME` → `cleanable=false` + 中文 warning。
 30. `tool_policy_degrades_on_home_ancestor`：override 指向 home 的上级 → 降级。
 31. `tool_policy_degrades_on_filesystem_root`：override 指向 `/`（Windows 用 `C:\`）→ 降级。
@@ -1181,25 +1185,31 @@ mount
 
 ## 12. 裁决记录（Chief，已裁决）
 
-| # | 事项 | 裁决（已裁决） | 落地方式 |
-|---|---|---|---|
-| D1 | 删除方式 | **v1 只做永久删除**：不提供回收站选项、不引入 `trash` 相关依赖（零新增依赖） | `clean.rs` 用 `fs::remove_dir_all` / `fs::remove_file`；DTO 无 `deletionMode` 字段（§6.2 / §7.6） |
-| D2 | sessions 类别 | **v1 仅展示，不提供清理** | `AiCacheCategory::is_cleanable()` 只对 cache/logs 为 true；`cleanable=false`；clean 命令级 `CATEGORY_NOT_CLEANABLE` |
-| D3 | Ollama model_cache | **v1 仅展示，不提供清理** | 同上；模型体积照常展示，无删除入口 |
-| D4 | 系统缓存根（macOS 等） | **最终裁决：不进 v1，留 backlog（v1.1）**。代码中无 `claude-cli-nodejs` / `~/Library/Caches` 条目，v1 不扫描、不清理系统缓存根；已评审的精确条目设计移入 §16（设计已备，未实现） | v1：无相关代码/命令/测试；v1.1：§16（`RootKind::SystemCache` + 根级 `overrides` + `children_globs`，精确条目、禁止整根/通配） |
-| D5 | 工具矩阵与 Claude Desktop 边界 | **保持 spec v1.1 的 9 工具矩阵不变**；Claude Desktop 的 `claude_desktop_config.json`、扩展安装目录、`config.json` / `state*` 等配置与状态文件归「仅展示 / 受保护」，不进入可清理类别 | §5.2/§5.3.2；`tools().len()==9` 单测；C 类 protected |
-| D6 | 白名单文件类目标（Reviewer B1） | **保留文件类目标，但只允许匹配文件，不允许匹配目录** | 模板类型化 Dir/File；`expand_targets` / `template_matches` 复核 `is_file()` / `is_dir()`；类型不符 `PATH_NOT_ALLOWED`；专项单测（§7.8） |
-| D7 | 工具根降级 | 由 env override 得到的 root == home / home 的祖先 / 文件系统根 → 该工具降级为「仅检测」（`cleanable=false`），catalog 与 scan 返回 warnings | §7.7；`tool_policy_for_roots`；clean 命令级 `TOOL_DISABLED`，单条校验再拦一次 |
-| D8 | 清理请求分批 | **单次最多 64 项**，前端负责分批调用并合并结果 | §6.10；后端 `MAX_TARGETS_PER_REQUEST`，超出命令级 `INVALID_ARGUMENT` |
-| D9 | 扫描取消 | **v1 不做后端中断，只做前端停止等待**，文案必须诚实；真取消放 v2 | §6.11；按钮「停止显示结果」+ 后台仍会完成的说明 |
+> 状态列按 **HEAD `5ed9d30` 的代码实测**逐条核对：`✅ 已实现` = 代码/测试有对应物；`⏸ 未实现` = 仅设计（v1.1 backlog）。
+> 表内 D 编号是本文件编号，与群里口头编号的对应关系见各行备注。
+
+| # | 事项 | 裁决（已裁决） | 落地方式 | 代码状态（HEAD 实测） |
+|---|---|---|---|---|
+| D1 | 删除方式 | **v1 只做永久删除**：不提供回收站选项、不引入 `trash` 相关依赖（零新增依赖） | `clean.rs` 用 `fs::remove_dir_all` / `fs::remove_file`；DTO 无 `deletionMode` 字段（§6.2 / §7.6） | ✅ 已实现：`clean.rs` 仅 `fs` 删除，无 `trash`；DTO 无 `deletionMode` / `riskAck` |
+| D2 | sessions 类别 | **v1 仅展示，不提供清理** | `AiCacheCategory::is_cleanable()` 只对 cache / logs 为 true；`cleanable=false`；clean 命令级 `CATEGORY_NOT_CLEANABLE` | ✅ 已实现：`mod.rs` `is_cleanable()` 仅 `Cache` / `Logs`；`clean.rs` 命令级 `CATEGORY_NOT_CLEANABLE` |
+| D3 | Ollama model_cache | **v1 仅展示，不提供清理** | 同上；模型体积照常展示，无删除入口 | ✅ 已实现：`model_cache` 走同一 `is_cleanable()` 判定，仅展示 |
+| D4 | 系统缓存根（macOS 等） | **最终裁决：不进 v1，留 backlog（v1.1）**。代码中无 `claude-cli-nodejs` / `~/Library/Caches` 条目，v1 不扫描、不清理系统缓存根 | v1：无相关代码/命令/测试；v1.1：§16（`RootKind::SystemCache` + 根级 `overrides` + `children_globs`，精确条目、禁止整根/通配） | ⏸ 未实现：`catalog.rs` 无系统缓存根条目，`RootKind` / `overrides` / `children_globs` / `root_as_target` 均不存在（设计见 §16） |
+| D5 | 工具矩阵与 Claude Desktop 边界 | **保持 spec v1.1 的 9 工具矩阵不变**；Claude Desktop 的 `claude_desktop_config.json`、扩展安装目录、`config.json` / `state*` 等配置与状态文件归「仅展示 / 受保护」，不进入可清理类别 | §5.2 / §5.3.2；9 工具矩阵；C 类 protected | ✅ 已实现：9 工具；`claude_desktop_config.json` / `Preferences` / `Cookies` / `extensions` / `state.vscdb` 在 `protected`，`IndexedDB` / `Local Storage` 在 sessions。⚠️ `tools().len()==9` 专项单测尚未落地（现由 `catalog_never_lists_protected_basenames` 等静态断言部分覆盖），列入补测候选 |
+| D6 | 白名单文件类目标（Reviewer B1） | **保留文件类目标，但只允许匹配文件，不允许匹配目录** | 模板类型化 Dir/File；`expand_targets` / `template_matches` 复核 `is_file()` / `is_dir()`；类型不符 `PATH_NOT_ALLOWED`；专项单测（§7.8） | ✅ 已实现：`expand_targets` 的 glob 分支只收 `is_file()`；`validate_target` 与删除前二次校验均拒目录/链接（`PATH_NOT_ALLOWED` / `PATH_CHANGED`） |
+| D7 | 工具根降级 | 由 env override 得到的 root == home / home 的祖先 / 文件系统根 → 该工具降级为「仅检测」（`cleanable=false`），catalog 与 scan 返回 warnings | §7.7；`tool_policy_for_roots`；clean 命令级 `TOOL_DISABLED`，单条校验再拦一次 | ✅ 已实现：catalog / scan 返回 `cleanable=false` + 中文 warning；`clean.rs` 命令级 `TOOL_DISABLED` 整批拒绝 |
+| D8 | 清理请求分批 | **单次最多 64 项**，前端负责分批调用并合并结果 | §6.10；后端 `MAX_TARGETS_PER_REQUEST`，超出命令级 `INVALID_ARGUMENT` | ✅ 已实现：`MAX_TARGETS_PER_REQUEST = 64`；前端 `CLEAN_BATCH_SIZE = 64` 串行分批并合并结果 |
+| D9 | 扫描取消 | **v1 不做后端中断，只做前端停止等待**，文案必须诚实；真取消放 v2 | §6.11；按钮「停止显示结果」+ 后台仍会完成的说明 | ✅ 已实现：按钮「停止显示结果」+ 旁注"后端扫描仍会完成"；`scanTaskPendingRef` 防并发扫描 |
+| D10 | paste-cache / usage-data（群内亦称 **D1**，注意与本表 D1 区分） | **v1 仅展示、不清理**：`paste-cache` 是历史粘贴痕迹、`usage-data` 是 `/insights` 历史报告，均为用户可见且不可恢复的内容；永久删除无回收站，收益不抵风险 | `catalog.rs` 从 Cache 移到 Sessions（`cleanable=false`）；单测 `d1_paste_cache_and_usage_data_are_display_only`；clean 对两路径返回 `CATEGORY_NOT_CLEANABLE` 且目录树零变化 | ✅ 已实现（`89dac87`）：`catalog.rs` 中两者位于 Sessions；专项单测通过 |
 
 已落定、无需再拍板：首屏自动扫描（挂载后 300ms 触发）、「全选安全缓存」按钮、新增 Rust 模块目录、
 全平台不设 `windowsOnly`、不新开服务端/数据库、不改 Tauri 配置与 capabilities。
 
 **回写说明**：本版把初稿中的 `deletionMode` / `riskAck` / 默认回收站 / sessions+model_cache 可清理
 等设计全部改为实现口径；DTO 增补 `cleanable` / `inUse` / `lastModifiedMs` / `displayOnlyBytes` /
-`measured` / `totalDisplayOnlyBytes`；**D4 按最终裁决移出 v1**（系统缓存根设计移入 §16 backlog），
-D5（9 工具矩阵不变 + Claude Desktop 配置/扩展/状态仅展示）保留。QA 验收以本版为准
+`measured` / `totalDisplayOnlyBytes`。**D4 按终裁移出 v1**（系统缓存根设计移入 §16 backlog）；
+**D10（群内 D1）** 已按 `89dac87` 回写（`paste-cache` / `usage-data` 归 sessions 仅展示）；
+D5（9 工具矩阵不变 + Claude Desktop 配置/扩展/状态仅展示）保留。上面新增的「代码状态」列是对
+HEAD `5ed9d30` 的实测核对结果，凡 `⏸ 未实现` 或 `⚠️` 项均不在 v1 验收范围。QA 验收以本版为准
 （旧版 plan 的上述字段与行为已作废）。
 
 ---

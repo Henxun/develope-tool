@@ -1,6 +1,6 @@
 # AI 智能体缓存清理 — 技术方案（plan.md）
 
-- 状态：待评审（architect gate 已自检，待 Chief / Product 拍板 §12）
+- 状态：已按实现回写（2026-10-31，对齐 Chief 裁决与已合并实现；QA 以本版为准）
 - 特性分支：`feat/ai-cache-clean`（基于 `main`）
 - 目标读者：Coder（实现）、Reviewer（设计/安全审查）、Tester（验收）
 - 约束来源：`.specify/memory/constitution.md`、`CLAUDE.md`、`AGENTS.md`
@@ -10,8 +10,9 @@
 ## 1. 结论摘要（TL;DR）
 
 新增一个独立工具页 `/tools/ai-cache-clean`，扫描本机已安装的 AI 编码工具，把其数据目录拆成
-**可清理类别**（cache / logs / sessions / model_cache）和**受保护类别**（配置、凭据、扩展、状态库），
-展示各自体积，支持按工具、按类别、按路径三级勾选清理。默认走 **dry-run**，实际删除默认 **移到回收站**。
+**可清理类别**（cache / logs）、**仅展示类别**（sessions / model_cache）和**受保护内容**（配置、凭据、
+扩展、状态库）。支持按工具、按类别、按路径三级勾选清理，默认走 **dry-run**，实际执行为 **永久删除**
+（v1 不提供回收站选项）。
 
 实现分三块，全部落在既有技术边界内：
 
@@ -19,8 +20,9 @@
    + `scan.rs`（体积扫描）+ `clean.rs`（校验与删除）+ `tests.rs`（单元测试）。
 2. **前端新增页面** `src/app/tools/ai-cache-clean/`，复用 `/tools` 布局与现有视觉语言；
    注册进 `src/lib/tools.ts`，IPC 封装进 `src/lib/tauri.ts`。
-3. **零新增依赖**：`walkdir`、`rayon`、`trash`、`globset`、`serde` 都已在 `Cargo.toml` 中；
-   不新增 npm 包；不改 Tauri capabilities（自定义 command 不需要额外权限）；不改 `tauri.conf.json`。
+3. **零新增依赖**：`walkdir`、`rayon`、`globset`、`serde` 均已在 `Cargo.toml` 中；
+   不新增回收站依赖（v1 只用 Rust 原生 `fs` 永久删除）；不新增 npm 包；不改 Tauri capabilities
+   （自定义 command 不需要额外权限）；不改 `tauri.conf.json`。
 
 关键安全立场：**前端永远只能提交"工具 id + 类别 + 绝对路径"，Rust 侧白名单重新解析并校验后才允许删除**；
 删除集合是封闭白名单（`catalog.rs` 常量），不是文件名黑名单。
@@ -34,11 +36,11 @@
 | Rust 单文件 `lib.rs`（2357 行） | `src-tauri/src/lib.rs` | 本特性必须拆独立模块，避免 `lib.rs` 继续膨胀 |
 | 命令统一 `Result<_, String>`，错误为中文文案 | `lib.rs:230-…` | 沿用；新增错误采用 `CODE: 文案` 前缀（§6.5） |
 | 磁盘扫描：`async` command + `spawn_blocking` + `rayon` + 进度事件 | `lib.rs:909-957`、`lib.rs:754-891` | **直接复用其思路**：重活 off-UI-thread、`par_iter` 并行、跳符号链接 |
-| 删除走 `trash` crate（回收站） | `lib.rs:1061-1076` | 复用；本特性增加"永久删除"可选项 |
+| 现有 `delete_path` 走 `trash`（回收站） | `lib.rs:1061-1076` | **不复用**：按裁决本特性只做永久删除，不引入回收站路径（零新增依赖） |
 | 路径校验范式：绝对路径 + 拒绝 `..` + 白名单前缀 | `lib.rs:1148-1191` | 本特性加严：canonicalize + 根目录前缀 + 符号链接拒绝 |
 | 前端：`invokeTauri<T>` 薄封装 + 页面内 `listen<Event>` | `src/lib/tauri.ts`、`src/app/tools/disk-heatmap/page.tsx:562` | 沿用；新增事件监听与类型 |
 | 工具注册表 | `src/lib/tools.ts` | 新增一条 no-`windowsOnly` 条目 |
-| `tool-data-migrate` 会把 `~/.claude` 等目录**软链到其它盘** | `src-tauri/src/lib.rs:630-711`、`src/app/tools/tool-data-migrate/page.tsx` | 本特性必须处理"根目录是符号链接""类别目录是符号链接"两种情况（§8） |
+| `tool-data-migrate` 会把 `~/.claude` 等目录**软链到其它盘** | `src-tauri/src/lib.rs:630-711`、`src/app/tools/tool-data-migrate/page.tsx` | 本特性必须处理"根目录是符号链接""类别目录是符号链接"两种情况（§7.3/§7.4） |
 
 性能基线（来自 constitution）：任何操作不得阻塞 WebView 事件循环；本方案用 `spawn_blocking` + 事件节流保证。
 
@@ -51,7 +53,14 @@
 - 9 个工具：Claude Code、Claude Desktop、Codex CLI、Cursor、GitHub Copilot（VS Code 扩展）、
   GitHub Copilot CLI、Windsurf、Gemini CLI、Ollama。
 - macOS / Linux / Windows 三平台（按编译目标 `cfg!` 选择根目录，不做运行时 OS 插件依赖）。
-- 存在性检测 + 体积扫描 + 按工具/类别/路径的选择 + dry-run + 回收站/永久删除 + 结果与失败明细。
+- 系统缓存根（D4）：macOS `~/Library/Caches/claude-cli-nodejs`、`~/Library/Caches/Cursor`、
+  `~/Library/Caches/com.exafunction.windsurf`、`~/Library/Logs/Claude`，Linux `~/.cache/claude-cli-nodejs`
+  —— **只按精确白名单条目清理**：固定子路径，或「枚举直接父目录 + 末段单层模式」（如
+  `<项目目录>/--mcp-logs-*`）；**不整根删除、不做整层通配**。
+- 工具矩阵固定 9 个（spec v1.1 / D5）：系统缓存根作为**已有工具的附加根**，不新增工具条目；
+  Claude Desktop 的 `claude_desktop_config.json`、扩展安装目录、config/state 文件仅展示/受保护。
+- 存在性检测 + 体积扫描 + 按工具/类别/路径的选择 + dry-run + 永久删除 + 结果与失败明细。
+- 仅清理 cache / logs 两类；sessions / model_cache 只展示占用（`cleanable=false`），不提供删除入口。
 - 扫描进度事件（当前工具、当前路径、已扫条目数）。
 
 ### 3.2 明确不在 v1
@@ -60,7 +69,7 @@
 - 定时自动清理、后台常驻监控（无数据库，v1 不做持久化）。
 - "一键卸载工具""清理注册表/环境变量"（越界，属于 `windows-migrate`）。
 - LM Studio、Continue、OpenCode、Aider、Cline、Trae、Cursor CLI、Windsurf/Codeium CLI —— 路径待实测，v2 加表即可（catalog 数据驱动，加一个条目即可上线）。
-- 扫描取消（v2：用一个 `AtomicBool` 句柄，见 §10 风险 6）。
+- 扫描取消：v1 只做前端「停止显示结果」（后端任务仍会跑完，文案须诚实，见 §6.11）；真取消放 v2。
 
 ---
 
@@ -71,27 +80,32 @@
 ```
 Tool（AI 工具，如 claude-code）
  └─ Root（该工具的数据根目录，按平台解析；通常 1 个，VS Code 系可能 3 个）
-     └─ Category（可清理类别：cache / logs / sessions / model_cache）
+     └─ Category（类别：cache / logs 可清理；sessions / model_cache 仅展示）
          └─ Target（具体相对路径，是目录或文件；绝对路径由 Root + 相对路径解析）
 ```
 
-- **只有 Category 内、且出现在 `catalog.rs` 白名单里的 Target 才可删。**
-  根目录本身、根目录下未列出的任何内容（配置、凭据、扩展、SQLite 状态库……）一律不碰。
+- **只有 Category 可清理（cache/logs）、Target 出现在 `catalog.rs` 白名单里，才允许删除。**
+  根目录本身、根目录下未列出的任何内容（配置、凭据、扩展、SQLite 状态库……）一律不碰；
+  sessions / model_cache 类别只展示占用，不提供删除入口（§4.2）。
 - Tool 是否"已检测"= 任一 Root 存在。若 Root 存在但所有 Target 都不存在，UI 显示"已安装 · 无缓存"。
 - 体积口径：只统计白名单 Target（目录递归、文件取 metadata.len）。**不返回整目录体积**，
   避免为了"总占用"多扫一遍未识别内容（Ollama 模型目录可达数十 GB，扫描代价与风险都不划算）。
   UI 文案用"已识别缓存占用"而不是"总占用"。
+- 两段式扫描（控预算）：主扫描只递归统计可清理类别（cache / logs），sessions / model_cache 只返回路径、
+  标 `measured=false`；用户点"计算占用"时带 `includeHeavy=true` 二次扫描才统计这两类，
+  结果分别汇总到 `cleanableBytes` / `displayOnlyBytes`。
 
 ### 4.2 类别语义（固定 4 类）
 
 | key | 中文 | 默认勾选 | 风险等级 | 语义 |
 |---|---|---|---|---|
-| `cache` | 缓存 | ✅ | safe | 删了会自动重建：HTTP/GPU/代码缓存、索引、changelog、临时快照 |
-| `logs` | 日志 | ✅ | safe | 调试日志、崩溃转储、沙箱请求日志 |
-| `sessions` | 会话记录 | ❌ | history | 聊天/会话/回滚快照/文件历史，删了不可恢复 |
-| `model_cache` | 模型文件 | ❌ | redownload | 模型权重，删了要重新下载（可能数十 GB） |
+| `cache` | 缓存 | ✅（`cleanable=true`） | safe | 删了会自动重建：HTTP/GPU/代码缓存、索引、changelog、临时快照 |
+| `logs` | 日志 | ✅（`cleanable=true`） | safe | 调试日志、崩溃转储、沙箱请求日志 |
+| `sessions` | 会话记录 | ❌（`cleanable=false`，v1 仅展示） | history | 聊天/会话/回滚快照/文件历史；只展示占用，不提供删除入口 |
+| `model_cache` | 模型文件 | ❌（`cleanable=false`，v1 仅展示） | redownload | 模型权重；只展示占用，不提供删除入口 |
 
 受保护内容不建模为类别（不返回、不可传参），仅在 `catalog.protected` 里用于 UI 展示说明与测试断言。
+`cleanable` 由后端 `AiCacheCategory::is_cleanable()` 唯一决定（只有 cache / logs 为 true），前端不自行推断。
 
 ---
 
@@ -106,6 +120,8 @@ Tool（AI 工具，如 claude-code）
 |---|---|---|---|
 | `Home` | `$HOME` | `$HOME` | `%USERPROFILE%`（回退 `HOMEDRIVE+HOMEPATH`） |
 | `MacApplicationSupport` | `$HOME/Library/Application Support` | — | — |
+| `MacLibraryCaches` | `$HOME/Library/Caches` | — | — |
+| `MacLibraryLogs` | `$HOME/Library/Logs` | — | — |
 | `XdgConfig` | `~/.config`（mac 上部分跨平台 CLI 仍用它） | `$XDG_CONFIG_HOME` 或 `~/.config` | — |
 | `XdgData` | `~/.local/share` | `$XDG_DATA_HOME` 或 `~/.local/share` | — |
 | `XdgCache` | `~/.cache` | `$XDG_CACHE_HOME` 或 `~/.cache` | — |
@@ -143,7 +159,25 @@ Tool（AI 工具，如 claude-code）
 
 > 图例：✅ 已确认；⚠️ 待实测（实现时用 `ls` 核对真实安装，确认后再进白名单，否则注释掉并在 `catalog.rs` 留 TODO）。
 
+**系统缓存根（D4；作为附加根挂在已经存在的 9 个工具上，不新增工具）**
+
+| 工具 | 平台 | 系统缓存根 | 精确白名单条目（相对根） |
+|---|---|---|---|
+| `claude-code` | macOS | `~/Library/Caches/claude-cli-nodejs` | `<项目目录>/--mcp-logs-*` |
+| `claude-code` | macOS | `~/Library/Logs/Claude` | 根目录本身（日志根，唯一特例，§7.9） |
+| `claude-code` | Linux | `~/.cache/claude-cli-nodejs` | `<项目目录>/--mcp-logs-*` |
+| `cursor` | macOS | `~/Library/Caches/Cursor` | `Cache`、`Code Cache`、`CachedData`、`GPUCache`、`DawnGraphiteCache`、`DawnWebGPUCache`、`GrShaderCache`、`ShaderCache` |
+| `windsurf` | macOS | `~/Library/Caches/com.exafunction.windsurf` | 同 Cursor 的系统缓存根条目 |
+| 任一工具 | Windows | — | 结构未实测，v1.2 不启用（不猜路径） |
+
+规则（R15 / §7.9）：只删表中**精确条目**；不删系统缓存根本身（`~/Library/Logs/Claude` 日志根除外）；
+禁止 `*` 或 `*/*` 匹配根下任意子项；未列出的子目录一律不动；根下无匹配条目时显示"无可清理项"，
+**不退回整根删除**。`<项目目录>` 必须来自该根下的实际磁盘枚举（单层目录名，不含分隔符 / `..`）。
+
 ### 5.3 各工具明细（相对根目录的路径 → 类别）
+
+> 图例：`cache` / `logs` = 可清理；`sessions` / `model_cache` = **v1 仅展示、不提供清理**；
+> 类型列 `dir` / `file` / `file glob` 同时是白名单模板类型（§7.8 只允许同类型命中）。
 
 #### 5.3.1 Claude Code（`claude-code`）— 依据官方文档《Explore the .claude directory》✅
 
@@ -172,6 +206,17 @@ Tool（AI 工具，如 claude-code）
 `workflows/`、`themes/`、`keybindings.json`、`agent-memory/`、`jobs/`、`daemon/`、`CLAUDE.md`、
 `remote-settings.json`、`policy-limits.json`、`stats-cache.json`、以及根同级的 `~/.claude.json`。
 
+**系统缓存根（D4，精确条目；不新增工具）**
+
+| 系统缓存根 | 白名单条目 | 说明 |
+|---|---|---|
+| macOS `~/Library/Caches/claude-cli-nodejs` | `<项目目录>/--mcp-logs-*` | MCP 日志是常见体积大头；只删名称以 `--mcp-logs-` 开头的子目录本身，**不删项目目录、不删缓存根、不做 `*/*` 通配** |
+| macOS `~/Library/Logs/Claude` | 根目录本身（日志根） | 旧版日志输出位置，整目录均为日志；唯一允许"目标是根"的特例（§7.9） |
+| Linux `~/.cache/claude-cli-nodejs` | `<项目目录>/--mcp-logs-*` | 语义同 macOS |
+| Windows | — | 结构未实测，v1.2 不启用（不猜路径） |
+
+> 归属类别：MCP 日志条目归 `logs`（可清理）；Electron 缓存类条目归 `cache`。
+
 #### 5.3.2 Claude Desktop（`claude-desktop`）— Electron 标准布局 ✅/⚠️
 
 | 相对路径 | 类型 | 类别 | 说明 |
@@ -180,9 +225,12 @@ Tool（AI 工具，如 claude-code）
 | `Service Worker/CacheStorage` / `Service Worker/ScriptCache` | dir | cache ✅ | 仅缓存 |
 | `Crashpad` | dir | logs ✅ | 崩溃转储 |
 | `logs` | dir | logs ✅ | 应用日志（mac 上日志也可能在 `~/Library/Logs/Claude`，v2 再加第二个根） |
-| `IndexedDB` / `Local Storage` | dir | sessions ⚠️ | 本地会话/界面态，删除可能丢历史，默认关闭 |
+| `IndexedDB` / `Local Storage` | dir | sessions ⚠️ | 本地会话/界面态；v1 仅展示，不提供清理 |
 
-受保护：`claude_desktop_config.json`（MCP 配置）、`Preferences`、`Cookies`、`Network` 等。
+仅展示/受保护（C 类，**不进入可清理类别**，D5）：`claude_desktop_config.json`（MCP 配置）、
+`extensions/`（扩展安装目录）、`config.json` 与 `state*`（配置与状态文件）、`Preferences`、`Cookies`、`Network`。
+D5 口径：Claude Desktop **只清理上表 Electron 缓存/日志（A 类）**；配置、扩展安装目录、config/state 文件
+只展示占用、不提供清理入口。
 
 #### 5.3.3 Codex CLI（`codex`）— 目录随版本变化，标 ⚠️ 的必须实测
 
@@ -191,20 +239,17 @@ Tool（AI 工具，如 claude-code）
 | `cache` | dir | cache ✅ | 应用层工具定义缓存 |
 | `.tmp` / `tmp` | dir | cache ✅ | 插件克隆、marketplace 临时目录 |
 | `plugins/cache` | dir | cache ✅ | 版本化插件包，可重新拉取 |
-| `vendor_imports` | dir | cache ⚠️ | 技能来源仓库缓存（可重新同步） |
 | `ambient-suggestions` | dir | cache ✅ | 项目环境建议缓存 |
-| `node_repl` | dir | cache ⚠️ | Node REPL 运行态；仅在 Codex 退出后可删 |
-| `logs_*.sqlite` | file glob | logs ✅ | 运行日志库（文件名带版本号，允许 `*`） |
-| `.sandbox` | dir | logs ⚠️ | 沙箱请求日志 + `sandbox.log`；仅退出后可删 |
-| `computer-use-turn-ended` | dir | logs ⚠️ |  Computer Use 回合标记（大量空文件） |
-| `sessions` / `archived_sessions` | dir | sessions ❌ | rollout 会话回放 |
-| `session_index.jsonl` | file | sessions ❌ | 会话索引 |
-| `history.jsonl` | file | sessions ⚠️ | 若存在则视为提示词历史 |
-| `generated_images` | dir | sessions ⚠️ | 生成图片产物（不是缓存，删除会丢文件） |
+| `logs_*.sqlite` | file glob | logs ✅ | 运行日志库（根级单层匹配；文件类，只删文件本身） |
+| `sessions` / `archived_sessions` | dir | sessions ❌ | rollout 会话回放；v1 仅展示 |
+| `session_index.jsonl` | file | sessions ❌ | 会话索引；v1 仅展示 |
+| `history.jsonl` | file | sessions ❌ | 提示词历史；v1 仅展示 |
 
 受保护：`auth.json`（API Key，**凭据**）、`config.toml`、`AGENTS.md`、`state_*.sqlite`、`goals_*.sqlite`、`sqlite/`、
-`skills/`、`plugins/`（除 `plugins/cache`）、`rules/`、`browser/`、`computer-use/`、`pets/`、
-`.sandbox-bin/`、`.sandbox-secrets/`、`.codex-global-state.json`。
+`skills/`、`rules/`、`browser/`、`computer-use/`、`pets/`、`.sandbox-bin/`、`.sandbox-secrets/`、
+`.codex-global-state.json`。
+⚠️ v2 候选（当前版本未列入白名单，不清理）：`vendor_imports`、`node_repl`、`.sandbox`、
+`computer-use-turn-ended`、`generated_images`。
 
 #### 5.3.4 Cursor（`cursor`）— 根目录已由文档确认 ✅，子目录按 Chromium/VS Code 布局
 
@@ -221,6 +266,10 @@ Tool（AI 工具，如 claude-code）
 受保护：`User/globalStorage/state.vscdb`（**聊天历史数据库**，官方解析工具明确从该库读取历史）、
 `state.vscdb.backup`、`User/settings.json`、`User/keybindings.json`、`extensions/`、`User/globalStorage/storage.json`。
 ⚠️ v2 候选（待实测命名）：`User/globalStorage/anysphere.cursor-*`（向量索引/embeddings 缓存，通常很大）。
+
+**系统缓存根（D4，macOS）**：`~/Library/Caches/Cursor` 下仅白名单 `Cache`、`Code Cache`、`CachedData`、
+`GPUCache`、`DawnGraphiteCache`、`DawnWebGPUCache`、`GrShaderCache`、`ShaderCache`；不删缓存根本身，
+不删未列出子目录，根下无匹配时显示"无可清理项"（§7.9）。
 
 #### 5.3.5 GitHub Copilot — VS Code 扩展（`copilot-vscode`）
 
@@ -254,26 +303,31 @@ Tool（AI 工具，如 claude-code）
 | `User/workspaceStorage` | sessions ⚠️ | 工作区状态（含 Codeium 会话关联） |
 
 受保护：`User/globalStorage/state.vscdb`（聊天/状态库）、`User/settings.json`、`extensions/`、
-`User/globalStorage/*`（Codeium 登录态等，白名单外自动受保护）。
+`User/globalStorage/*`（Codeium 登录态等，白名单外自动受保护）；另 `~/.codeium`（账号 token + Cascade 记忆）
+不在扫描范围内。
 
-#### 5.3.8 Gemini CLI（`gemini-cli`）
+**系统缓存根（D4，macOS）**：`~/Library/Caches/com.exafunction.windsurf` 下仅白名单 `Cache`、`Code Cache`、
+`CachedData`、`GPUCache`、`DawnGraphiteCache`、`DawnWebGPUCache`、`GrShaderCache`、`ShaderCache`；
+不删缓存根本身、不删未列出子目录（§7.9）。
+
+#### 5.3.8 Gemini CLI（`gemini-cli`）— v1 无 A 类白名单，**完全只读**
 
 | 相对路径 | 类别 | 说明 |
 |---|---|---|
-| `logs.json` | logs ⚠️ | 根级旧版日志（若存在） |
-| `tmp` | sessions ❌ | `tmp/<slug>/chats/*.jsonl` 会话、checkpoints、`logs.json`、`.project_root`；删除丢会话与检查点 |
-| `history` | sessions ❌ | 工作区注册/历史（`.project_root`） |
-| `shell_history` | sessions ❌ | shell 命令历史 |
+| `tmp` | sessions ❌ | `tmp/<slug>/chats/*.jsonl` 会话、checkpoints、`logs.json`、`.project_root`；v1 仅展示 |
+| `history` | sessions ❌ | 工作区注册/历史（`.project_root`）；v1 仅展示 |
+| `shell_history` | sessions ❌ | shell 命令历史；v1 仅展示 |
 
 受保护：`settings.json`、`oauth_creds.json`（**凭据**）、`google_accounts.json`、`trustedFolders.json`、
 `projects.json`、`policies/`、`extensions/`、`skills/`、`GEMINI.md`、`installation_id`、`user_id`、MCP token 文件。
+> Gemini CLI **不提供任何清理入口**（无 cache/logs 白名单），只检测 + 展示会话类占用。
 
 #### 5.3.9 Ollama（`ollama`）
 
 | 相对路径 | 类别 | 说明 |
 |---|---|---|
 | `logs` | logs ✅ | 服务日志（mac/Windows；Linux 常走 journald） |
-| `models` | model_cache ❌ | 模型权重（`blobs` + `manifests`），删除需重新 `ollama pull`，可能数十 GB |
+| `models` | model_cache ❌ | 模型权重（`blobs` + `manifests`）；v1 仅展示占用，不提供清理入口 |
 
 受保护：`id_ed25519` / `id_ed25519.pub`（Ollama 私钥/公钥）、`history`。
 ⚠️ 若设置了 `OLLAMA_MODELS`，v1 不识别该目录（宁可不清理，也不猜路径）。
@@ -285,10 +339,11 @@ Tool（AI 工具，如 claude-code）
 ```
 .credentials.json  auth.json  oauth_creds.json  credentials.json  hosts.json
 config.json  config.toml  settings.json  settings.local.json  .claude.json
-state.vscdb  state.vscdb.backup  *.key  *.pem  .env  id_ed25519
+claude_desktop_config.json  state.vscdb  state.vscdb.backup  history.jsonl
+*.key  *.pem  .env  id_ed25519
 ```
 
-> 说明：`logs_*.sqlite` 属于日志文件、允许；`*sqlite` 不能一刀切禁。
+> 说明：`logs_*.sqlite` 属于日志文件、允许；`*sqlite` 不能一刀切禁（如 Codex `logs_2.sqlite` 是日志库）。
 
 ### 5.5 漂移与版本
 
@@ -308,8 +363,8 @@ src-tauri/src/
 └── ai_cache/
     ├── mod.rs             # 公开：DTO、请求/响应、3 个 command、事件结构；错误构造函数
     ├── catalog.rs         # 平台枚举、BaseDir 解析、ToolSpec 常量表、白名单匹配
-    ├── scan.rs            # 体积测量、进度节流、并行扫描、scan_impl
-    ├── clean.rs           # 目标校验、去重、dry-run、删除、clean_impl
+    ├── scan.rs            # 体积测量、进度节流、并行扫描、scan_all_with_heavy
+    ├── clean.rs           # 目标校验、去重、dry-run、永久删除、clean_all
     └── tests.rs           # #[cfg(test)] 单元测试（catalog + 校验 + 扫描 + 清理）
 ```
 
@@ -342,7 +397,9 @@ pub enum AiPathKind { Dir, File }
 pub struct AiCachePathDto {
     pub path: String,          // 绝对路径（展示用，非 canonical 形式）
     pub bytes: u64,
-    pub kind: AiPathKind,
+    pub kind: AiPathKind,      // dir | file：文件类目标只能匹配文件（§7.8，B1）
+    pub last_modified_ms: u64, // 最近修改时间（毫秒），用于展示"上次使用"
+    pub in_use: bool,          // 最近 10 分钟内有修改 → 默认不勾选，允许手动勾选
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -351,6 +408,8 @@ pub struct AiCacheCategoryDto {
     pub category: AiCacheCategory,
     pub label: String,          // 中文
     pub risk: AiRisk,
+    pub cleanable: bool,        // false = 仅展示（sessions / model_cache），前端不渲染删除入口
+    pub measured: bool,         // 体积是否已计算：主扫描只有 cache/logs 为 true
     pub default_selected: bool,
     pub description: String,
     pub paths: Vec<AiCachePathDto>,
@@ -373,8 +432,10 @@ pub struct AiToolScanDto {
     pub name: String,
     pub vendor: String,
     pub detected: bool,          // 任一 root 存在
+    pub cleanable: bool,         // false = 根目录降级为仅检测（§7.7），不可清理
     pub roots: Vec<AiCacheRootDto>,
-    pub cleanable_bytes: u64,    // 所有类别之和
+    pub cleanable_bytes: u64,    // 仅 cache + logs
+    pub display_only_bytes: u64, // 仅已计算的 sessions / model_cache
     pub warnings: Vec<String>,
 }
 
@@ -386,6 +447,7 @@ pub struct AiCacheScanResult {
     pub scanned_at_secs: u64,
     pub duration_ms: u64,
     pub total_cleanable_bytes: u64,
+    pub total_display_only_bytes: u64, // 已计算的 sessions / model_cache 合计
     pub tools: Vec<AiToolScanDto>,
     pub warnings: Vec<String>,
 }
@@ -400,6 +462,8 @@ pub struct AiToolCatalogDto {
     pub roots: Vec<String>,      // 解析出的绝对路径（含不存在的）
     pub detected: bool,
     pub protected: Vec<String>,  // 受保护项（相对路径，仅展示）
+    pub cleanable: bool,         // false = 根目录降级为仅检测（§7.7）
+    pub warnings: Vec<String>,   // 降级原因
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -417,14 +481,9 @@ pub struct AiCacheCatalog {
 pub struct AiCacheScanRequest {
     #[serde(default)]
     pub tool_ids: Vec<String>,   // 空 = 全部
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum AiDeletionMode {
-    #[default]
-    Trash,       // 移到系统回收站（默认，安全）
-    Permanent,   // 直接删除（用户显式选择）
+    #[serde(default)]
+    pub include_heavy: bool,     // false（默认）= 主扫描只算 cache/logs；
+                                 // true = 「计算占用」二次请求，递归统计 sessions / model_cache
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -438,16 +497,15 @@ pub struct AiCacheCleanTarget {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AiCacheCleanRequest {
-    pub targets: Vec<AiCacheCleanTarget>,
+    pub targets: Vec<AiCacheCleanTarget>, // 单次 ≤ MAX_TARGETS_PER_REQUEST（64），见 §6.10
     #[serde(default = "default_true")]
     pub dry_run: bool,           // 缺省 true：任何调用方忘了传都只会预览
-    #[serde(default)]
-    pub deletion_mode: AiDeletionMode,
-    #[serde(default)]
-    pub risk_ack: bool,          // 选中 sessions/model_cache 时必须显式为 true
 }
 
 fn default_true() -> bool { true }
+
+/// 单次清理请求的目标数上限（对应 §6.10 的分批约束）。
+pub const MAX_TARGETS_PER_REQUEST: usize = 64;
 
 // ── 响应 ──
 
@@ -470,7 +528,6 @@ pub struct AiCleanItem {
 #[serde(rename_all = "camelCase")]
 pub struct AiCacheCleanResult {
     pub dry_run: bool,
-    pub deletion_mode: AiDeletionMode,
     pub freed_bytes: u64,
     pub deleted_count: u64,
     pub skipped_count: u64,
@@ -503,6 +560,9 @@ pub struct AiCacheCleanProgressEvent {
 
 ### 6.3 命令签名（3 个）
 
+> 系统缓存根（D4）不新增命令、不新增 DTO 字段：它们作为 `roots` 里的额外根出现，每个根自带
+> `categories`（来源 `overrides` / `children_globs`）。`clean` 仍只接收 `{ toolId, category, path }`。
+
 ```rust
 #[tauri::command]
 pub fn get_ai_cache_catalog() -> Result<AiCacheCatalog, String>;
@@ -522,6 +582,8 @@ pub async fn clean_ai_caches(
 
 - scan / clean 都是 `async` + `tauri::async_runtime::spawn_blocking`，与 `scan_disk_usage`（`lib.rs:909`）同构；
   同步 command 在主线程执行，会让整个 WebView 冻结。
+- `clean_ai_caches` 单次最多 64 项（`MAX_TARGETS_PER_REQUEST`），超出即命令级 `INVALID_ARGUMENT`；
+  前端分批并合并结果（§6.10）。
 - 注册：`lib.rs` 顶部 `mod ai_cache;`；`generate_handler![…]` 追加
   `ai_cache::get_ai_cache_catalog, ai_cache::scan_ai_cache_usage, ai_cache::clean_ai_caches`。
 - 事件名（kebab-case，与 `disk-scan-progress` 一致）：`ai-cache-scan-progress`、`ai-cache-clean-progress`。
@@ -530,17 +592,19 @@ pub async fn clean_ai_caches(
 ### 6.4 前端调用参数形状（camelCase，Tauri 2 默认）
 
 ```ts
-// 扫描
+// 主扫描（只算 cache / logs；sessions / model_cache 标 measured=false）
 await invokeTauri<AiCacheScanResult>("scan_ai_cache_usage", {
-  request: { toolIds: [] },      // 空 = 全部工具
+  request: { toolIds: [], includeHeavy: false },
 });
-// 清理（先 dry-run）
+// 用户点「计算占用」：二次扫描，把展示类别也统计出来
+await invokeTauri<AiCacheScanResult>("scan_ai_cache_usage", {
+  request: { toolIds: [], includeHeavy: true },
+});
+// 清理（先 dry-run；单次 ≤ 64 项，超出前端分批）
 await invokeTauri<AiCacheCleanResult>("clean_ai_caches", {
   request: {
     targets: [{ toolId: "claude-code", category: "cache", path: "/Users/me/.claude/paste-cache" }],
     dryRun: true,
-    deletionMode: "trash",
-    riskAck: false,
   },
 });
 ```
@@ -549,17 +613,20 @@ await invokeTauri<AiCacheCleanResult>("clean_ai_caches", {
 
 沿用项目 `Result<T, String>`；新增错误统一 `<CODE>: <中文文案>`，前端原样展示，必要时按 `:` 前缀做逻辑分支。
 
-| CODE | 触发 | 处理 |
+| CODE | 触发 | 层级 / 处理 |
 |---|---|---|
-| `INVALID_ARGUMENT` | 请求为空、targets 为空 | 命令级 `Err` |
+| `INVALID_ARGUMENT` | targets 为空、单批 > 64 项 | 命令级 `Err` |
 | `TOOL_NOT_FOUND` | `toolId` 不在 catalog | 命令级 `Err` |
-| `CATEGORY_NOT_CLEANABLE` | 白名单里没有该类别 | 命令级 `Err`（不静默跳过） |
-| `RISK_NOT_ACKNOWLEDGED` | 目标含 sessions/model_cache 但 `riskAck=false` | 命令级 `Err` |
-| `PATH_NOT_ABSOLUTE` / `PATH_NOT_ALLOWED` | 路径不在白名单 / 含 `..` | **单条 item 失败**（`Failed`） |
-| `PATH_IS_SYMLINK` | 目标是符号链接/junction | **单条 item 失败**（`Skipped` + warning，见 §7.4） |
-| `PATH_NOT_FOUND` | 扫描后被删/被移动 | **单条 item 失败**（`Skipped`） |
-| `DELETE_FAILED` / `TRASH_FAILED` | 系统拒绝/占用/权限 | **单条 item 失败**（`Failed`，不回退永久删除） |
-| `SCAN_FAILED` | `spawn_blocking` join 失败 | 命令级 `Err` |
+| `CATEGORY_NOT_CLEANABLE` | 类别为 sessions / model_cache，或该工具无此类别 | 命令级 `Err`（不静默跳过） |
+| `TOOL_DISABLED` | 工具已降级为仅检测（根目录指向 home / home 上级 / 文件系统根，§7.7） | 命令级整批 `Err`（保证"一个字节都不删"） |
+| `PATH_NOT_ABSOLUTE` | 路径不是绝对路径 | **单条** `Failed` |
+| `PATH_NOT_ALLOWED` | 含 `..`/`.`、不在白名单目录内、不在工具根内、命中凭据黑名单 | **单条** `Failed` |
+| `PATH_IS_SYMLINK` | 目标是符号链接 / junction | **单条** `Skipped`（不删链接目标） |
+| `PATH_NOT_FOUND` | 扫描后被删 / 被移动 | **单条** `Skipped`（幂等：第二次清理即此码） |
+| `PATH_NOT_READABLE` | 权限不足无法读取元数据 | **单条** `Failed` |
+| `ROOT_NOT_FOUND` / `ROOT_PROTECTED` | 根目录不可访问 / 目标等于根、home、文件系统根 | **单条** `Failed` |
+| `DELETE_FAILED` | 系统拒绝删除（占用、只读、权限） | **单条** `Failed`（不重试、不降级） |
+| `SCAN_FAILED` / `CLEAN_FAILED` | `spawn_blocking` join 失败（任务 panic） | 命令级 `Err` |
 
 设计要点：**单条失败不打断整体**，用 `items[].status` + `warnings` 表达部分成功；命令级 `Err` 只用于
 "请求本身非法"。Tauri 序列化 `Err(String)` 时前端 `catch` 拿到字符串，现有 `extractErrorMessage` 可直接用。
@@ -575,24 +642,37 @@ pub fn current_platform() -> Platform { /* cfg! 分支 */ }
 
 #[derive(Clone, Copy)]
 pub enum BaseDir {
-    Home, MacApplicationSupport, XdgConfig, XdgData, XdgCache,
-    AppDataRoaming, LocalAppData,
+    Home, MacApplicationSupport, MacLibraryCaches, MacLibraryLogs,
+    XdgConfig, XdgData, XdgCache, AppDataRoaming, LocalAppData,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum RootKind {
+    /// 工具数据根（默认）：`~/.claude`、`~/Library/Application Support/Cursor` 等。
+    ToolData,
+    /// 系统缓存根（D4）：`~/Library/Caches/<app>`、`~/Library/Logs/Claude` 等。
+    /// 只允许精确条目，禁止整根删除 / 整层通配（§7.9）。
+    SystemCache,
 }
 
 pub struct RootSpec {
     pub platforms: &'static [Platform],
     pub base: BaseDir,
-    pub relative: &'static str,            // 如 ".claude" / "Cursor/User/globalStorage"
+    pub relative: &'static str,             // 如 ".claude" / "Cursor/User/globalStorage"
     pub env_override: Option<&'static str>, // 如 Some("CLAUDE_CONFIG_DIR")
+    pub kind: RootKind,                     // 新增：ToolData | SystemCache
+    /// 空 = 继承工具级 categories；系统缓存根必须显式给出自己的精确条目。
+    pub overrides: &'static [CategorySpec],
+    /// 仅系统日志根使用（`~/Library/Logs/Claude`）：允许把该根目录本身作为唯一删除目标。
+    pub root_as_target: bool,
 }
 
 pub struct CategorySpec {
     pub category: AiCacheCategory,
-    pub label: &'static str,
-    pub risk: AiRisk,
-    pub default_selected: bool,
-    pub description: &'static str,
-    pub paths: &'static [&'static str],    // 相对路径；文件允许末段含 '*'
+    pub paths: &'static [&'static str],       // 固定子路径 / 末段单层 glob
+    /// 系统缓存根专用：「根下每个直接子目录」内再匹配该末段模式（如 "--mcp-logs-*"）。
+    /// 父目录名由 `read_dir` 实测枚举，配置里**不允许**写 `*` / `*/*` 段。
+    pub children_globs: &'static [&'static str],
 }
 
 pub struct ToolSpec {
@@ -610,39 +690,81 @@ pub fn tools() -> &'static [ToolSpec] { &TOOLS }
 `catalog.rs` 中 Claude Code 条目的完整写法（其余工具按 §5.3 表照抄同一形状）：
 
 ```rust
+const ALL_PLATFORMS: &[Platform] = &[Platform::MacOs, Platform::Linux, Platform::Windows];
+
 const TOOLS: &[ToolSpec] = &[
     ToolSpec {
         id: "claude-code",
         name: "Claude Code",
         vendor: "Anthropic",
         roots: &[
-            RootSpec { platforms: &[Platform::MacOs, Platform::Linux], base: BaseDir::Home,
-                       relative: ".claude", env_override: Some("CLAUDE_CONFIG_DIR") },
-            RootSpec { platforms: &[Platform::Windows], base: BaseDir::Home,
-                       relative: r".claude", env_override: Some("CLAUDE_CONFIG_DIR") },
+            // 工具数据根
+            RootSpec {
+                platforms: ALL_PLATFORMS,
+                base: BaseDir::Home,
+                relative: ".claude",              // Windows 由 Path::join 处理分隔符
+                env_override: Some("CLAUDE_CONFIG_DIR"),
+                kind: RootKind::ToolData,
+                overrides: &[],
+                root_as_target: false,
+            },
+            // D4：macOS 系统缓存根（MCP 日志），只按 `<项目目录>/--mcp-logs-*` 精确条目清理
+            RootSpec {
+                platforms: &[Platform::MacOs],
+                base: BaseDir::MacLibraryCaches,
+                relative: "claude-cli-nodejs",
+                env_override: None,
+                kind: RootKind::SystemCache,
+                overrides: &[CategorySpec {
+                    category: AiCacheCategory::Logs,
+                    paths: &[],
+                    children_globs: &["--mcp-logs-*"],
+                }],
+                root_as_target: false,
+            },
+            // D4：旧版日志根（整目录均为日志，唯一允许 root_as_target 的特例）
+            RootSpec {
+                platforms: &[Platform::MacOs],
+                base: BaseDir::MacLibraryLogs,
+                relative: "Claude",
+                env_override: None,
+                kind: RootKind::SystemCache,
+                overrides: &[CategorySpec {
+                    category: AiCacheCategory::Logs,
+                    paths: &[],
+                    children_globs: &[],
+                }],
+                root_as_target: true,
+            },
         ],
         categories: &[
             CategorySpec {
-                category: AiCacheCategory::Cache, label: "缓存", risk: AiRisk::Safe,
-                default_selected: true,
-                description: "可安全删除，工具会自动重建",
+                category: AiCacheCategory::Cache,
                 paths: &["cache", "shell-snapshots", "paste-cache", "image-cache",
-                         "todos", "statsig", "logs", "debug", "plans", "session-env",
+                         "todos", "statsig", "logs", "plans", "session-env",
                          "backups", "usage-data"],
+                children_globs: &[],
             },
             CategorySpec {
-                category: AiCacheCategory::Sessions, label: "会话记录", risk: AiRisk::History,
-                default_selected: false,
-                description: "删除后历史会话、回滚与提示词历史不可恢复",
+                category: AiCacheCategory::Logs,
+                paths: &["debug"],
+                children_globs: &[],
+            },
+            CategorySpec {
+                category: AiCacheCategory::Sessions,   // 仅展示（is_cleanable=false）
                 paths: &["projects", "file-history", "tasks", "uploads", "dev-mods",
                          "feedback", "feedback-bundles", "history.jsonl"],
+                children_globs: &[],
             },
         ],
         protected: &[".credentials.json", "settings.json", "settings.local.json",
                      "plugins", "skills", "agents", "commands", "rules", "output-styles",
                      "workflows", "themes", "keybindings.json", "agent-memory",
-                     "jobs", "daemon", "CLAUDE.md"],
+                     "jobs", "daemon", "CLAUDE.md", "remote-settings.json",
+                     "policy-limits.json", "stats-cache.json"],
     },
+    // …其余 8 个工具同形状，数据以 §5.3 表为准；D4 系统缓存根只在
+    // claude-code（macOS + Linux）、cursor（macOS）、windsurf（macOS）上挂附加根。
 ];
 ```
 
@@ -652,37 +774,46 @@ const TOOLS: &[ToolSpec] = &[
    **env 读取必须可注入**：`fn resolve_roots_with(spec, platform, lookup: &dyn Fn(&str) -> Option<OsString>)`，
    生产传 `|k| env::var_os(k)`，单测传假查找器（避免测试里 `set_var` 污染并行测试）。
 2. 词法 + canonicalize 去重（跨工具/跨编辑器根）。
-3. **目标路径解析器**：`root.join(rel)`，若 `rel` 末段含 `*` → `read_dir(root)` 按 `globset::Glob` 匹配
-   **根级文件名**（不接受含 `/` 的通配，杜绝跨目录模式）。
+3. **目标路径解析器**：`root.join(rel)`，若 `rel` 末段含 `*` → `read_dir(parent)` 按 `globset::Glob` 匹配
+   **根级文件名**（不接受含 `/` 的通配，杜绝跨目录模式）；文件类模板只收 `is_file()` 的命中项，
+   目录类模板只收 `is_dir()` 的命中项（B1，见 §7.8）。
 4. 白名单匹配（clean 校验用）：解析后的绝对路径与"工具 × 类别 × 实际存在的目标"逐一相等比较
-   （Windows 下路径大小写不敏感比较，见 §7.3）。不做"前缀宽松匹配"。
+   （Windows 下路径大小写不敏感比较，见 §7.3）。不做"前缀宽松匹配"；模板类型（dir/file）不符同样拒绝。
+5. **根级白名单覆盖**：`root.overrides` 非空时该根使用覆盖后的类别条目（系统缓存根必须显式覆盖）；
+   空时继承 `ToolSpec.categories`。scan 按「根 × 该根的有效类别条目」展开，DTO 中每个 root 自带 categories。
+6. **系统缓存根（D4）**：`kind=SystemCache` 的根只允许 `paths` 固定条目 + `children_globs`
+   （枚举直接子目录后的末段模式）命中；配置里不允许出现 `*` / `*/*` 段；
+   `root_as_target=true` 仅用于 `~/Library/Logs/Claude` 这类日志根（§7.9）。
 
 ### 6.7 扫描实现（`scan.rs`）
 
 ```
-scan_impl(window, request):
+scan_all_with_heavy(platform, lookup, tool_ids, include_heavy, sink):
   start = Instant::now()
   specs = 选中的 ToolSpec（空 = 全部；未知 id → 命令级 Err(TOOL_NOT_FOUND)，不静默忽略）
-  emit 初始进度(toolIndex=0)
-  results = specs.par_iter().map(|spec| scan_tool(spec, &progress_ctx)).collect()
+  results = specs.par_iter().map(|spec| scan_tool(spec, include_heavy)).collect()
   // rayon 的 IndexedParallelIterator 保序，前端按 catalog 顺序展示
-  汇总 total_cleanable_bytes、warnings，返回
+  汇总 total_cleanable_bytes / total_display_only_bytes / warnings，返回
 ```
 
-`scan_tool`：对每个 resolved root：
+`scan_tool`（对每个 resolved root）：
 1. `root.exists()` 为 false → `exists=false`，categories 全空，跳过。
-2. 对每个 CategorySpec：解析出实际存在的 targets（`symlink_metadata` 判断，符号链接 → `Skipped` + warning，不 follow）。
-   不存在的 target 不返回——前端只会看到"真实存在、可点选"的路径，避免用户勾选空气。
-3. 每个 target 体积：`measure_path()` —— `WalkDir::new(p).follow_links(false)`，跳过 `entry.file_type().is_symlink()`，
-   文件累加 `metadata.len()`；目录本身不计大小；读失败（权限）→ warning 而非中断。
-4. 每个文件/目录计一次 `scanned_entries`，**节流**触发进度事件（§6.8）。
+2. 工具级 `policy.cleanable=false`（降级，§7.7）→ 正常返回数据，但 `cleanable=false` + warnings。
+3. 对每个 root 的**有效 CategorySpec**（`root.overrides` 非空则用覆盖，否则继承工具级）：
+   - `measured = include_heavy || category.is_cleanable()`；未测的展示类别只展开路径、`bytes=0`、`measured=false`。
+   - 解析实际存在的 targets（固定条目 / 末段 glob / 系统缓存根的 `children_globs`；`symlink_metadata` 判断，
+     符号链接 → warning，不 follow）；不存在的 target 不返回。
+   - 每个 target 调 `measure_bytes()`：目录 `WalkDir::follow_links(false)` 跳过 symlink 条目，
+     文件取 `metadata.len()`；同时得出 `last_modified_ms`；`in_use = 最近 10 分钟内有修改`
+     （`IN_USE_WINDOW_MS = 10 * 60 * 1000`）。
+4. 每处理一个条目 `maybe_emit` 一次，**节流 200ms** 触发进度事件（§6.8）。
 
 性能：
-- 不构建树、不返回逐文件数据 —— 返回体积按"target"聚合，payload 只有几十~几百条，杜绝 disk-heatmap 式前端卡顿。
+- 不构建树、不返回逐文件数据——只返回 target 级聚合，payload 几十~几百条，杜绝 disk-heatmap 式前端卡顿。
 - 工具级 `par_iter`，单工具内部顺序 walk（避免磁盘随机 IO 抖动 + 进度路径有意义）；
   rayon 默认线程数即可，不额外建池。
-- `WalkDir` 默认不跨文件系统？不设置（保持默认），但 `follow_links(false)` 防循环。
-- 每个 target 扫描前调用一次 `Event::reset` 无意义，不做；用全局 `AtomicU64` 计数与毫秒时间戳节流。
+- 主扫描**不递归** sessions / model_cache（大目录留到 `includeHeavy=true` 二次请求），保证首屏扫描预算。
+- `WalkDir.follow_links(false)` 防循环；读失败（权限）只计 `unreadable` 并 warning，不中断。
 
 ### 6.8 进度节流
 
@@ -712,26 +843,51 @@ fn maybe_emit(ctx: &ProgressCtx, path: &Path) {
 ### 6.9 清理实现（`clean.rs`）
 
 ```
-clean_impl(window, request):
-  1. targets 非空校验；tool_id 存在校验；category 只能是 4 类之一（serde 已保证能被反序列化）；
-     若 targets 里有 sessions/model_cache 且 !risk_ack → Err(RISK_NOT_ACKNOWLEDGED)
+clean_all(platform, lookup, request, sink):
+  1. validate_request：targets 非空且 ≤ 64；tool 存在；category.is_cleanable()（否则 CATEGORY_NOT_CLEANABLE）；
+     工具未降级（否则 TOOL_DISABLED，整批拒绝）
   2. 逐条 validate_target()：
        - 绝对路径、无 `..`/`.` 组件
+       - 白名单模板精确匹配（含 dir/file 类型匹配，§7.8）
+       - 降级护栏（工具级，§7.7）
        - `symlink_metadata` 判断：是符号链接（含 Windows junction）→ Skipped + warning（**先判断再 canonicalize**）
-       - 解出该 tool 的所有 root，canonicalize 后要求 target（canonical）在某个 root 之内
-       - target（canonical）必须精确命中该 tool 该 category 的白名单解析结果（canonical + 平台大小写归一）
-       - target 不得等于 root / home / 盘符根；组件深度 ≥ 3（unix）或 ≥ 3（windows `C:\Users\x`）
-  3. 按 canonical path 去重；若 A 是 B 的祖先，丢弃 B（避免"先删父再删子"的重复记账）
-  4. dryRun=true：每条 measure_path() 算字节 → WouldDelete，零副作用返回
-  5. dryRun=false：
-       - 删除前立即再次 symlink_metadata 检查（TOCTOU 兜底）
-       - 记录实际字节：先 measure_path()，再按 deletion_mode 删除
-         - Trash → trash::delete
-         - Permanent → 目录 fs::remove_dir_all / 文件 fs::remove_file
-       - 成功 → Deleted + freed_bytes 累加；失败 → Failed + error（不降级、不重试）
+       - canonicalize 后必须在某个 canonical root 之内；target ≠ root / home / 盘符根
+       - 凭据 basename 黑名单兜底
+  3. 按 canonical path 去重；祖先覆盖后代（避免"先删父再删子"的重复记账）
+  4. dryRun=true：每条 measure_bytes() → WouldDelete，零副作用返回
+  5. dryRun=false（v1 永久删除）：
+       - 删除前再次 symlink_metadata 检查（TOCTOU 兜底）
+       - 记录实际字节：先 measure_bytes()，再按实际类型删除：
+         目录 → fs::remove_dir_all；文件 → fs::remove_file
+       - 成功 → Deleted + freed_bytes 累加；失败 → Failed + error（不重试、不降级）
        - 每删一条 emit clean 进度事件
-  6. 返回汇总（deleted/skipped/failed + warnings）
+  6. 返回汇总（deleted/skipped/failed + freedBytes + warnings）
 ```
+
+### 6.10 清理请求分批约束（≤64 项/批）
+
+- 后端硬限制：`MAX_TARGETS_PER_REQUEST = 64`；`targets.len() > 64` → 命令级 `INVALID_ARGUMENT`
+  （文案：单次清理最多 64 项）。
+- 前端负责分批：把「已选路径集合」按 64 个一组切片，**串行**调用 `clean_ai_caches`（避免并发删除互相干扰），
+  再合并结果：
+  - `freedBytes` / `deletedCount` / `skippedCount` / `failedCount` 累加；
+  - `items` 按批拼接（保持选择顺序）；
+  - `warnings` 去重合并；某批命令级 `Err` → 停止后续批次，保留已完成批的结果并展示错误。
+- dry-run 预览同样分批，合并后一次性展示，保证"预览清单 = 实际清理清单"。
+- 64 既是后端上限也是前后端协议约束：前端不得假设"一次能删完"，进度以批为单位推进。
+
+### 6.11 扫描取消（v1 边界，文案必须诚实）
+
+- **v1 不做后端中断**：Rust 扫描在 `spawn_blocking` 中跑到结束（`WalkDir` 无取消点），不提供
+  `cancel_scan` 命令、不加中断句柄。
+- 前端只做"停止显示结果"：用户点击后递增 `scanTokenRef`、丢弃后续结果与进度事件、恢复可操作状态；
+  **后台扫描仍会跑完**，完成后结果被丢弃（无害，只消耗一次 CPU/IO）。
+- 文案禁止暗示"已中断后台任务"；实现口径（已落地）：
+  - 按钮：「停止显示结果」
+  - 提示：「已停止显示结果；后端扫描仍会在后台完成，稍后可点「重新扫描」刷新。」
+  - 按钮 `title`：「只停止界面显示与计时，后端扫描任务仍会跑完」
+- 真取消（`AtomicBool` + `AppHandle` state，或 `WalkDir` 迭代器内检查）放 v2；届时同步改文案与 UI。
+- `scanning` 期间清理按钮禁用；「停止显示结果」后允许基于上一次扫描结果继续操作。
 
 ---
 
@@ -744,14 +900,15 @@ clean_impl(window, request):
 
 ### 7.2 校验顺序（任一失败即拒绝该条）
 
-1. 请求自洽：targets 非空、toolId 存在、category ∈ {cache, logs, sessions, model_cache}。
-2. 路径形态：`Path::is_absolute()`；组件中无 `ParentDir`/`CurDir`（防 `../../`）；长度非空。
-3. 目标类型（**先于 canonicalize**）：`symlink_metadata`（**不 follow**）；`file_type().is_symlink()` 为真
-   （Windows junction 也算）→ 拒绝。顺序很重要：先判断再 canonicalize，否则符号链接会被"解析掉"而漏检。
-4. 根目录解析：取该 tool 的所有 `RootSpec`，逐个 canonicalize；`target` canonicalize 后必须在某个
-   canonical root 前缀内。
-5. **白名单精确匹配**：`target`（canonical 形式）必须等于 `root × category.paths` 解析出的某个真实目标
-   （canonical 形式，平台大小写归一；非前缀匹配）。
+1. 请求自洽（命令级，整批拒绝）：targets 非空且 ≤ 64；toolId 存在；category 必须 `is_cleanable()`
+   （sessions / model_cache 直接 `CATEGORY_NOT_CLEANABLE`）；工具未降级（`TOOL_DISABLED`，§7.7）。
+2. 路径形态（单条）：`Path::is_absolute()`；组件中无 `ParentDir`/`CurDir`（防 `../../`）；长度非空。
+3. 白名单类型匹配（单条，B1）：目标必须命中该工具该类别白名单模板；目录类模板要求目标是目录，
+   文件类模板要求目标是普通文件（同名目录/文件一律不命中，§7.8）。
+4. 目标类型（**先于 canonicalize**）：`symlink_metadata`（**不 follow**）；`file_type().is_symlink()` 为真
+   （Windows junction 也算）→ `Skipped`。顺序很重要：先判断再 canonicalize，否则符号链接会被"解析掉"而漏检。
+5. 根目录解析：取该 tool 的所有 `RootSpec`，逐个 canonicalize；`target` canonicalize 后必须在某个
+   canonical root 前缀内（`ROOT_NOT_FOUND` / `PATH_NOT_ALLOWED`）。
 6. 兜底禁删：target ≠ root、≠ home、≠ 盘符/文件系统根；basename 不在 §5.4 黑名单。
 7. `dry_run` 与真实删除共用同一套校验，**dry-run 不是"跳过校验的预览"**。
 
@@ -779,15 +936,79 @@ clean_impl(window, request):
 ### 7.5 并发与竞态
 
 - 单窗口应用，并发来自：重复点击、React StrictMode 双 effect、扫描未完成就清理。
-- 前端：所有重操作按钮在 `busy` 时 disabled；effect 用 `useRef` 防重复触发；清理完成后自动重扫（而非手工减数量）。
+- 前端：所有重操作按钮在 `busy` 时 disabled；effect 用 `useRef` 防重复触发；扫描用 `scanTokenRef` 做结果
+  代际校验（旧请求结果直接丢弃）；清理完成后自动重扫（而非手工减数量）。
+- 清理分批：>64 项时按 §6.10 串行分批，不并发调用 `clean_ai_caches`。
 - Rust：无全局状态、命令幂等——重复清理同一路径第二次返回 `PATH_NOT_FOUND`（Skipped），不产生破坏。
 - 不做后端互斥锁（KISS）：代价是极端情况下两次清理交错，但每条仍然走完整校验，最坏结果是重复的 Skipped。
 
-### 7.6 删除方式
+### 7.6 删除方式（已裁决：v1 永久删除）
 
-- 默认 `trash`（回收站），与 `delete_path` 一致，可恢复。
-- `permanent` 必须由 UI 显式选择（默认值永远是 trash），且确认弹窗用红色危险样式 + 明确文案。
-- **绝不**在 trash 失败时自动降级为永久删除；把失败项返回给用户。
+- **v1 只做永久删除**：不使用回收站、不提供"移到回收站"选项、不引入新依赖（`trash` 虽在 `Cargo.toml` 中，
+  但本特性不调用）。
+- 安全补偿（因为不可恢复）：
+  - 强制先 dry-run 预览：弹窗逐条列出「工具 / 类别 / 绝对路径 / 体积 / 合计」；
+  - 高危文案："清理后无法恢复"；
+  - 确认按钮红色危险样式，初始焦点在「取消」；
+  - 默认勾选排除 `inUse=true`（最近 10 分钟有修改）的路径，用户可手动勾选；
+  - 单条失败不中断，返回失败明细，用户可先退出被占用的工具再重试。
+- 删除实现：目录 `fs::remove_dir_all`（不跟随内部符号链接）、文件 `fs::remove_file`；
+  目标本身是符号链接 → 跳过（§7.4）。
+- 不做"删除失败自动降级/重试"；失败就是 `Failed` 返回。
+
+### 7.7 工具根降级：仅检测（override 指向敏感位置）
+
+根目录来自环境变量 override（`CLAUDE_CONFIG_DIR` / `CODEX_HOME` / `GEMINI_CLI_HOME`）时，用户可能把它指到
+任意位置。若解析出的 root 命中以下任一条件，整个工具降级为「仅检测」：
+
+1. `root == home`（用户主目录本身）；
+2. `root` 是 home 的祖先（如 `/Users`；含 home 本身被文件系统根覆盖的情形）；
+3. `root` 是文件系统根（`/`、`C:\`）。
+
+判定用 canonicalize 后的路径 + `path_eq` / `is_within`（Windows 大小写归一），避免 `..` / 符号链接绕过。
+实现位于 `catalog.rs::tool_policy_for_roots`，环境变量读取可注入以便单测。
+
+降级后的行为（**一个字节都不删**）：
+
+- catalog：`AiToolCatalogDto.cleanable=false`，`warnings` 返回中文原因
+  （如"根目录指向用户主目录，已降级为仅检测（不提供清理）"）；
+- scan：`AiToolScanDto.cleanable=false` + warnings，正常返回路径与体积（供用户判断是否配错）；
+- clean：命令级 `TOOL_DISABLED` 整批拒绝；`validate_target` 内也再拦一次（双保险）；
+- UI：该工具卡显示"仅检测"徽标与降级原因，勾选/清理入口禁用；「打开目录」仍可用，方便用户修正 env 配置；
+- 单测：覆盖 home / home 上级 / 文件系统根 / 正常目录四种输入。
+
+### 7.8 目录类 vs 文件类目标（B1 修复要求）
+
+白名单里同时存在目录类目标（`Cache/`、`sessions/` 等）与文件类目标（`logs_*.sqlite`、`session_index.jsonl`、
+`history.jsonl` 等）。若只做名称匹配，会出现类型混淆（例如把 `logs_2.sqlite` 做成目录，清理时命中并递归
+删除整个同名目录）。
+
+裁决：**保留文件类目标，但文件类模板只允许匹配普通文件，不允许匹配目录**。实现要求：
+
+1. catalog 模板显式区分类型：`AiPathKind::Dir` / `AiPathKind::File`（含 `*` 的 glob 模板一律视为 File）；
+   该类型同时用于 DTO 展示与后端类型校验。
+2. 展开（scan）：文件类模板在 `read_dir` 结果里只收 `is_file()`；目录类模板只收 `is_dir()`。
+3. 匹配（clean）：`template_matches` 命中后必须复核 `symlink_metadata` 的 `is_file()` / `is_dir()`；
+   类型不符 → `PATH_NOT_ALLOWED`（不得"按实际类型照删"）。
+4. 删除：目录走 `remove_dir_all`，文件走 `remove_file`。
+5. 单测（B1 专项）：同名目录存在时 `logs_*.sqlite` 模板不得命中；同名普通文件存在时目录类模板不得命中；
+   传"模板命中但类型不符"的路径 → 拒绝且磁盘零变化。
+
+### 7.9 系统缓存根（D4）校验规则
+
+系统缓存根与工具数据根共用校验管线，但额外加硬约束：
+
+1. 白名单只能来自 `RootSpec.overrides` 的 `paths` / `children_globs`；catalog 期断言配置里不出现
+   `*` 作为独立段（`children_globs` 的父目录由 `read_dir` 实测枚举，配置里不写 `*` 段）。
+2. `children_globs` 展开：枚举根下每个直接子目录（跳过 symlink），在该子目录内按末段模式匹配；
+   父目录名必须是单层目录名（不含 `/`、`\`、`..`）；匹配到的目标仍要过 §7.2 全套校验。
+3. **不删系统缓存根本身**：仅 `root_as_target=true` 的日志根（`~/Library/Logs/Claude`）允许目标 == 根；
+   其余系统缓存根（`Caches/<app>`）一律 `ROOT_PROTECTED`，**永不整根删除**。
+4. **不整层通配**：代码中不存在"删根下所有子项"的分支；根下无匹配条目 → 该根 0 项，
+   UI 显示"无可清理项"，**不退回整根删除**。
+5. 降级（§7.7）只针对工具数据根；系统缓存根路径固定，若因异常环境解析到 home / 盘符根，
+   该根同样拒绝并 warning，不进入清理。
+6. 测试：见 §11.6 的 D4 用例（精确条目、项目目录保留、根保留、无关子目录保留、无匹配零删除）。
 
 ---
 
@@ -799,12 +1020,14 @@ clean_impl(window, request):
 src/lib/tools.ts                                   # +1 个 TOOL_ITEMS 条目（无 windowsOnly）
 src/lib/tauri.ts                                   # + AI cache 类型 + 3 个封装函数
 src/lib/format.ts                                  # 新增：formatBytes（新页面用；disk-heatmap 的重复实现留作后续 DRY）
-src/app/tools/ai-cache-clean/page.tsx              # 页面：状态机 + 数据编排
+src/app/tools/ai-cache-clean/page.tsx              # 页面：状态机 + 数据编排 + 清理分批
+src/app/tools/ai-cache-clean/types.ts              # 视图模型（多根目录合并为 ToolView）
+src/app/tools/ai-cache-clean/utils.ts              # 类别中文名、错误文案 humanizeError
 src/app/tools/ai-cache-clean/components/
-  ├── tool-cache-card.tsx                          # 工具卡片（折叠/展开、类别勾选、路径列表）
-  ├── category-section.tsx                         # 单个类别行（checkbox + 风险徽标 + 体积）
+  ├── tool-cache-card.tsx                          # 工具卡片（折叠/展开、类别勾选、路径列表、计算占用）
+  ├── category-section.tsx                         # 单个类别行（checkbox/仅展示、风险徽标、体积、懒计算按钮）
   ├── scan-progress-bar.tsx                        # 扫描进度（当前工具/路径/已扫条目/秒数）
-  ├── clean-confirm-dialog.tsx                     # dry-run 结果确认（分组清单、模式选择、危险确认）
+  ├── clean-confirm-dialog.tsx                     # dry-run 结果确认（逐路径清单、合计、永久删除危险确认）
   └── clean-result-panel.tsx                       # 结果汇总 + 失败明细
 ```
 
@@ -836,13 +1059,25 @@ export type AiPathKind = "dir" | "file";
 export async function getAiCacheCatalog(): Promise<AiCacheCatalog> {
   return invokeTauri<AiCacheCatalog>("get_ai_cache_catalog");
 }
-export async function scanAiCacheUsage(toolIds: string[] = []): Promise<AiCacheScanResult> {
-  return invokeTauri<AiCacheScanResult>("scan_ai_cache_usage", { request: { toolIds } });
+export async function scanAiCacheUsage(
+  toolIds: string[] = [],
+  includeHeavy = false,
+): Promise<AiCacheScanResult> {
+  return invokeTauri<AiCacheScanResult>("scan_ai_cache_usage", {
+    request: { toolIds, includeHeavy },
+  });
 }
-export async function cleanAiCaches(request: AiCacheCleanRequest): Promise<AiCacheCleanResult> {
+export async function cleanAiCaches(request: {
+  targets: AiCacheCleanTarget[];
+  dryRun?: boolean;              // 缺省 true
+}): Promise<AiCacheCleanResult> {
   return invokeTauri<AiCacheCleanResult>("clean_ai_caches", { request });
 }
 ```
+
+> 类型要点：`AiCachePath.inUse` / `lastModifiedMs`、`AiCacheCategoryInfo.cleanable` / `measured`、
+> `AiToolScan.cleanable` / `displayOnlyBytes`、`AiCacheScanResult.totalDisplayOnlyBytes`、
+> `AiToolCatalog.cleanable` / `warnings` 与 §6.2 一一对应；`cleanable` 由后端给出，前端不自行推断。
 
 事件监听沿用现有写法（动态 `import("@tauri-apps/api/event")`）：
 
@@ -855,31 +1090,33 @@ const unlisten = await listen<AiCacheScanProgressEvent>("ai-cache-scan-progress"
 
 ```
 mount
- ├─ getAiCacheCatalog()（毫秒级）→ 渲染 9 张工具卡（已检测/未检测/路径）
- └─ 自动开始 scanAiCacheUsage()（spawn_blocking，进度条 + 卡片骨架）
-      ├─ 扫描中：进度条（当前工具 i/n、当前路径、已扫条目、计时）；"重新扫描"禁用
-      ├─ 扫描完成：每工具每类别显示体积；默认勾选 defaultSelected 的路径
-      │    ├─ 勾选变化 → 顶部汇总条（已选 N 项 / X GB）实时更新
-      │    └─ 点"清理选中" → cleanAiCaches({dryRun:true}) → 确认弹窗
+ ├─ getAiCacheCatalog()（毫秒级）→ 渲染 9 张工具卡（已检测/未检测/路径/仅检测降级）
+ └─ 300ms 后自动 scanAiCacheUsage()（主扫描：只算 cache/logs；进度条 + 卡片骨架）
+      ├─ 扫描中：进度条（当前工具 i/n、当前路径、已扫条目、计时）；「重新扫描」禁用
+      │          「停止显示结果」只停止前端等待，后端任务仍会跑完（§6.11）
+      ├─ 扫描完成：cache/logs 显示体积并可勾选；sessions/model_cache 显示路径 +「计算占用」
+      │    ├─ 点单工具「计算占用」→ scanAiCacheUsage([toolId], true) → 合并回该卡（measured=true）
+      │    ├─ 勾选变化 → 顶部汇总条（已选 N 项 / X GB）实时更新（inUse 路径默认不勾选）
+      │    └─ 点"清理选中" → 分批（≤64）cleanAiCaches({dryRun:true}) → 确认弹窗
       │           ├─ 取消 → 返回
-      │           └─ 确认（选 sessions/model 时需勾"我已知晓"）→ cleanAiCaches({dryRun:false, riskAck:true})
-      │                  └─ 结果面板（freed/skipped/failed）→ 自动重扫
+      │           └─ 确认 → 分批 cleanAiCaches({dryRun:false}) → 结果面板 → 800ms 后自动重扫
       └─ 扫描失败/部分警告：错误条 + 重试
 ```
 
-状态：`catalog`, `scan`, `selectedPaths: Set<string>`, `scanning`, `cleaning`, `dryRunResult`, `cleanResult`,
-`error`, `progress`。**Selection 用路径集合**（不是 toolId+category 结构），避免"路径消失后勾选残留"，
-也让 dry-run 目标就是"用户看到的那些路径"。
+状态：`catalog`, `scan`, `selectedPaths: Set<string>`, `scanning`, `scanTaskPending`, `heavyLoading: Set<toolId>`,
+`previewLoading`, `cleaning`, `preview`, `cleanResult`, `error`, `progress`, `notice`。
+**Selection 用路径集合**（不是 toolId+category 结构），避免"路径消失后勾选残留"，也让 dry-run 目标就是
+"用户看到的那些路径"。分批逻辑见 §6.10（串行请求 + 结果合并）。
 
 ### 8.4 组件职责
 
 | 组件 | 职责 | 关键 props |
 |---|---|---|
-| `tool-cache-card` | 工具头部（名称/厂商/检测状态/根目录/总可清理）、类别列表、展开路径明细、工具级全选 | `tool`, `selected: Set<string>`, `onTogglePath`, `onToggleTool`, `busy` |
-| `category-section` | 类别一行：checkbox、标签、风险徽标（safe=emerald / history=amber / redownload=rose）、体积、说明、路径列表（展开时） | `category`, `selected`, `onToggle`, `expanded` |
-| `scan-progress-bar` | `role="progressbar"`（indeterminate）+ aria-live 文本；当前工具名/路径截断显示 | `progress`, `toolCount`, `elapsedMs` |
-| `clean-confirm-dialog` | 只读清单（按工具→类别分组）、总字节、删除模式 radio（回收站/永久删除）、sessions/model 的风险勾选、确认/取消 | `result(dryRun)`, `mode`, `onModeChange`, `riskAck`, `onConfirm`, `onCancel` |
-| `clean-result-panel` | 汇总（释放/删除/跳过/失败）、失败项表格（路径+原因）、提示"关闭占用工具后重试" | `result`, `onRescan` |
+| `tool-cache-card` | 工具头部（名称/厂商/检测状态/仅检测降级徽标+原因/根目录/可清理体积/展示占用）、类别列表、展开路径明细、工具级全选、「计算占用」 | `tool`, `selected: Set<string>`, `onTogglePath`, `onToggleTool`, `onMeasureHeavy`, `heavyLoading`, `busy` |
+| `category-section` | 类别一行：可清理类别 checkbox；仅展示类别无勾选、显示 `measured ? 体积 : 「计算占用」`；风险徽标（safe=emerald / history=amber / redownload=rose）；路径列表（含 inUse 标记） | `category`, `selected`, `onToggle`, `onMeasureHeavy`, `heavyLoading`, `expanded`, `busy` |
+| `scan-progress-bar` | spinner + aria-live 文本；当前工具名/路径截断显示；不显示假百分比 | `progress`, `elapsedMs` |
+| `clean-confirm-dialog` | 只读清单（按工具→类别分组、逐条绝对路径）、合计体积、"清理后无法恢复"、逐条 inUse 提示、跳过项原因、确认/取消（无删除模式选择，v1 固定永久删除） | `preview(dryRun result)`, `toolNameById`, `inUsePaths`, `onConfirm`, `onCancel` |
+| `clean-result-panel` | 汇总（释放/删除/跳过/失败）、失败项表格（路径+原因）、提示"先退出占用工具后重试" | `result`, `onRescan` |
 
 ### 8.5 视觉与交互（apply frontend-design skill）
 
@@ -908,9 +1145,11 @@ mount
 | 场景 | 预算 | 措施 |
 |---|---|---|
 | catalog（首屏） | < 50ms | 只做路径字符串拼接 + `exists()`，不 walk |
-| 扫描典型机器（9 工具、缓存机 1-5 GB、部分 Cache 目录 10 万文件） | 1–10s | `spawn_blocking` + 工具级 rayon + 事件节流；不建树 |
-| 扫描极端（Cursor Cache + 会话目录百万文件） | 可能 30s+ | 进度条 + 计时；按钮禁用；不阻塞 UI；v2 加"取消" |
-| 清理 | 与删除目标体积相关 | 先 `measure_path` 再删（一次遍历 + 删除）；回收站删除由系统处理 |
+| 主扫描（9 工具、缓存机 1-5 GB、部分 Cache 目录 10 万文件） | 1–10s | `spawn_blocking` + 工具级 rayon + 事件节流；不建树；不递归 sessions/model_cache |
+| 系统缓存根（D4：MCP 日志 + Electron 缓存） | < 100ms | 固定根 + 精确条目，只 walk 白名单条目，不枚举未列出内容 |
+| 「计算占用」二次扫描（sessions / model_cache） | 按目标体积，可能 10s+ | 单工具粒度触发（`toolIds=[id]`），只扫该工具、只算展示类别，结果合并回卡片 |
+| 清理（永久删除） | 与删除目标体积相关 | 先 `measure_bytes` 再删（一次遍历 + 删除）；≤64 项/批，前端串行分批 |
+| 扫描极端（Cursor Cache 百万文件） | 可能 30s+ | 进度条 + 计时；可「停止显示结果」；不阻塞 UI；真取消 v2 |
 | IPC payload | 小 | 聚合到 path 级，不返回文件列表；事件最多 5/s |
 
 ---
@@ -920,22 +1159,31 @@ mount
 | # | 风险 | 影响 | 应对 | 阻塞? |
 |---|---|---|---|---|
 | 1 | AI 工具目录结构随版本漂移（Codex/Claude Code 变化最快） | 扫不到/误标 | catalog 版本化；⚠️ 条目实测后入表；白名单机制使"未知目录"只会漏清不会被误删；v2 加只读"未识别项" | 否 |
-| 2 | `~/.claude/projects` 含会话明文与 auto memory，误删伤害大 | 高 | sessions 默认不勾选；确认弹窗逐路径列出 + `riskAck`；文案点明后果 | 否 |
-| 3 | 误删凭据（`.credentials.json`、`auth.json`、`oauth_creds.json`） | 极高（需重新登录，可能丢本地配置） | 凭据永不进类别；§5.4 黑名单兜底；单测断言 catalog 不含凭据文件名 | 否 |
-| 4 | 工具运行中文件被占用（Windows 最明显） | 部分失败 | 单条 Failed 不中断；提示"请先退出该工具后重试"；不重试、不降级 | 否 |
-| 5 | `tool-data-migrate` 迁移后根/子目录是符号链接 | 忽略或报错 | 根允许为链接（canonical 前缀基准）；目标是链接 → Skipped + 提示"请到实际位置清理" | 否 |
-| 6 | 扫描无取消、耗时可能 30s+ | UX | v1 接受（进度+计时）；v2 用 `AtomicBool` 句柄 + `AppHandle` state 实现取消 | 否（v2） |
+| 2 | `~/.claude/projects` 含会话明文与 auto memory | 高（删除不可恢复） | **v1 该类仅展示不可删**（`cleanable=false`），命令级 `CATEGORY_NOT_CLEANABLE` 兜底；文案点明后果 | 否 |
+| 3 | 误删凭据（`.credentials.json`、`auth.json`、`oauth_creds.json`） | 极高（需重新登录，可能丢本地配置） | 凭据永不进可清理类别；§5.4 黑名单兜底；单测断言 catalog 不含凭据文件名 | 否 |
+| 4 | 工具运行中文件被占用（Windows 最明显） | 部分失败 | 单条 Failed 不中断；`inUse` 默认不勾选 + 确认弹窗提示"先退出工具"；不重试、不降级 | 否 |
+| 5 | `tool-data-migrate` 迁移后根/子目录是符号链接 | 忽略或报错 | 根允许为链接（canonical 前缀基准）；目标是链接 → `Skipped` + 提示"请到实际位置清理" | 否 |
+| 6 | 扫描无后端中断、耗时可能 30s+ | UX / 误解 | v1 只做「停止显示结果」（前端停止等待，后台跑完）+ 诚实文案（§6.11）；真取消 v2 | 否（v2） |
 | 7 | TOCTOU（检查与删除之间路径被换） | 低概率越界删除 | 删除前紧邻二次 `symlink_metadata`；本地单用户场景接受残余风险 | 否 |
-| 8 | 回收站不可用（网络盘/无桌面环境/权限） | 清理失败 | 返回 TRASH_FAILED 明细；引导切永久删除（显式选择） | 否 |
+| 8 | 永久删除不可恢复（无回收站） | 误删无法找回 | 强制 dry-run 预览 + 逐路径清单 + "清理后无法恢复" + 红色危险确认 + 初始焦点在「取消」；`inUse` 默认排除（§7.6） | 否 |
 | 9 | macOS 权限（TCC / 完全磁盘访问）/ Linux 权限不足 | 体积统计不全 | 读失败只 warning 不中断；UI 汇总 warning 并提示授权 | 否 |
 | 10 | 多编辑器根（Code / Insiders / VSCodium）或软链导致同一目录重复 | 重复计数/重复删除 | 词法 + canonicalize 去重；清理按 canonical path 再去重、祖先覆盖后代 | 否 |
-| 11 | 前端 StrictMode 双 effect 触发两次扫描 | 双倍 CPU/进度跳变 | `useRef` guard；Rust 命令无副作用、可重入 | 否 |
-| 12 | Ollama 模型删除后需重新下载数十 GB | 用户误操作代价大 | `model_cache` 默认不勾选；文案明示"需重新下载"；全局二次确认 | 否 |
+| 11 | 前端 StrictMode 双 effect 触发两次扫描 | 双倍 CPU/进度跳变 | `useRef` guard + `scanTokenRef` 代际校验；Rust 命令无副作用、可重入 | 否 |
+| 12 | Ollama 模型误操作（数 GB 重下载） | 用户代价大 | **v1 `model_cache` 仅展示不可删**；删除入口不存在 | 否 |
+| 13 | 文件/目录类型混淆（B1）：同名目录被文件模板命中并递归删除 | 极高（越界删目录） | 白名单模板类型化（Dir/File）；文件模板只匹配 `is_file()`，目录模板只匹配 `is_dir()`；类型不符拒绝 + B1 专项单测（§7.8） | **是**（修复前阻断上线） |
+| 14 | 单批目标过多（>64）导致长事务/超时 | 部分失败/无响应 | 后端 `MAX_TARGETS_PER_REQUEST=64` 硬限制；前端串行分批并合并结果（§6.10） | 否 |
+| 15 | 系统缓存根被整根 / 通配删除（D4） | 极高（波及未知内容） | 只允许精确条目 + `children_globs`（父目录由枚举得来）；`Caches/<app>` 根永不整根删；无匹配零删除；专项测试（§7.9） | 否 |
+| 16 | Claude Desktop 配置 / 扩展 / 状态被误删（D5） | 高（配置与扩展丢失、需重装） | 它们属于 C 类（仅展示/受保护），不进入可清理类别；Windsurf/Cursor 的扩展目录同理（不在白名单） | 否 |
 
 **取舍说明（为什么这样做）**
 
 - **只做白名单删除，不做"目录里除了 X 其余全删"**：少一点清理收益，换掉整类误删风险；符合 constitution 的
-  "security-first"。
+  "security-first"。系统缓存根（D4）同理：只删精确条目（如 `<项目目录>/--mcp-logs-*`），
+  宁可漏清也不整根/整层删除。
+- **只清 cache / logs，sessions / model_cache 仅展示**：项目定位是"释放磁盘空间"，不是"历史管理"；
+  把不可逆的会话/模型删除移出 v1，用"零删除入口"换掉最有价值的误删事故。
+- **v1 永久删除、不做回收站**：回收站不释放空间、还得二次清空，与工具目标矛盾；用 dry-run + 逐路径确认 +
+  `inUse` 默认排除来补偿不可恢复风险（已裁决，§12）。
 - **不建树/不做可视化**：`disk-heatmap` 已有；本工具的价值是"安全的一键清理"，返回聚合体积即可，避免重演
   "大目录渲染卡死"的历史问题（`disk-heatmap` 页面已为此做过两轮性能修复）。
 - **不引入 `dirs`/`thiserror`/`serde` 之外的任何依赖**：路径基址解析用 `env` 现成实现，几十行代码可控。
@@ -953,16 +1201,17 @@ mount
 ### 11.1 catalog / 静态安全断言
 
 1. `catalog_tool_ids_unique`：所有工具 `id` 唯一、非空。
-2. `catalog_categories_only_cleanable`：每个 `CategorySpec.category` ∈ 4 类可清理集合；`paths` 非空；
-   无绝对路径、无 `..`、无空串。
+2. `catalog_categories_valid`：每个 `CategorySpec.category` 是 4 类枚举之一；`paths` 非空；
+   无绝对路径、无 `..`、无空串；`is_cleanable()` 只对 cache / logs 返回 true。
 3. `catalog_never_lists_protected_basenames`：所有可清理路径的 basename（含 glob 去 `*`）不在 §5.4 黑名单里
    —— 这是"凭据永不进白名单"的机器化保证。
 4. `catalog_category_paths_do_not_nest_protected`：可清理路径不与同工具的 `protected` 列表互为祖先/后代。
 5. `resolve_roots_expands_bases`（`cfg` 按当前平台）：当前平台每个工具的 roots 非空、全部绝对路径、
    无重复（canonical 去重后）。
-6. `env_override_wins`：临时把 `CLAUDE_CONFIG_DIR` 指到临时目录，`resolve_roots` 返回该目录（用 `std::env::set_var` 需谨慎：
-   用 `#[serial]`？无该 crate → 改为把 override 值作为参数注入 `resolve_roots_with(spec, platform, env_lookup_fn)`，
-   便于测试，生产用闭包读 `env::var_os`。**设计上要求 env 读取可注入**）。
+6. `env_override_wins`：把 override 值作为参数注入 `resolve_roots_with(spec, platform, env_lookup_fn)`
+   （生产用闭包读 `env::var_os`，单测用假查找器；**设计要求 env 读取可注入**），断言返回 override 目录。
+6b. `file_templates_match_only_files`（B1）：`logs_*.sqlite` 模板在"同名目录 + 普通文件"混合目录中
+   只收文件；`expand_targets` / `template_matches` 对目录命中返回 false。
 
 ### 11.2 路径校验（拒绝用例必须有）
 
@@ -983,50 +1232,89 @@ mount
 17. `scan_real_files_and_glob`：`logs_1.sqlite`(10B) + `logs_2.sqlite`(20B) 命中 `logs_*.sqlite` → 30B；
     `logs_3.txt` 不命中。
 18. `scan_category_aggregation`：同一 tool 多 root（伪造两个 VS Code 根）→ 各自 `exists` 正确、总字节为和。
-19. `scan_result_serializes_camel_case`：`serde_json::to_value` 断言含 `cleanableBytes`/`totalCleanableBytes`/
-    `catalogVersion`，category 值为 `"model_cache"`（契约测试，仿 `lib.rs` 现有 serde 测试）。
+19. `scan_result_serializes_camel_case`：`serde_json::to_value` 断言含 `cleanableBytes`/`displayOnlyBytes`/
+    `totalDisplayOnlyBytes`/`catalogVersion`，category 值为 `"model_cache"`（契约测试，仿 `lib.rs` 现有 serde 测试）。
+19b. `scan_main_scan_skips_heavy_categories`：`includeHeavy=false` 时 sessions / model_cache 的
+    `measured=false`、`bytes=0`、`displayOnlyBytes=0`；`includeHeavy=true` 时 `measured=true` 且体积正确。
+19c. `in_use_flag_from_mtime`：新写入的 target `inUse=true`、`lastModifiedMs` 接近当前时间；
+    `touch` 到旧时间的 target `inUse=false`（阈值为 10 分钟）。
 
 ### 11.4 清理
 
 20. `clean_dry_run_touches_nothing`：`dryRun=true` 后文件仍存在；items 全 `would_delete`；`freedBytes` 正确。
 21. `clean_permanent_removes_only_selected`：只删 `paste-cache`，`settings.json` 与 `random/` 仍在。
-22. `clean_trash_mode_does_not_crash_headless`：CI/无桌面环境下 `trash` 可能失败 → 断言返回 `Failed` 而非 panic
-    （不断言删除成功，避免环境相关 flaky）。
-23. `clean_skips_symlinked_target`：目标是符号链接 → `Skipped` + warning，外部目录未受影响。
-24. `clean_rejects_risk_without_ack`：targets 含 sessions 且 `riskAck=false` → 命令级 `Err(RISK_NOT_ACKNOWLEDGED)`。
-25. `clean_rejects_unknown_tool_and_category`。
-26. `clean_dedupes_nested_targets`：同时传 `projects` 与其子路径 → 只删父、只记一次。
-27. `clean_reports_partial_failure`：一个目标不存在 → 该项 Skipped，其它项 Deleted，整体 `Ok`。
-28. `clean_result_serializes_camel_case`：`freedBytes`/`deletedCount`/`dryRun`。
+22. `clean_rejects_display_only_categories`：targets 含 sessions / model_cache → 命令级 `Err(CATEGORY_NOT_CLEANABLE)`，
+    磁盘零变化。
+23. `clean_skips_symlinked_target`：目标是符号链接 → `Skipped/PATH_IS_SYMLINK`，外部目录未受影响。
+24. `clean_rejects_unknown_tool_and_category`：`TOOL_NOT_FOUND` / `CATEGORY_NOT_CLEANABLE`。
+25. `clean_rejects_over_64_targets`：65 项 → 命令级 `Err(INVALID_ARGUMENT)`，磁盘零变化。
+26. `clean_dedupes_nested_targets`：同时传 cache 父目录与其子路径 → 只删父、只记一次。
+27. `clean_reports_partial_failure`：一个目标不存在 → 该项 `Skipped`，其它项 `Deleted`，整体 `Ok`。
+28. `clean_result_serializes_camel_case`：`freedBytes`/`deletedCount`/`dryRun`（序列化后**无** `deletionMode`）。
+28b. `clean_second_run_is_idempotent`：连续两次清理同一目标 → 第二次 freed=0、deleted=0、skipped=1
+    （`PATH_NOT_FOUND`），不报失败。
+28c. `clean_bc_files_untouched`：清理 cache/logs 后 B/C 类文件（配置、凭据、未知目录）数量与 SHA-256 不变。
 
 ### 11.5 手工验证矩阵（Tester）
 
 | 平台 | 用例 | 期望 |
 |---|---|---|
 | macOS | 本机装 Claude Code / Cursor 等 | 自动检测、体积与 `du -sh` 同数量级（±10%）、不卡 UI |
+| macOS | 系统缓存根：`~/Library/Caches/claude-cli-nodejs/<proj>/--mcp-logs-*` | 只清理匹配的 MCP 日志子目录；`<proj>`、缓存根、无关子目录保留 |
+| macOS | `~/Library/Caches/Cursor` 与 `~/Library/Caches/com.exafunction.windsurf` | 只清白名单 Electron 缓存子目录，未列出内容与根保留 |
+| macOS | Claude Desktop 配置与扩展（D5） | `claude_desktop_config.json`、`extensions/`、`config.json`/`state*` 不出现在可清理列表，磁盘不变 |
 | macOS | 用 `tool-data-migrate` 把 `~/.claude` 软链到外盘 | 正常检测到实际路径；删除时不跟随/不越界；给出提示 |
-| macOS | 勾选 `sessions` 配合 dry-run | 清单逐路径列出，取消无副作用 |
+| macOS | sessions / model_cache 类别 | 只有「计算占用」与「打开目录」，**没有任何删除入口** |
 | Windows | 工具运行中执行清理 | 部分 Failed，提示"先退出工具"；无崩溃 |
 | Windows | 路径大小写不同的伪造 target 调用 | 正常命中白名单（大小写不敏感） |
-| Linux | 无桌面垃圾站环境用回收站模式 | Failed 明细，不 panic；永久删除模式可工作 |
-| 三平台 | 手工 `invoke` 传 `path: "/"` / `"../../x"` / 受保护文件 | 全部被拒，无任何删除 |
+| 三平台 | `cleanAiCaches` 一次传 65 项 | 命令级拒绝（"单次清理最多 64 项"），磁盘零变化 |
+| 三平台 | 把 `CLAUDE_CONFIG_DIR` 指向 `$HOME` 后打开页面 | 工具卡显示"仅检测"+原因；勾选/清理禁用；扫描正常 |
+| 三平台 | 扫描中点「停止显示结果」 | 文案说明后台仍会完成；UI 恢复可操作；完成后结果不覆盖（需重新扫描） |
+| 三平台 | 手工 `invoke` 传 `path: "/"` / `"../../x"` / 受保护文件 / 文件模板命中目录 | 全部被拒，无任何删除 |
 | 三平台 | `npm run lint`、`cargo fmt --check`、`cargo clippy`、`cargo test` | 全绿 |
+
+### 11.6 回写新增用例（工具根降级 / 类型匹配 / 分批 / D4 / D5）
+
+29. `tool_policy_degrades_on_home_root`：override 指向 `$HOME` → `cleanable=false` + 中文 warning。
+30. `tool_policy_degrades_on_home_ancestor`：override 指向 home 的上级 → 降级。
+31. `tool_policy_degrades_on_filesystem_root`：override 指向 `/`（Windows 用 `C:\`）→ 降级。
+32. `tool_policy_allows_normal_root`：override 指向临时目录下的 `.claude` → `cleanable=true`、warnings 为空。
+33. `degraded_tool_cannot_be_cleaned`：降级工具的 clean 请求 → 命令级 `TOOL_DISABLED`，磁盘零变化。
+34. `catalog_exposes_cleanable_and_warnings`：catalog 与 scan 的 `cleanable` / `warnings` 字段出现在 JSON 中且语义一致。
+35. `file_template_type_mismatch_rejected`（B1）：把同名目录路径按文件模板提交 → `PATH_NOT_ALLOWED`，目录未被删除。
+36. `system_cache_expands_children_globs`（D4）：伪造 `~/Library/Caches/claude-cli-nodejs/<proj>/--mcp-logs-x/`、
+    `<proj>/other/`、`<proj>/` → 只返回 `--mcp-logs-x` 一个 target；`<proj>` 与 `other` 不返回。
+37. `system_cache_never_deletes_root_or_parent`：clean 传缓存根本身或 `<proj>` 目录 → `ROOT_PROTECTED` /
+    `PATH_NOT_ALLOWED`，磁盘零变化。
+38. `system_cache_no_match_is_empty`：根存在但无匹配条目 → 0 个 target，**不退回整根删除**。
+39. `system_cache_exact_subdirs_only`（Cursor）：伪造白名单子目录 + 未列出子目录 → 只返回白名单子目录。
+40. `claude_desktop_config_extensions_not_cleanable`（D5）：`claude_desktop_config.json`、`extensions`、
+    `config.json`、`state*` 不在任何可清理类别；scan 不返回为 target；clean 传入被拒。
+41. `tool_matrix_stays_nine`（D5）：`tools().len() == 9`；系统缓存根不新增工具 id / 不改变工具矩阵。
 
 ---
 
-## 12. 待拍板项（Chief / Product）
+## 12. 裁决记录（Chief，已裁决）
 
-| # | 决策 | 我的建议 |
-|---|---|---|
-| D1 | v1 是否提供 `sessions` 类别清理？ | **提供，默认不勾选** + dry-run 确认 + riskAck。收益（Claude Code `projects` 常是 GB 级）大于风险 |
-| D2 | `model_cache`（Ollama）是否 v1 上线？ | **上线但默认不勾选**，仅展示体积；若产品不想要，实现上只需把这一条目从 catalog 去掉 |
-| D3 | 默认删除方式 | **回收站**（`trash`），永久删除作为显式下拉选项；不建议默认永久 |
-| D4 | 首屏是否自动扫描（可能 1–10s 后台任务） | **自动**（满足"自动检测占用大小"），用户可随时点击"重新扫描"；v2 再加取消 |
-| D5 | 是否要"一键清理全部工具的 cache 类别"入口 | **v1 提供"全选安全缓存"按钮**，但仍走 dry-run 确认；不做静默一键清理 |
-| D6 | 是否接受新增 Rust 模块目录（而非继续堆 `lib.rs`） | 建议接受（`lib.rs` 已 2357 行，本特性约 +700 行） |
+| # | 事项 | 裁决（已裁决） | 落地方式 |
+|---|---|---|---|
+| D1 | 删除方式 | **v1 只做永久删除**：不提供回收站选项、不引入 `trash` 相关依赖（零新增依赖） | `clean.rs` 用 `fs::remove_dir_all` / `fs::remove_file`；DTO 无 `deletionMode` 字段（§6.2 / §7.6） |
+| D2 | sessions 类别 | **v1 仅展示，不提供清理** | `AiCacheCategory::is_cleanable()` 只对 cache/logs 为 true；`cleanable=false`；clean 命令级 `CATEGORY_NOT_CLEANABLE` |
+| D3 | Ollama model_cache | **v1 仅展示，不提供清理** | 同上；模型体积照常展示，无删除入口 |
+| D4 | 系统缓存根（macOS 等） | **纳入可清理范围，但只按精确白名单条目删除**：Claude Code `<项目目录>/--mcp-logs-*`、`~/Library/Logs/Claude`（日志根）；Cursor / Windsurf `~/Library/Caches/<app>` 下指定的 Electron 缓存子目录；**禁止整根删除 / `*` / `*/*` 通配** | §5.2 系统缓存根表 + §7.9；`RootKind::SystemCache` + `overrides` + `children_globs`；根级保留与无匹配零删除单测 |
+| D5 | 工具矩阵与 Claude Desktop 边界 | **保持 spec v1.1 的 9 工具矩阵不变**；Claude Desktop 的 `claude_desktop_config.json`、扩展安装目录、`config.json` / `state*` 等配置与状态文件归「仅展示 / 受保护」，不进入可清理类别 | §5.2/§5.3.2；系统缓存根作为附加根不新增工具；`tools().len()==9` 单测；C 类 protected |
+| D6 | 白名单文件类目标（Reviewer B1） | **保留文件类目标，但只允许匹配文件，不允许匹配目录** | 模板类型化 Dir/File；`expand_targets` / `template_matches` 复核 `is_file()` / `is_dir()`；类型不符 `PATH_NOT_ALLOWED`；专项单测（§7.8） |
+| D7 | 工具根降级 | 由 env override 得到的 root == home / home 的祖先 / 文件系统根 → 该工具降级为「仅检测」（`cleanable=false`），catalog 与 scan 返回 warnings | §7.7；`tool_policy_for_roots`；clean 命令级 `TOOL_DISABLED`，单条校验再拦一次 |
+| D8 | 清理请求分批 | **单次最多 64 项**，前端负责分批调用并合并结果 | §6.10；后端 `MAX_TARGETS_PER_REQUEST`，超出命令级 `INVALID_ARGUMENT` |
+| D9 | 扫描取消 | **v1 不做后端中断，只做前端停止等待**，文案必须诚实；真取消放 v2 | §6.11；按钮「停止显示结果」+ 后台仍会完成的说明 |
 
-无需拍板、已定的技术边界：不引入新依赖；不改 Tauri 配置与 capabilities；不新开服务端/数据库；
-不做 Windows 专属 gating（全平台）。
+已落定、无需再拍板：首屏自动扫描（挂载后 300ms 触发）、「全选安全缓存」按钮、新增 Rust 模块目录、
+全平台不设 `windowsOnly`、不新开服务端/数据库、不改 Tauri 配置与 capabilities。
+
+**回写说明**：本版把初稿中的 `deletionMode` / `riskAck` / 默认回收站 / sessions+model_cache 可清理
+等设计全部改为实现口径；DTO 增补 `cleanable` / `inUse` / `lastModifiedMs` / `displayOnlyBytes` /
+`measured` / `totalDisplayOnlyBytes`；并按 spec v1.2 补 D4 系统缓存根（精确条目）与 D5
+（9 工具矩阵不变 + Claude Desktop 配置/扩展/状态仅展示）。QA 验收以本版为准（旧版 plan 的上述字段与行为已作废）。
 
 ---
 
@@ -1037,13 +1325,13 @@ mount
 
 | 任务 | 内容 | 验收 |
 |---|---|---|
-| T1 | 建 `ai_cache/` 模块骨架；`catalog.rs` 写入 9 个工具常量（⚠️ 条目注释掉）+ 基址/环境变量解析（env 读取可注入）；`tests.rs` 写 11.1 的 1–6 | `cargo test` 通过；`id` 唯一；claude-code 条目与 §6.6 一致 |
-| T2 | `clean.rs` 的 `validate_target` + 白名单匹配 + 符号链接/root/home 拒绝；11.2 全部测试 | 拒绝用例全绿；无 `unwrap()` on user input |
-| T3 | `scan.rs`：`measure_path` + 并行 `scan_impl` + 进度节流；11.3 测试 | 伪造目录体积精确；符号链接不计数；payload 无逐文件数据 |
-| T4 | `clean_impl`：dry-run、trash/permanent、去重、部分失败；`cmd.rs` 三个 command + `lib.rs` 注册；11.4 测试 | dry-run 零副作用；permanent 只删选中；部分失败整体 Ok |
+| T1 | 建 `ai_cache/` 模块骨架；`catalog.rs` 写入 9 个工具常量（⚠️ 条目注释掉）+ 基址/环境变量解析（env 可注入）+ D4 系统缓存根（`RootKind` / `overrides` / `children_globs`，工具仍为 9 个）；`tests.rs` 写 11.1 与 11.6 的 36–41 | `cargo test` 通过；`id` 唯一且共 9 个；claude-code 条目与 §6.6 一致；系统缓存根只含精确条目 |
+| T2 | `clean.rs` 的 `validate_target` + 白名单匹配（含 dir/file 类型匹配，B1）+ 符号链接/root/home 拒绝 + 工具根降级护栏 + 系统缓存根规则（§7.9）；11.2 + §11.6 的 29–41 测试 | 拒绝用例全绿；类型不符/降级工具/缓存根本身均被拒；无 `unwrap()` on user input |
+| T3 | `scan.rs`：`measure_bytes` + 并行扫描 + 进度节流 + `includeHeavy` 惰性类别 + `inUse` / `lastModifiedMs`；11.3 测试 | 伪造目录体积精确；主扫描不递归 sessions/model_cache；符号链接不计数 |
+| T4 | `clean_all`：dry-run、永久删除、≤64 项限制、去重、部分失败；三个 command + `lib.rs` 注册；11.4 测试 | dry-run 零副作用；permanent 只删选中；65 项被拒；部分失败整体 Ok |
 | T5 | `tauri.ts` 类型 + 3 个 wrapper；`tools.ts` 条目；`lib/format.ts` | `tsc`/lint 通过；类型与 Rust DTO 字段一一对应 |
-| T6 | 页面骨架：catalog 首屏 + 自动扫描 + 进度条 + 错误态 | `npm run tauri:dev` 打开即见 9 卡片与进度 |
-| T7 | 卡片/类别/勾选/汇总条 + dry-run 确认弹窗 + 结果面板 + 清理后重扫 | 手动走通"扫描→勾选→预览→取消→确认→重扫" |
+| T6 | 页面骨架：catalog 首屏 + 自动扫描 + 进度条 +「停止显示结果」+ 错误态 | 打开即见 9 卡片与进度；停止显示文案诚实（后台仍完成） |
+| T7 | 卡片/类别/勾选/汇总条 +「计算占用」+ dry-run 确认弹窗 + 结果面板 + ≤64 分批 + 清理后重扫 | 手动走通"扫描→（计算占用）→勾选→预览→取消→确认→重扫"；>64 项自动分批 |
 | T8 | 三平台手工矩阵（§11.5）+ 安全负例（手工 invoke 非法 path） | 安全负例全部被拒；UI 无冻结 |
 
 **提交**：`feat: 新增 AI 智能体缓存清理工具页`（Conventional Commits + 中文），PR 目标 `main`；
@@ -1056,7 +1344,8 @@ mount
 - Rust 入口：`src-tauri/src/lib.rs:2276`（`run()` 的 `generate_handler!`）。
 - 扫描范式参考：`src-tauri/src/lib.rs:909-957`（`scan_disk_usage`）。
 - 进度事件范式：`src-tauri/src/lib.rs:731-737`（`emit_disk_scan_progress`）+ 前端 `disk-heatmap/page.tsx:562`。
-- 删除/回收站范式：`src-tauri/src/lib.rs:1061-1076`。
+- 删除参考（**不复用**）：`src-tauri/src/lib.rs:1061-1076` 的 `delete_path` 走回收站；本特性按裁决只用
+  `fs` 永久删除，不调用 `trash`。
 - 路径校验范式（Windows 迁移）：`src-tauri/src/lib.rs:1148-1191`。
 - 前端 IPC 封装：`src/lib/tauri.ts:9-16`。
 - 工具注册表：`src/lib/tools.ts:31-76`。

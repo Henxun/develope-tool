@@ -3,7 +3,7 @@ feature: ai-cache-clean
 status: draft
 owner: 产品（Product）
 created: 2026-10-31
-version: 1.3
+version: 1.4
 updated: 2026-10-31
 target: v1（MVP）
 ---
@@ -13,6 +13,11 @@ target: v1（MVP）
 > 一句话：自动检测本机已安装的 AI 编码工具，列出**可安全清理的缓存/日志目录**及其占用，让用户一键释放磁盘空间，同时明确展示"会话记录、配置、凭据"等**永不删除**的数据。
 
 ## 版本记录
+
+**v1.4（2026-10-31，文档与实现对齐）**
+- **D1 回写**：Claude Code 的 `paste-cache` / `usage-data` 从 A 类缓存移到 B 类（`Sessions`，仅展示、无清理入口）。这两项目录含用户可见痕迹（历史粘贴内容、`/insights` 历史报告），删除不可恢复，实现已按仅展示落地（`catalog.rs` 归入 `Sessions`，`cleanable=false`）。
+- **错误码按实现对齐**：`R9` / §4.3 / AC-21 的 `TOOL_DOWNGRADED` → `TOOL_DISABLED`；`R12` / §4.3 的 `FORBIDDEN_BASENAME` → `PATH_NOT_ALLOWED`（凭据/配置黑名单兜底与普通越界同码，仅展示用）。
+- 全文复查 `paste-cache`、`usage-data`、`SystemCache`：系统缓存根表述只存在于 §12 backlog 与 v1.3 版本记录，v1 正文无残留；与代码、`plan.md` 对齐。
 
 **v1.3（2026-10-31，D4 终裁）**
 - **D4 延后到 v1.1**：macOS 系统缓存根（`~/Library/Caches/claude-cli-nodejs` 等）**不进 v1**；R15 / AC-23 及精确条目设计移入 §12「v1.1 backlog」，标注"未实现，留待 v1.1"。
@@ -171,10 +176,10 @@ target: v1（MVP）
 | R6 | 目标不存在 → 跳过（视为幂等），不报错、不计入失败。 |
 | R7 | 目标内最近 **10 分钟**内有文件修改 → 标记「可能正在使用」，默认不勾选（可手动勾选）。 |
 | R8 | 逐项独立执行；单项失败（权限/占用/被删）只影响该项，其余继续；结果分别列出成功/跳过/失败原因。 |
-| R9 | **根目录校验与降级**：工具根经 env override 指向「用户主目录本身 / 用户主目录的上级 / 文件系统根」→ 该工具 `cleanable=false`，降级为仅检测；前端不可勾选，后端拒绝其清理请求（`TOOL_DOWNGRADED`）。 |
+| R9 | **根目录校验与降级**：工具根经 env override 指向「用户主目录本身 / 用户主目录的上级 / 文件系统根」→ 该工具 `cleanable=false`，降级为仅检测；前端不可勾选，后端拒绝其清理请求（`TOOL_DISABLED`）。 |
 | R10 | 单次清理请求最多 64 项；**前端必须按 64 分批串行提交**（预览与真删都分批）并合并结果，用户不应看到因超限导致的失败（AC-22）。 |
 | R11 | 白名单模板只允许**末段单层通配**（如 `logs_*.sqlite`）；不支持 `**`、不支持正则。 |
-| R12 | **全局兜底黑名单**：即使误写进白名单，以下 basename 也永不删除——`.credentials.json`、`auth.json`、`oauth_creds.json`、`credentials.json`、`config.json`、`config.toml`、`settings.json`、`settings.local.json`、`.claude.json`、`state.vscdb`、`state.vscdb.backup`、`history.jsonl`、`.env`、`id_ed25519`、`*.key`、`*.pem` 等（`FORBIDDEN_BASENAME`）。 |
+| R12 | **全局兜底黑名单**：即使误写进白名单，以下 basename 也永不删除——`.credentials.json`、`auth.json`、`oauth_creds.json`、`credentials.json`、`config.json`、`config.toml`、`settings.json`、`settings.local.json`、`.claude.json`、`state.vscdb`、`state.vscdb.backup`、`history.jsonl`、`.env`、`id_ed25519`、`*.key`、`*.pem` 等（拒绝错误码 `PATH_NOT_ALLOWED`，与越界同码）。 |
 | R13 | 不写任何持久化记录（不落盘历史/日志/数据库）；清理结果仅在页面内存中展示。 |
 | R14 | 全程无网络请求；删除不用 shell/PowerShell，统一 Rust 原生 `fs`；`dry_run` 预览不得产生任何文件系统变更。 |
 
@@ -189,9 +194,9 @@ target: v1（MVP）
 
 | 类别 | 白名单条目（相对根） | 删除影响 |
 |------|---------------------|---------|
-| A · 缓存 | `cache`、`shell-snapshots`、`paste-cache`、`image-cache`、`todos`、`statsig`、`logs`、`plans`、`session-env`、`backups`、`usage-data` | 可自动重建；`paste-cache` 丢历史粘贴内容、`usage-data` 丢 `/insights` 历史报告，会话记录不受影响 |
+| A · 缓存 | `cache`、`shell-snapshots`、`image-cache`、`todos`、`statsig`、`logs`、`plans`、`session-env`、`backups` | 可自动重建；会话记录不受影响 |
 | A · 日志 | `debug` | 失去调试日志 |
-| B · 会话 | `projects`、`file-history`、`tasks`、`uploads`、`dev-mods`、`feedback`、`feedback-bundles`、`history.jsonl` | 会话 transcript、检查点、任务、上传/反馈内容，不可恢复 → 只展示 |
+| B · 会话 | `projects`、`file-history`、`tasks`、`uploads`、`dev-mods`、`feedback`、`feedback-bundles`、`history.jsonl`、`paste-cache`、`usage-data` | 会话 transcript、检查点、任务、上传/反馈内容；`paste-cache` 为历史粘贴内容、`usage-data` 为 `/insights` 历史报告——均为用户可见痕迹，删除不可恢复 → 只展示，无清理入口（D1） |
 
 C 类（protected，绝不进入白名单）：`.credentials.json`、`settings.json`、`settings.local.json`、`plugins`、`skills`、`agents`、`commands`、`rules`、`output-styles`、`workflows`、`themes`、`keybindings.json`、`agent-memory`、`jobs`、`daemon`、`CLAUDE.md`、`remote-settings.json`、`policy-limits.json`、`stats-cache.json`。
 
@@ -403,7 +408,7 @@ clean_ai_caches(request {
 **实现约束**
 
 - 前端提交的 `path` 只作候选：后端按 `tool_id + category` 找到白名单模板并**精确匹配**；未命中 → 该项失败，绝不"就近删除"。
-- `Sessions` / `ModelCache` 类别一律拒绝清理（`CATEGORY_NOT_CLEANABLE`）；降级工具一律拒绝（`TOOL_DOWNGRADED`）；全局兜底黑名单拒绝（`FORBIDDEN_BASENAME`）。
+- `Sessions` / `ModelCache` 类别一律拒绝清理（`CATEGORY_NOT_CLEANABLE`）；降级工具一律拒绝（`TOOL_DISABLED`）；全局兜底黑名单拒绝（`PATH_NOT_ALLOWED`）。
 - 目录类目标 `fs::remove_dir_all`；文件类目标 `fs::remove_file`，**不递归、不删同名目录**。
 - 删除前紧邻一次 `symlink_metadata` 复查（不 follow），压缩扫描→清理之间的 TOCTOU 窗口。
 - 单次请求 ≤64 项；前端按 64 分批串行提交（预览与真删都分批）并合并结果，不把超限错误暴露给用户。
@@ -440,7 +445,7 @@ clean_ai_caches(request {
 | AC-18 | 无网络 / 无提权 | 断网下全部功能可用；无网络请求代码路径；普通权限完成所有操作，无 UAC/提权弹窗 |
 | AC-19 | 幂等 | 连续两次清理同一批：第二次成功且 `freed_bytes = 0`，无错误 |
 | AC-20 | 隐私 | 清理结果不落盘（无历史文件、无 localStorage 路径记录）；代码中无上传/遥测调用 |
-| AC-21 | override 降级 | `CLAUDE_CONFIG_DIR=$HOME`、`CODEX_HOME=$HOME`、`CLAUDE_CONFIG_DIR=/`（及主目录上级）→ 该工具 `cleanable=false`：前端无勾选框、卡片显示降级原因、清理请求被 `TOOL_DOWNGRADED` 拒绝（`cargo test` + 手工验证） |
+| AC-21 | override 降级 | `CLAUDE_CONFIG_DIR=$HOME`、`CODEX_HOME=$HOME`、`CLAUDE_CONFIG_DIR=/`（及主目录上级）→ 该工具 `cleanable=false`：前端无勾选框、卡片显示降级原因、清理请求被 `TOOL_DISABLED` 拒绝（`cargo test` + 手工验证） |
 | AC-22 | 分批提交 | 构造 65 个待清理目标：前端按 64 分批（1 批 64 + 1 批 1）串行提交，全部执行并合并 `freed_bytes`/items；UI **不出现**"单次最多 64 项"之类错误 |
 
 **质量门（沿用项目宪法）**：`npm run lint`、`cargo fmt --check`、`cargo clippy` 干净；`cargo test` 覆盖 AC-10/11/12/13/14/16/21；PR 需过 architect + senior-qa（+ staff-infrastructure 看 Windows 路径与 CI）。
@@ -485,6 +490,7 @@ clean_ai_caches(request {
 | R4 | Ollama `models`（模型权重，`ModelCache` 类别） | **只展示，不提供清理入口** | 重新下载成本高（时间/流量），不属于"可自动重建" |
 | R5 | macOS 系统缓存目录（`~/Library/Caches/claude-cli-nodejs` 等） | **不进 v1，留 backlog（见 §12），v1.1 再做**；届时按精确白名单条目删除，不整根删、不做通配 | 代码已稳定全绿，SystemCache 根是新增的删除路径，临交付前加风险不划算 |
 | R6 | 工具矩阵与 Claude Desktop 数据边界 | **保持 v1.1 的 9 工具矩阵**；Claude Desktop 的 `claude_desktop_config.json`、扩展安装目录、config/state 文件**仅展示 / 受保护**，不进入可清理类别 | 配置与扩展删后不可恢复；9 工具的覆盖范围已验证，不因未启用的系统缓存根而扩表 |
+| R7 | Claude Code `paste-cache` / `usage-data`（D1） | **从 `Cache` 移到 `Sessions`：只展示占用，无清理入口** | 历史粘贴内容与 `/insights` 历史报告是用户可见痕迹，删除不可恢复，不属于"可自动重建"；与实现 `catalog.rs` 一致 |
 
 > 以上为已拍板结论。若后续要改（例如清理 `workspaceStorage`），需新开规格并按"会话清理"单独设计确认流程，不在 v1 范围内。
 

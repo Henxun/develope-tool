@@ -1,6 +1,6 @@
 //! AI 智能体缓存清理（feat/ai-cache-clean）验收测试（Tester / QA）。
 //!
-//! 对应最终实现（**最终 HEAD `e991341`** / spec v1.3）：
+//! 对应最终实现（**最终 HEAD `8df1201`** / spec v1.4）：
 //! - A 类（可清理）= `Cache` + `Logs`：`image-cache` / `plans` / `backups` / `debug` …
 //! - B 类（只读）= `Sessions` + `ModelCache`：`paste-cache` / `usage-data` / `projects` …（含惰性计算）
 //! - 覆盖 spec v1.3 §7 的 AC-02/03/04/05/06/07/08/09/10/11/12/13/14/15/16/17/19/21/22 + R3（B1）回归
@@ -12,7 +12,8 @@
 //! ```
 //!
 //! 所有夹具在系统临时目录，通过注入式 env lookup 指向夹具，不读写真实 `$HOME`；
-//! 不新增依赖：SHA-256 调系统 `shasum`，体积核对调系统 `du -sk`。
+//! 不新增依赖：内容指纹用纯 Rust FNV-1a（跨平台，不调 `shasum`）；
+//! `du -sk` 对比只在 Unix 分支执行，Windows 走「精确字节和」断言（无 du 等效通用命令）。
 
 use devetool_lib::ai_cache::catalog::{self, Platform};
 use devetool_lib::ai_cache::clean;
@@ -25,6 +26,7 @@ use devetool_lib::ai_cache::{
 use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
+#[cfg(unix)]
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
@@ -174,6 +176,58 @@ fn platform() -> Platform {
     catalog::current_platform()
 }
 
+/// 平台文件系统根（Windows `C:\` / 其它 `/`），用于 AC-21「根目录降级」。
+#[cfg(windows)]
+fn fs_root() -> PathBuf {
+    match std::env::var_os("SystemDrive") {
+        Some(drive) => {
+            let mut path = PathBuf::from(drive);
+            path.push("\\");
+            path
+        }
+        None => PathBuf::from(r"C:\"),
+    }
+}
+
+#[cfg(not(windows))]
+fn fs_root() -> PathBuf {
+    PathBuf::from("/")
+}
+
+/// 平台上一个必然存在的系统目录（Windows `%SystemRoot%` / 其它 `/etc`），
+/// 用于「系统绝对路径必须被拒绝」的负例。
+#[cfg(windows)]
+fn system_protected_dir() -> PathBuf {
+    std::env::var_os("SystemRoot")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(r"C:\Windows"))
+}
+
+#[cfg(not(windows))]
+fn system_protected_dir() -> PathBuf {
+    PathBuf::from("/etc")
+}
+
+/// 从 catalog 解析工具根目录：Cursor / Claude Desktop 等各平台根不同，
+/// 夹具必须用产品同一套解析逻辑，不能硬编码 macOS 路径。
+fn tool_root(lookup: &(impl Fn(&str) -> Option<OsString> + Sync), tool_id: &str) -> PathBuf {
+    let catalog_result = catalog::build_catalog(platform(), lookup);
+    let tool = catalog_result
+        .tools
+        .iter()
+        .find(|tool| tool.id == tool_id)
+        .unwrap_or_else(|| panic!("catalog 缺少工具：{tool_id}"));
+    tool.roots
+        .first()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| panic!("工具 {tool_id} 没有根目录"))
+}
+
+/// 路径最后一段是否等于指定名字（不依赖展示字符串的分隔符）。
+fn ends_with_component(path: &Path, component: &str) -> bool {
+    path.file_name().and_then(|name| name.to_str()) == Some(component)
+}
+
 fn scan_all(
     lookup: &(impl Fn(&str) -> Option<OsString> + Sync),
     tool_ids: &[&str],
@@ -219,7 +273,7 @@ fn clean_capturing(
     (result, events.into_inner().expect("事件锁"))
 }
 
-/// 目录/文件树指纹：路径 + 类型 + 字节数 + SHA-256（符号链接只记录链接本身）。
+/// 目录/文件树指纹：路径 + 类型 + 字节数 + 内容指纹（FNV-1a；符号链接只记录链接本身）。
 fn fingerprint(path: &Path) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     collect_fingerprint(path, &mut out);
@@ -244,7 +298,7 @@ fn collect_fingerprint(path: &Path, out: &mut Vec<String>) {
             "file|{}|{}|{}",
             path.display(),
             meta.len(),
-            sha256(path).unwrap_or_else(|| "SHA_UNAVAILABLE".to_string())
+            content_hash(path).unwrap_or_else(|| "HASH_UNAVAILABLE".to_string())
         ));
         return;
     }
@@ -264,22 +318,19 @@ fn collect_fingerprint(path: &Path, out: &mut Vec<String>) {
     out.push(format!("other|{}", path.display()));
 }
 
-fn sha256(path: &Path) -> Option<String> {
-    let output = Command::new("shasum")
-        .arg("-a")
-        .arg("256")
-        .arg(path)
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
+/// 纯 Rust 内容指纹（FNV-1a 64）：只用于「内容是否变化」的比对，
+/// 不依赖 `shasum`/OpenSSL，Windows 与 Unix 结果一致，无需密码学强度。
+fn content_hash(path: &Path) -> Option<String> {
+    let data = fs::read(path).ok()?;
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in data {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
     }
-    let text = String::from_utf8_lossy(&output.stdout);
-    text.split_whitespace()
-        .next()
-        .map(|value| value.to_string())
+    Some(format!("{hash:016x}"))
 }
 
+#[cfg(unix)]
 fn du_bytes(path: &Path) -> Option<u64> {
     let output = Command::new("du").arg("-sk").arg(path).output().ok()?;
     if !output.status.success() {
@@ -290,12 +341,63 @@ fn du_bytes(path: &Path) -> Option<u64> {
     Some(kib * 1024)
 }
 
+#[cfg(unix)]
 fn deviation_percent(scan_bytes: u64, du_bytes: u64) -> f64 {
     if scan_bytes == 0 {
         return 0.0;
     }
     let delta = (scan_bytes as f64 - du_bytes as f64).abs();
     delta / scan_bytes as f64 * 100.0
+}
+
+/// AC-04 体积核对：Unix 用系统 `du -sk` 做独立比对。
+#[cfg(unix)]
+fn assert_du_within_tolerance(
+    cache: &AiCacheCategoryDto,
+    logs: &AiCacheCategoryDto,
+    scan_bytes: u64,
+) {
+    let mut du_total = 0u64;
+    for category in [cache, logs] {
+        for path in &category.paths {
+            let path_buf = PathBuf::from(&path.path);
+            let du = du_bytes(&path_buf).expect("du -sk 应可执行");
+            let dev = deviation_percent(path.bytes, du);
+            println!(
+                "AC-04 明细 {} scan={}B du={}B 偏差={:.2}%",
+                path.path, path.bytes, du, dev
+            );
+            assert!(
+                dev <= 5.0,
+                "单项目录 {} 与 du -sk 偏差 {:.2}% 超过 5%（scan={} du={}）",
+                path.path,
+                dev,
+                path.bytes,
+                du
+            );
+            du_total += du;
+        }
+    }
+    let dev_total = deviation_percent(scan_bytes, du_total);
+    println!("AC-04 合计 scan={scan_bytes}B du={du_total}B 偏差={dev_total:.2}%（阈值 5%）");
+    assert!(
+        dev_total <= 5.0,
+        "总体积与 du -sk 偏差 {dev_total:.2}% 超过 5%"
+    );
+}
+
+/// Windows 没有 `du -sk` 等效通用命令：跳过磁盘块对比，改以「扫描字节 ==
+/// 期望文件字节和」的精确断言（断言不弱化，只是换一个可移植的度量）。
+#[cfg(not(unix))]
+fn assert_du_within_tolerance(
+    _cache: &AiCacheCategoryDto,
+    _logs: &AiCacheCategoryDto,
+    scan_bytes: u64,
+) {
+    println!(
+        "AC-04 Windows：无 `du -sk` 等效通用命令，跳过磁盘块对比；\
+         改用「扫描字节 == 期望文件字节和」精确断言（scan={scan_bytes}B）"
+    );
 }
 
 fn find_category<'a>(
@@ -342,33 +444,8 @@ fn ac04_scan_bytes_match_du_within_5_percent() {
     let logs = find_category(&result, "claude-code", AiCacheCategory::Logs).expect("logs 类别");
     let scan_bytes = cache.bytes + logs.bytes;
 
-    let mut du_total = 0u64;
-    for category in [cache, logs] {
-        for path in &category.paths {
-            let path_buf = PathBuf::from(&path.path);
-            let du = du_bytes(&path_buf).expect("du -sk 应可执行");
-            let dev = deviation_percent(path.bytes, du);
-            println!(
-                "AC-04 明细 {} scan={}B du={}B 偏差={:.2}%",
-                path.path, path.bytes, du, dev
-            );
-            assert!(
-                dev <= 5.0,
-                "单项目录 {} 与 du -sk 偏差 {:.2}% 超过 5%（scan={} du={}）",
-                path.path,
-                dev,
-                path.bytes,
-                du
-            );
-            du_total += du;
-        }
-    }
-    let dev_total = deviation_percent(scan_bytes, du_total);
-    println!("AC-04 合计 scan={scan_bytes}B du={du_total}B 偏差={dev_total:.2}%（阈值 5%）");
-    assert!(
-        dev_total <= 5.0,
-        "总体积与 du -sk 偏差 {dev_total:.2}% 超过 5%"
-    );
+    assert_du_within_tolerance(cache, logs, scan_bytes);
+
     assert_eq!(scan_bytes, 220_000 + 1_300_000 + 480_000 + 90_000);
     assert_eq!(result.total_cleanable_bytes, scan_bytes);
     assert_eq!(
@@ -406,7 +483,7 @@ fn ac06_b_class_is_display_only_and_measured_lazily() {
         sessions
             .paths
             .iter()
-            .any(|path| path.path.ends_with(DIR_SESSION)),
+            .any(|path| ends_with_component(Path::new(&path.path), DIR_SESSION)),
         "B 类路径仍应列出（供「打开目录」）"
     );
     assert_eq!(
@@ -547,7 +624,7 @@ fn d1_paste_cache_and_usage_data_are_display_only() {
         .unwrap_or("")
         .contains("PATH_NOT_ALLOWED")));
 
-    // 4) 目录树（含 SHA-256）零变化。
+    // 4) 目录树（含内容指纹）零变化。
     let mut after: Vec<String> = Vec::new();
     after.extend(fingerprint(&paste_dir));
     after.extend(fingerprint(&usage_dir));
@@ -557,7 +634,7 @@ fn d1_paste_cache_and_usage_data_are_display_only() {
         before.len(),
         after.len()
     );
-    assert_eq!(before, after, "被拒后目录树（含 SHA-256）必须完全一致");
+    assert_eq!(before, after, "被拒后目录树（含内容指纹）必须完全一致");
     assert!(paste_dir.join("paste.bin").exists());
     assert!(usage_dir.join("insight.bin").exists());
 
@@ -579,7 +656,10 @@ fn d1_paste_cache_and_usage_data_are_display_only() {
         sessions_heavy
             .paths
             .iter()
-            .filter(|path| path.path.ends_with(DIR_SESSION) || path.path.ends_with(DIR_SESSION_2))
+            .filter(|path| {
+                ends_with_component(Path::new(&path.path), DIR_SESSION)
+                    || ends_with_component(Path::new(&path.path), DIR_SESSION_2)
+            })
             .all(|path| path.bytes > 0),
         "两个目录在仅展示区都应有非零体积"
     );
@@ -691,7 +771,7 @@ fn ac07_dry_run_defaults_true_and_deletes_nothing() {
     assert!(result.dry_run);
     assert_eq!(result.deleted_count, 0);
     assert!(result.freed_bytes > 0, "dry-run 仍应给出预计释放量");
-    assert_eq!(before, after, "dry-run 后目录树（含 SHA-256）必须完全一致");
+    assert_eq!(before, after, "dry-run 后目录树（含内容指纹）必须完全一致");
     assert!(target.join("a.bin").exists());
 
     let explicit: AiCacheCleanRequest = serde_json::from_value(serde_json::json!({
@@ -710,7 +790,7 @@ fn ac07_dry_run_defaults_true_and_deletes_nothing() {
     assert!(!target.exists());
 }
 
-// ── AC-13 B/C 类零影响：清理前后文件数 + SHA-256 完全一致 ──
+// ── AC-13 B/C 类零影响：清理前后文件数 + 内容指纹（FNV-1a）完全一致 ──
 
 #[test]
 fn ac13_bc_untouched_by_clean() {
@@ -754,7 +834,7 @@ fn ac13_bc_untouched_by_clean() {
         .count();
     let hash_count_before = before
         .iter()
-        .filter(|entry| entry.starts_with("file|") && !entry.contains("SHA_UNAVAILABLE"))
+        .filter(|entry| entry.starts_with("file|") && !entry.contains("HASH_UNAVAILABLE"))
         .count();
 
     let lookup = env.lookup();
@@ -783,16 +863,13 @@ fn ac13_bc_untouched_by_clean() {
         .filter(|entry| entry.starts_with("file|"))
         .count();
     println!(
-        "AC-13 B/C 类文件数 before={file_count_before} after={file_count_after} 含 SHA-256 的文件数={hash_count_before}"
+        "AC-13 B/C 类文件数 before={file_count_before} after={file_count_after} 含内容指纹的文件数={hash_count_before}"
     );
     assert!(
         file_count_before > 0 && hash_count_before == file_count_before,
-        "B/C 类指纹必须全部带 SHA-256（shasum 可用）"
+        "B/C 类指纹必须全部带内容指纹（纯 Rust FNV-1a，无外部命令）"
     );
-    assert_eq!(
-        before, after,
-        "B/C 类目录/文件的数量与 SHA-256 必须完全一致"
-    );
+    assert_eq!(before, after, "B/C 类目录/文件的数量与内容指纹必须完全一致");
     assert!(root.exists(), "工具根目录必须保留");
     assert!(
         root.join(DIR_SESSION).join("paste.bin").exists(),
@@ -806,11 +883,14 @@ fn ac13_bc_untouched_by_clean() {
 #[test]
 fn ac13_multi_tool_b_class_zero_impact() {
     let env = FakeEnv::new("ac13-multi");
-    let codex = env.home.join(".codex");
-    let ollama = env.home.join(".ollama");
-    let cursor = env.home.join("Library/Application Support/Cursor");
-    fs::create_dir_all(&codex).expect("创建 .codex 失败");
-    fs::create_dir_all(&ollama).expect("创建 .ollama 失败");
+    let lookup = env.lookup();
+    // 根目录用 catalog 解析：Cursor 在 macOS 是 ~/Library/Application Support/Cursor，
+    // Windows 是 %APPDATA%\Cursor——不能硬编码 macOS 路径。
+    let codex = tool_root(&lookup, "codex");
+    let ollama = tool_root(&lookup, "ollama");
+    let cursor = tool_root(&lookup, "cursor");
+    fs::create_dir_all(&codex).expect("创建 Codex 根失败");
+    fs::create_dir_all(&ollama).expect("创建 Ollama 根失败");
     fs::create_dir_all(&cursor).expect("创建 Cursor 根失败");
     write_file(&codex.join("sessions/rollout-1.jsonl"), 5_000);
     write_file(&codex.join("logs_1.sqlite"), 1_000);
@@ -822,7 +902,6 @@ fn ac13_multi_tool_b_class_zero_impact() {
         7_000,
     );
     write_file(&cursor.join("Cache/data.bin"), 1_000);
-    let lookup = env.lookup();
 
     let sessions_before = fingerprint(&codex.join("sessions"));
     let models_before = fingerprint(&ollama.join("models"));
@@ -936,7 +1015,9 @@ fn ac13_multi_tool_b_class_zero_impact() {
 #[test]
 fn d5_claude_desktop_sensitive_items_are_not_cleanable() {
     let env = FakeEnv::new("d5-desktop");
-    let root = env.home.join("Library/Application Support/Claude");
+    let lookup = env.lookup();
+    // Claude Desktop 根：macOS ~/Library/Application Support/Claude、Windows %APPDATA%\Claude。
+    let root = tool_root(&lookup, "claude-desktop");
     fs::create_dir_all(&root).expect("创建 Claude Desktop 根失败");
     // A 类：Electron 可重建缓存
     write_file(&root.join("Cache/data.bin"), 1_000);
@@ -953,7 +1034,6 @@ fn d5_claude_desktop_sensitive_items_are_not_cleanable() {
     for relative in sensitive {
         write_file(&root.join(relative), 256);
     }
-    let lookup = env.lookup();
 
     let catalog_result = catalog::build_catalog(platform(), &lookup);
     let desktop = catalog_result
@@ -990,7 +1070,7 @@ fn d5_claude_desktop_sensitive_items_are_not_cleanable() {
         for path in &category.paths {
             for sensitive_rel in sensitive {
                 assert!(
-                    !path.path.ends_with(sensitive_rel),
+                    !Path::new(&path.path).ends_with(Path::new(sensitive_rel)),
                     "受保护项 {} 不得作为可清理项返回（category={:?}, cleanable={}）",
                     path.path,
                     category.category,
@@ -1063,6 +1143,13 @@ fn ac10_11_16_reject_forged_and_out_of_scope_targets() {
     let outside = env.home.join("outside/secret.txt");
     write_file(&outside, 500);
     let lookup = env.lookup();
+    // 系统绝对路径：Unix `/etc`、Windows `%SystemRoot%`（都不能依赖 POSIX 目录存在）。
+    let system_dir = system_protected_dir();
+    assert!(
+        system_dir.exists(),
+        "平台系统目录应存在：{}",
+        system_dir.display()
+    );
 
     let outside_dir_before = fingerprint(&env.home.join("outside"));
     let projects_before = fingerprint(&root.join("projects"));
@@ -1104,10 +1191,10 @@ fn ac10_11_16_reject_forged_and_out_of_scope_targets() {
                 .to_string(),
         },
         Case {
-            label: "绝对路径 /etc",
+            label: "绝对路径系统目录",
             tool_id: "claude-code",
             category: AiCacheCategory::Cache,
-            path: "/etc".to_string(),
+            path: system_dir.display().to_string(),
         },
         Case {
             label: "把工具根目录当目标",
@@ -1242,7 +1329,7 @@ fn ac10_11_16_reject_forged_and_out_of_scope_targets() {
     );
     assert!(root.exists());
     assert!(root.join(DIR_CACHE).join("ok.bin").exists());
-    assert!(Path::new("/etc").exists());
+    assert!(system_dir.exists());
 }
 
 // ── AC-22 后端 64 项上限仍生效（前端分批由 UI 代码核对） ──
@@ -1328,7 +1415,7 @@ fn ac12_symlink_target_not_followed_or_deleted() {
     let second_bytes = cache
         .paths
         .iter()
-        .find(|path| path.path.ends_with(DIR_CACHE_2))
+        .find(|path| ends_with_component(Path::new(&path.path), DIR_CACHE_2))
         .map(|path| path.bytes)
         .unwrap_or(0);
     println!("AC-12 {DIR_CACHE_2} 体积（不含链接目标 900000B）={second_bytes}B");
@@ -1365,7 +1452,7 @@ fn ac12_symlink_target_not_followed_or_deleted() {
     let symlink_item = result
         .items
         .iter()
-        .find(|item| item.path.ends_with(DIR_CACHE))
+        .find(|item| ends_with_component(Path::new(&item.path), DIR_CACHE))
         .expect("应保留符号链接项");
     assert!(
         symlink_item.status == AiCleanStatus::Skipped
@@ -1690,12 +1777,12 @@ fn ac21_override_to_sensitive_root_degrades_tool() {
     assert_eq!(ok.deleted_count, 1, "普通 override 应可正常清理");
 
     // 三种敏感位置：$HOME 本身 / $HOME 的上级 / 文件系统根（用每轮自己的 home 构造）
-    for label in ["$HOME 本身", "$HOME 的上级", "文件系统根 /"] {
+    for label in ["$HOME 本身", "$HOME 的上级", "文件系统根"] {
         let mut env = FakeEnv::new("ac21-sensitive");
         let override_dir = match label {
             "$HOME 本身" => env.home.clone(),
             "$HOME 的上级" => env.home.parent().map(Path::to_path_buf).expect("home 上级"),
-            _ => PathBuf::from("/"),
+            _ => fs_root(),
         };
         let normal = env.home.join("x");
         fs::create_dir_all(normal.join(DIR_CACHE)).expect("创建目录失败");
@@ -1901,12 +1988,12 @@ fn ac14_in_use_flag_from_mtime() {
     let recent = cache
         .paths
         .iter()
-        .find(|path| path.path.ends_with(DIR_CACHE))
+        .find(|path| ends_with_component(Path::new(&path.path), DIR_CACHE))
         .expect("recent");
     let old = cache
         .paths
         .iter()
-        .find(|path| path.path.ends_with(DIR_CACHE_2))
+        .find(|path| ends_with_component(Path::new(&path.path), DIR_CACHE_2))
         .expect("old");
     println!(
         "AC-14 recent.in_use={} (mtime={}) old.in_use={} (mtime={})",

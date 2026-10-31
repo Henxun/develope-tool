@@ -3,7 +3,7 @@
 - 执行人：Tester（测试）
 - 时间：2026-10-31（Asia/Shanghai）
 - 验收基线：**spec v1.4（已提交 `154a71d`，文档与实现对齐：D1 回写、错误码 `TOOL_DISABLED`；D4 在 v1.1 backlog；AC-01~AC-22）**
-- 代码基线：`feat/ai-cache-clean` @ **`5a6fa30`（最终 HEAD）**——含 `89dac87`（D1）、`b8d6bf3`（B1/惰性计算/降级/分批）、`e991341`（heavy 扫描并发口 + 文件系统根文案）、`5a6fa30`（计算占用串行约束 + 分批失败兜底）；另有 spec v1.4 等 docs 提交
+- 代码基线：`feat/ai-cache-clean` @ **`8df1201`（最终 HEAD）**——含 `89dac87`（D1）、`b8d6bf3`（B1/惰性计算/降级/分批）、`e991341`（heavy 扫描并发口 + 文件系统根文案）、`5a6fa30`（计算占用串行约束 + 分批失败兜底）、`8df1201`（9 工具矩阵字面断言）；另有 spec v1.4 等 docs 提交
 - 验证环境：macOS（Darwin，Apple Silicon）、rustc/cargo 1.99.1、Node v24.21.0
 - 验收方式：Rust 集成测试（真实实现 + 临时夹具 + 注入 env），前端 lint/build + 关键交互代码核对
 
@@ -36,12 +36,12 @@
 - 前端（静态核对 + build）：`tool-cache-card.tsx:45` 按 `cleanable` 拆分 `readonlyCategories`，`:189-205` 渲染「会话与模型数据（仅展示，不清理）」区块；`category-section.tsx:97-119` 对不可清理类别显示「仅展示」徽标与「计算占用」按钮；`page.tsx:540-575` 计算占用时调 `scanAiCacheUsage([toolId], true)` 并把结果合并回卡片（`:810` 绑定）；`e991341` 起 heavy 计算期间禁用重新扫描，避免两路进度混入同一条进度条。
 - 未验：真实 Tauri 页面点按（需开窗应用），按 §4 记为「无法验证」。
 
-### 0.3 质量门（最终 HEAD `5a6fa30` 实测）
+### 0.3 质量门（最终 HEAD `8df1201` 实测）
 
 ```
 cargo fmt --check                                   → exit 0
 cargo clippy --all-targets -- -D warnings           → exit 0，0 warning
-cargo test                                          → lib 47 passed / qa_ai_cache 22 passed / 0 failed
+cargo test                                          → lib 48 passed / qa_ai_cache 22 passed / 0 failed
 npm run lint                                        → exit 0
 npm run build                                       → exit 0（静态导出含 /tools/ai-cache-clean）
 ```
@@ -194,6 +194,6 @@ S5 最后事件 processed=2 freed=100（processed = deleted+skipped+failed）
 
 ## 6. 签署
 
-**结论（最终 HEAD `5a6fa30`，spec v1.4）：通过 19 条 / 失败 0 条 / 无法验证 3 条（本机无 GUI 走查与真实 5 GB 场景）；必测 8/8 通过；质量门全绿。** D1、D5 已按裁决验证通过，D4 已按裁决排除（v1.1 backlog）。剩余 N3/N4/N5 为低危文案/展示项，不阻塞交付；真机 UI 走查由有 GUI 的机器补 7 状态截图后即可交付。
+**结论（最终 HEAD `8df1201`，spec v1.4）：通过 19 条 / 失败 0 条 / 无法验证 3 条（本机无 GUI 走查与真实 5 GB 场景）；必测 8/8 通过；质量门全绿。** D1、D5 已按裁决验证通过，D4 已按裁决排除（v1.1 backlog）。剩余 N3/N4/N5 为低危文案/展示项，不阻塞交付；真机 UI 走查由有 GUI 的机器补 7 状态截图后即可交付。
 
 Tester · 2026-10-31

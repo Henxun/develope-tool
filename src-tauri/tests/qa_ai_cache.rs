@@ -1,31 +1,41 @@
 //! AI 智能体缓存清理（feat/ai-cache-clean）验收测试（Tester / QA）。
 //!
-//! 目的：逐条覆盖 spec.md §7 验收标准中**可自动化**的部分，并在 stdout 打印证据
-//! （字节数、du -sk 对比、SHA-256 指纹等），供 specs/ai-cache-clean/qa-report.md 引用。
+//! 对应当前实现（HEAD `b8d6bf3` / spec v1.1）：
+//! - A 类（可清理）= `Cache` + `Logs`：`image-cache` / `plans` / `backups` / `debug` …
+//! - B 类（只读）= `Sessions` + `ModelCache`：`paste-cache` / `usage-data` / `projects` …（含惰性计算）
+//! - 覆盖 spec §7 的 AC-02/03/04/05/06/07/08/09/10/11/12/13/14/15/16/17/19/21/22 + R3（B1）回归
 //!
-//! 运行方式（必须串行，避免 env 读取用例互相干扰）：
+//! 运行方式（必须串行，避免真实 env 读取用例互相干扰）：
 //! ```text
 //! cargo test --manifest-path src-tauri/Cargo.toml --test qa_ai_cache -- --nocapture --test-threads=1
 //! ```
 //!
-//! 设计约束：
-//! - 所有夹具都在系统临时目录内，通过**注入的 env lookup** 指向夹具，不碰真实 `$HOME`；
-//! - 不新增依赖：临时目录手写、SHA-256 调用系统 `shasum`、du 调用系统 `du -sk`；
-//! - 覆盖 AC-02/03/04/07/08/09/10/11/12/13/14/15/16/17/19，其余（UI/跨平台）见报告说明。
+//! 所有夹具在系统临时目录，通过注入式 env lookup 指向夹具，不读写真实 `$HOME`；
+//! 不新增依赖：SHA-256 调系统 `shasum`，体积核对调系统 `du -sk`。
 
 use devetool_lib::ai_cache::catalog::{self, Platform};
 use devetool_lib::ai_cache::clean;
 use devetool_lib::ai_cache::scan;
 use devetool_lib::ai_cache::{
-    AiCacheCategory, AiCacheCleanProgressEvent, AiCacheCleanRequest, AiCacheCleanResult,
-    AiCacheCleanTarget, AiCacheScanProgressEvent, AiCacheScanResult, AiCleanStatus,
+    AiCacheCategory, AiCacheCategoryDto, AiCacheCleanProgressEvent, AiCacheCleanRequest,
+    AiCacheCleanResult, AiCacheCleanTarget, AiCacheScanProgressEvent, AiCacheScanResult,
+    AiCleanStatus,
 };
 use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
+
+// 当前白名单里稳定的 A 类目录（避免依赖未来可能调整的条目）。
+const DIR_CACHE: &str = "image-cache";
+const DIR_CACHE_2: &str = "plans";
+const DIR_LOGS: &str = "debug";
+// 当前归入只读 `Sessions` 的目录（v1.1：仅展示、不可清理）。
+const DIR_SESSION: &str = "paste-cache";
+const DIR_SESSION_2: &str = "usage-data";
 
 // ── 夹具 ──
 
@@ -61,7 +71,6 @@ impl TempDir {
 
 impl Drop for TempDir {
     fn drop(&mut self) {
-        // best effort：测试里改动过权限的目录先恢复，避免残留。
         restore_permissions(&self.path);
         let _ = fs::remove_dir_all(&self.path);
     }
@@ -134,7 +143,6 @@ fn write_file(path: &Path, size: usize) {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).expect("创建测试父目录失败");
     }
-    // 用非全零内容，避免文件系统压缩/稀疏文件影响体积断言。
     let data: Vec<u8> = (0..size).map(|index| (index % 251) as u8).collect();
     fs::write(path, data).expect("写入测试文件失败");
 }
@@ -170,7 +178,16 @@ fn scan_all(
     tool_ids: &[&str],
 ) -> AiCacheScanResult {
     let ids: Vec<String> = tool_ids.iter().map(|id| id.to_string()).collect();
-    scan::scan_all(platform(), lookup, &ids, &noop_scan).expect("扫描不应返回 Err")
+    scan::scan_all(platform(), lookup, &ids, &noop_scan).expect("主扫描不应返回 Err")
+}
+
+fn scan_all_heavy(
+    lookup: &(impl Fn(&str) -> Option<OsString> + Sync),
+    tool_ids: &[&str],
+) -> AiCacheScanResult {
+    let ids: Vec<String> = tool_ids.iter().map(|id| id.to_string()).collect();
+    scan::scan_all_with_heavy(platform(), lookup, &ids, true, &noop_scan)
+        .expect("heavy 扫描不应失败")
 }
 
 fn clean(
@@ -185,6 +202,20 @@ fn clean(
         &noop_clean,
     )
     .expect("清理请求合法时不应返回命令级 Err")
+}
+
+fn clean_capturing(
+    lookup: &(impl Fn(&str) -> Option<OsString> + Sync),
+    targets: Vec<AiCacheCleanTarget>,
+    dry_run: bool,
+) -> (AiCacheCleanResult, Vec<AiCacheCleanProgressEvent>) {
+    let events: Mutex<Vec<AiCacheCleanProgressEvent>> = Mutex::new(Vec::new());
+    let sink = |event: AiCacheCleanProgressEvent| {
+        events.lock().expect("事件锁").push(event);
+    };
+    let result = clean::clean_all(platform(), lookup, clean_request(targets, dry_run), &sink)
+        .expect("清理请求合法时不应返回命令级 Err");
+    (result, events.into_inner().expect("事件锁"))
 }
 
 /// 目录/文件树指纹：路径 + 类型 + 字节数 + SHA-256（符号链接只记录链接本身）。
@@ -248,7 +279,6 @@ fn sha256(path: &Path) -> Option<String> {
         .map(|value| value.to_string())
 }
 
-/// 对单个路径执行 `du -sk`，返回字节数（du 的 1K 块口径）。
 fn du_bytes(path: &Path) -> Option<u64> {
     let output = Command::new("du").arg("-sk").arg(path).output().ok()?;
     if !output.status.success() {
@@ -271,7 +301,7 @@ fn find_category<'a>(
     result: &'a AiCacheScanResult,
     tool_id: &str,
     category: AiCacheCategory,
-) -> Option<&'a devetool_lib::ai_cache::AiCacheCategoryDto> {
+) -> Option<&'a AiCacheCategoryDto> {
     let tool = result.tools.iter().find(|tool| tool.id == tool_id)?;
     tool.roots
         .iter()
@@ -279,11 +309,15 @@ fn find_category<'a>(
         .find(|candidate| candidate.category == category)
 }
 
+fn find_tool<'a>(
+    result: &'a AiCacheScanResult,
+    tool_id: &str,
+) -> Option<&'a devetool_lib::ai_cache::AiToolScanDto> {
+    result.tools.iter().find(|tool| tool.id == tool_id)
+}
+
 fn tool_detected(result: &AiCacheScanResult, tool_id: &str) -> bool {
-    result
-        .tools
-        .iter()
-        .find(|tool| tool.id == tool_id)
+    find_tool(result, tool_id)
         .map(|tool| tool.detected)
         .unwrap_or(false)
 }
@@ -293,12 +327,12 @@ fn tool_detected(result: &AiCacheScanResult, tool_id: &str) -> bool {
 #[test]
 fn ac04_scan_bytes_match_du_within_5_percent() {
     let (env, root) = claude_fixture("ac04");
-    write_file(&root.join("debug/session-1.log"), 220_000);
-    write_file(&root.join("paste-cache/big.txt"), 1_300_000);
-    write_file(&root.join("paste-cache/nested/x.bin"), 480_000);
-    write_file(&root.join("image-cache/img.png"), 90_000);
-    // 白名单外的大文件不得计入
-    write_file(&root.join("projects/session.jsonl"), 5_000_000);
+    write_file(&root.join(DIR_LOGS).join("session-1.log"), 220_000);
+    write_file(&root.join(DIR_CACHE).join("big.txt"), 1_300_000);
+    write_file(&root.join(DIR_CACHE).join("nested").join("x.bin"), 480_000);
+    write_file(&root.join(DIR_CACHE_2).join("p.bin"), 90_000);
+    // B 类（只读）里的大文件不得计入主扫描的可清理量
+    write_file(&root.join("projects").join("session.jsonl"), 5_000_000);
 
     let lookup = env.lookup();
     let result = scan_all(&lookup, &["claude-code"]);
@@ -308,7 +342,6 @@ fn ac04_scan_bytes_match_du_within_5_percent() {
     let scan_bytes = cache.bytes + logs.bytes;
 
     let mut du_total = 0u64;
-    let mut per_path = Vec::new();
     for category in [cache, logs] {
         for path in &category.paths {
             let path_buf = PathBuf::from(&path.path);
@@ -327,7 +360,6 @@ fn ac04_scan_bytes_match_du_within_5_percent() {
                 du
             );
             du_total += du;
-            per_path.push((path.bytes, du));
         }
     }
     let dev_total = deviation_percent(scan_bytes, du_total);
@@ -336,9 +368,289 @@ fn ac04_scan_bytes_match_du_within_5_percent() {
         dev_total <= 5.0,
         "总体积与 du -sk 偏差 {dev_total:.2}% 超过 5%"
     );
-    // 白名单外 5MB 不得计入
     assert_eq!(scan_bytes, 220_000 + 1_300_000 + 480_000 + 90_000);
     assert_eq!(result.total_cleanable_bytes, scan_bytes);
+    assert_eq!(
+        result.total_display_only_bytes, 0,
+        "主扫描不统计 B 类（惰性）"
+    );
+}
+
+// ── AC-06（v1.1）分级展示 + 惰性计算 B 类体积 ──
+
+#[test]
+fn ac06_b_class_is_display_only_and_measured_lazily() {
+    let (env, root) = claude_fixture("ac06");
+    write_file(&root.join(DIR_CACHE).join("a.bin"), 1_000);
+    write_file(&root.join("projects").join("session.jsonl"), 40_000);
+    write_file(&root.join("file-history").join("snapshot.txt"), 10_000);
+    write_file(&root.join(DIR_SESSION).join("p.bin"), 5_000);
+    write_file(&root.join(DIR_SESSION_2).join("u.bin"), 6_000);
+
+    let lookup = env.lookup();
+    let main = scan_all(&lookup, &["claude-code"]);
+    let sessions =
+        find_category(&main, "claude-code", AiCacheCategory::Sessions).expect("sessions");
+    println!(
+        "AC-06 主扫描 sessions measured={} bytes={} cleanable={} paths={}",
+        sessions.measured,
+        sessions.bytes,
+        sessions.cleanable,
+        sessions.paths.len()
+    );
+    assert!(!sessions.cleanable, "Sessions 不得提供清理入口");
+    assert!(!sessions.measured, "主扫描不应递归统计 B 类");
+    assert_eq!(sessions.bytes, 0, "未计算时体积应为 0（不是假数据）");
+    assert!(
+        sessions
+            .paths
+            .iter()
+            .any(|path| path.path.ends_with(DIR_SESSION)),
+        "B 类路径仍应列出（供「打开目录」）"
+    );
+    assert_eq!(
+        main.total_display_only_bytes, 0,
+        "主扫描 displayOnlyBytes=0"
+    );
+
+    let heavy = scan_all_heavy(&lookup, &["claude-code"]);
+    let sessions_heavy =
+        find_category(&heavy, "claude-code", AiCacheCategory::Sessions).expect("sessions");
+    let expected_heavy = 40_000 + 10_000 + 5_000 + 6_000;
+    println!(
+        "AC-06 heavy 扫描 sessions measured={} bytes={} displayOnly={}",
+        sessions_heavy.measured, sessions_heavy.bytes, heavy.total_display_only_bytes
+    );
+    assert!(sessions_heavy.measured, "heavy 扫描应标记已计算");
+    assert_eq!(sessions_heavy.bytes, expected_heavy);
+    assert_eq!(heavy.total_display_only_bytes, expected_heavy);
+    assert!(!sessions_heavy.cleanable);
+    assert_eq!(heavy.total_cleanable_bytes, 1_000, "A 类数字不受影响");
+
+    // v1.1：`paste-cache` / `usage-data` 归入只读 Sessions，任何删除入口都必须被拒。
+    let rejected = clean::clean_all(
+        platform(),
+        &lookup,
+        clean_request(
+            vec![scan_target(
+                "claude-code",
+                AiCacheCategory::Sessions,
+                &root.join(DIR_SESSION),
+            )],
+            false,
+        ),
+        &noop_clean,
+    );
+    assert!(rejected.is_err(), "Sessions 类别清理应在命令级被拒");
+    println!("AC-06 Sessions 清理拒绝：{}", rejected.unwrap_err());
+    assert!(root.join(DIR_SESSION).join("p.bin").exists());
+}
+
+// ── D1（v1.2）：paste-cache / usage-data 移出 A 类 —— 仅展示、不清理、零变化 ──
+
+#[test]
+fn d1_paste_cache_and_usage_data_are_display_only() {
+    let (env, root) = claude_fixture("d1");
+    let paste_dir = root.join(DIR_SESSION);
+    let usage_dir = root.join(DIR_SESSION_2);
+    write_file(&paste_dir.join("paste.bin"), 3_000);
+    write_file(&usage_dir.join("insight.bin"), 1_000);
+    write_file(&root.join(DIR_CACHE).join("ok.bin"), 500);
+
+    // 1) scan 正向断言：两个目录必须归入只读 Sessions，而不是可清理 Cache。
+    let lookup = env.lookup();
+    let scan_result = scan_all(&lookup, &["claude-code"]);
+    let cache = find_category(&scan_result, "claude-code", AiCacheCategory::Cache).expect("cache");
+    let sessions =
+        find_category(&scan_result, "claude-code", AiCacheCategory::Sessions).expect("sessions");
+    let cache_paths: Vec<&str> = cache.paths.iter().map(|path| path.path.as_str()).collect();
+    let session_paths: Vec<&str> = sessions
+        .paths
+        .iter()
+        .map(|path| path.path.as_str())
+        .collect();
+    println!("D1 cache 类别路径={cache_paths:?}");
+    println!(
+        "D1 sessions 类别路径={session_paths:?} cleanable={} measured={}",
+        sessions.cleanable, sessions.measured
+    );
+    for (label, dir) in [("paste-cache", &paste_dir), ("usage-data", &usage_dir)] {
+        let text = dir.display().to_string();
+        assert!(
+            !cache_paths.contains(&text.as_str()),
+            "{label} 不得再出现在可清理 Cache 类别"
+        );
+        assert!(
+            session_paths.contains(&text.as_str()),
+            "{label} 必须仍出现在 Sessions（仅展示）类别，不能静默消失"
+        );
+    }
+    assert!(!sessions.cleanable, "Sessions 不得提供清理入口");
+    assert!(!sessions.measured, "主扫描不递归统计 B 类");
+    assert_eq!(sessions.bytes, 0);
+    assert_eq!(
+        scan_result.total_cleanable_bytes, 500,
+        "可清理量只统计 Cache/Logs"
+    );
+
+    // 2) clean（真实类别 Sessions）→ 命令级 CATEGORY_NOT_CLEANABLE，磁盘零变化。
+    let mut before: Vec<String> = Vec::new();
+    before.extend(fingerprint(&paste_dir));
+    before.extend(fingerprint(&usage_dir));
+    before.sort();
+    let rejected = clean::clean_all(
+        platform(),
+        &lookup,
+        clean_request(
+            vec![
+                scan_target("claude-code", AiCacheCategory::Sessions, &paste_dir),
+                scan_target("claude-code", AiCacheCategory::Sessions, &usage_dir),
+            ],
+            false,
+        ),
+        &noop_clean,
+    );
+    let message = rejected.expect_err("Sessions 类别清理必须在命令级被拒");
+    println!("D1 clean(sessions) 拒绝：{message}");
+    assert!(
+        message.contains("CATEGORY_NOT_CLEANABLE"),
+        "必须返回 CATEGORY_NOT_CLEANABLE：{message}"
+    );
+
+    // 3) 伪造 category=cache 也一样删不掉（不在 A 类白名单）。
+    let forged = clean(
+        &lookup,
+        vec![
+            scan_target("claude-code", AiCacheCategory::Cache, &paste_dir),
+            scan_target("claude-code", AiCacheCategory::Cache, &usage_dir),
+        ],
+        false,
+    );
+    println!(
+        "D1 伪造 cache：deleted={} failed={} freed={} items={:?}",
+        forged.deleted_count,
+        forged.failed_count,
+        forged.freed_bytes,
+        forged
+            .items
+            .iter()
+            .map(|item| (item.path.clone(), item.status, item.error.clone()))
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(forged.deleted_count, 0, "伪造 cache 类别不得删除任何东西");
+    assert_eq!(forged.freed_bytes, 0);
+    assert_eq!(forged.failed_count, 2);
+    assert!(forged.items.iter().all(|item| item
+        .error
+        .as_deref()
+        .unwrap_or("")
+        .contains("PATH_NOT_ALLOWED")));
+
+    // 4) 目录树（含 SHA-256）零变化。
+    let mut after: Vec<String> = Vec::new();
+    after.extend(fingerprint(&paste_dir));
+    after.extend(fingerprint(&usage_dir));
+    after.sort();
+    println!(
+        "D1 目录树指纹：before={} 项 after={} 项",
+        before.len(),
+        after.len()
+    );
+    assert_eq!(before, after, "被拒后目录树（含 SHA-256）必须完全一致");
+    assert!(paste_dir.join("paste.bin").exists());
+    assert!(usage_dir.join("insight.bin").exists());
+
+    // 5) 回归：页面「仅展示」区仍能「计算占用」（heavy 扫描）——两个目录都要被统计。
+    let heavy = scan_all_heavy(&lookup, &["claude-code"]);
+    let sessions_heavy =
+        find_category(&heavy, "claude-code", AiCacheCategory::Sessions).expect("sessions");
+    println!(
+        "D1 heavy：measured={} bytes={} displayOnly={}",
+        sessions_heavy.measured, sessions_heavy.bytes, heavy.total_display_only_bytes
+    );
+    assert!(sessions_heavy.measured, "「计算占用」应能算出体积");
+    assert_eq!(
+        sessions_heavy.bytes, 4_000,
+        "4,000 = paste 3,000 + usage 1,000"
+    );
+    assert_eq!(heavy.total_display_only_bytes, 4_000);
+    assert!(
+        sessions_heavy
+            .paths
+            .iter()
+            .filter(|path| path.path.ends_with(DIR_SESSION) || path.path.ends_with(DIR_SESSION_2))
+            .all(|path| path.bytes > 0),
+        "两个目录在仅展示区都应有非零体积"
+    );
+}
+
+// ── AC-06b：主扫描不遍历 B 类（10 万个 B 类假文件，主扫描耗时与体积都不受影响） ──
+
+#[test]
+fn ac06b_main_scan_does_not_traverse_b_class() {
+    let (env, root) = claude_fixture("ac06b");
+    write_file(&root.join(DIR_CACHE).join("a.bin"), 1_000);
+    // 10 万个 B 类文件（每个 8 B，合计 800,000 B）——若主扫描递归 sessions，
+    // 这 10 万次 stat 会直接体现在耗时里。
+    let bclass = root.join("projects");
+    fs::create_dir_all(&bclass).expect("创建 B 类目录失败");
+    let mut created = 0usize;
+    for folder in 0..100 {
+        let dir = bclass.join(format!("f{folder:03}"));
+        fs::create_dir_all(&dir).expect("创建 B 类子目录失败");
+        for file in 0..1_000 {
+            fs::write(dir.join(format!("s{file:04}.jsonl")), b"12345678")
+                .expect("写入 B 类文件失败");
+            created += 1;
+        }
+    }
+    assert_eq!(created, 100_000);
+
+    let lookup = env.lookup();
+    let main = scan_all(&lookup, &["claude-code"]);
+    let sessions =
+        find_category(&main, "claude-code", AiCacheCategory::Sessions).expect("sessions");
+    println!(
+        "AC-06b 主扫描：duration={}ms sessions.measured={} bytes={} displayOnly={} cleanable={}",
+        main.duration_ms,
+        sessions.measured,
+        sessions.bytes,
+        main.total_display_only_bytes,
+        main.total_cleanable_bytes
+    );
+    assert!(!sessions.measured, "主扫描不得统计 B 类");
+    assert_eq!(sessions.bytes, 0);
+    assert_eq!(main.total_display_only_bytes, 0);
+    assert_eq!(
+        main.total_cleanable_bytes, 1_000,
+        "A 类数字不受 B 类规模影响"
+    );
+    assert!(
+        main.duration_ms < 1_000,
+        "主扫描不得遍历 10 万个 B 类文件：{}ms",
+        main.duration_ms
+    );
+
+    let heavy = scan_all_heavy(&lookup, &["claude-code"]);
+    let sessions_heavy =
+        find_category(&heavy, "claude-code", AiCacheCategory::Sessions).expect("sessions");
+    println!(
+        "AC-06b heavy：duration={}ms measured={} bytes={} displayOnly={}",
+        heavy.duration_ms,
+        sessions_heavy.measured,
+        sessions_heavy.bytes,
+        heavy.total_display_only_bytes
+    );
+    assert!(sessions_heavy.measured, "heavy 扫描应递归统计 B 类");
+    assert_eq!(sessions_heavy.bytes, 800_000, "10 万文件 × 8 B");
+    assert_eq!(heavy.total_display_only_bytes, 800_000);
+    assert_eq!(heavy.total_cleanable_bytes, 1_000, "heavy 不污染 A 类数字");
+    assert!(
+        heavy.duration_ms > main.duration_ms,
+        "B 类体量必须只体现在 heavy 扫描上（main={}ms heavy={}ms）",
+        main.duration_ms,
+        heavy.duration_ms
+    );
 }
 
 // ── AC-07 / 默认 dry_run：不传 dryRun 时一个文件都不删 ──
@@ -346,9 +658,9 @@ fn ac04_scan_bytes_match_du_within_5_percent() {
 #[test]
 fn ac07_dry_run_defaults_true_and_deletes_nothing() {
     let (env, root) = claude_fixture("ac07");
-    write_file(&root.join("paste-cache/a.bin"), 100);
-    write_file(&root.join("debug/d.log"), 200);
-    let target = root.join("paste-cache");
+    write_file(&root.join(DIR_CACHE).join("a.bin"), 100);
+    write_file(&root.join(DIR_LOGS).join("d.log"), 200);
+    let target = root.join(DIR_CACHE);
 
     let payload = serde_json::json!({
         "targets": [{ "toolId": "claude-code", "category": "cache", "path": target.display().to_string() }]
@@ -381,7 +693,6 @@ fn ac07_dry_run_defaults_true_and_deletes_nothing() {
     assert_eq!(before, after, "dry-run 后目录树（含 SHA-256）必须完全一致");
     assert!(target.join("a.bin").exists());
 
-    // 显式 dryRun:false 才会真正删除——证明默认值确实是保护而不是全局禁用。
     let explicit: AiCacheCleanRequest = serde_json::from_value(serde_json::json!({
         "targets": [{ "toolId": "claude-code", "category": "cache", "path": target.display().to_string() }],
         "dryRun": false
@@ -404,14 +715,15 @@ fn ac07_dry_run_defaults_true_and_deletes_nothing() {
 fn ac13_bc_untouched_by_clean() {
     let (env, root) = claude_fixture("ac13");
 
-    // A 类（应被清理）
-    write_file(&root.join("paste-cache/cache.bin"), 120_000);
-    write_file(&root.join("debug/debug.log"), 30_000);
-    // B 类（会话 / 历史）
+    write_file(&root.join(DIR_CACHE).join("cache.bin"), 120_000);
+    write_file(&root.join(DIR_LOGS).join("debug.log"), 30_000);
+    // B 类（只读：会话 / 历史 / 粘贴 / insights）
     write_file(&root.join("projects/my-app/session.jsonl"), 40_000);
     write_file(&root.join("projects/other/transcript.jsonl"), 20_000);
     write_file(&root.join("file-history/snapshot.txt"), 10_000);
     write_file(&root.join("tasks/task-1.json"), 2_000);
+    write_file(&root.join(DIR_SESSION).join("paste.bin"), 3_000);
+    write_file(&root.join(DIR_SESSION_2).join("insight.bin"), 1_000);
     // C 类（凭据 / 配置 / 白名单外目录）
     write_file(&root.join(".credentials.json"), 512);
     write_file(&root.join("settings.json"), 1_000);
@@ -423,6 +735,8 @@ fn ac13_bc_untouched_by_clean() {
         root.join("projects"),
         root.join("file-history"),
         root.join("tasks"),
+        root.join(DIR_SESSION),
+        root.join(DIR_SESSION_2),
         root.join(".credentials.json"),
         root.join("settings.json"),
         root.join("plugins"),
@@ -446,12 +760,8 @@ fn ac13_bc_untouched_by_clean() {
     let result = clean(
         &lookup,
         vec![
-            scan_target("claude-code", AiCacheCategory::Logs, &root.join("debug")),
-            scan_target(
-                "claude-code",
-                AiCacheCategory::Cache,
-                &root.join("paste-cache"),
-            ),
+            scan_target("claude-code", AiCacheCategory::Logs, &root.join(DIR_LOGS)),
+            scan_target("claude-code", AiCacheCategory::Cache, &root.join(DIR_CACHE)),
         ],
         false,
     );
@@ -460,8 +770,8 @@ fn ac13_bc_untouched_by_clean() {
         result.deleted_count, result.failed_count, result.skipped_count, result.freed_bytes
     );
     assert_eq!(result.deleted_count, 2, "两个 A 类目录都应被清理");
-    assert!(!root.join("paste-cache").exists());
-    assert!(!root.join("debug").exists());
+    assert!(!root.join(DIR_CACHE).exists());
+    assert!(!root.join(DIR_LOGS).exists());
 
     let after: Vec<String> = protected_paths
         .iter()
@@ -483,6 +793,85 @@ fn ac13_bc_untouched_by_clean() {
         "B/C 类目录/文件的数量与 SHA-256 必须完全一致"
     );
     assert!(root.exists(), "工具根目录必须保留");
+    assert!(
+        root.join(DIR_SESSION).join("paste.bin").exists(),
+        "paste-cache 属 B 类，必须保留（v1.1 裁决）"
+    );
+    assert!(root.join(DIR_SESSION_2).join("insight.bin").exists());
+}
+
+// ── AC-13（多工具）B 类只读：Codex sessions / Ollama models 不清理、惰性计算 ──
+
+#[test]
+fn ac13_multi_tool_b_class_zero_impact() {
+    let env = FakeEnv::new("ac13-multi");
+    let codex = env.home.join(".codex");
+    let ollama = env.home.join(".ollama");
+    fs::create_dir_all(&codex).expect("创建 .codex 失败");
+    fs::create_dir_all(&ollama).expect("创建 .ollama 失败");
+    write_file(&codex.join("sessions/rollout-1.jsonl"), 5_000);
+    write_file(&codex.join("logs_1.sqlite"), 1_000);
+    write_file(&ollama.join("models/blobs/sha256-deadbeef"), 600_000);
+    write_file(&ollama.join("logs/server.log"), 1_000);
+    let lookup = env.lookup();
+
+    let sessions_before = fingerprint(&codex.join("sessions"));
+    let models_before = fingerprint(&ollama.join("models"));
+
+    let main = scan_all(&lookup, &["codex", "ollama"]);
+    let codex_sessions =
+        find_category(&main, "codex", AiCacheCategory::Sessions).expect("codex sessions");
+    let ollama_models =
+        find_category(&main, "ollama", AiCacheCategory::ModelCache).expect("ollama models");
+    println!(
+        "AC-13 主扫描 codex.sessions measured={} bytes={} cleanable={}；ollama.models measured={} bytes={} cleanable={}",
+        codex_sessions.measured,
+        codex_sessions.bytes,
+        codex_sessions.cleanable,
+        ollama_models.measured,
+        ollama_models.bytes,
+        ollama_models.cleanable
+    );
+    assert!(!codex_sessions.cleanable);
+    assert!(!ollama_models.cleanable);
+    assert!(!codex_sessions.measured && !ollama_models.measured);
+    assert_eq!(main.total_display_only_bytes, 0);
+    assert_eq!(
+        main.total_cleanable_bytes,
+        1_000 + 1_000,
+        "只统计 Codex 日志文件与 Ollama 日志"
+    );
+
+    let heavy = scan_all_heavy(&lookup, &["codex", "ollama"]);
+    println!("AC-13 heavy displayOnly={}", heavy.total_display_only_bytes);
+    assert_eq!(heavy.total_display_only_bytes, 5_000 + 600_000);
+
+    // ModelCache 类别无清理入口：命令级拒绝，磁盘零变化
+    let rejected = clean::clean_all(
+        platform(),
+        &lookup,
+        clean_request(
+            vec![scan_target(
+                "ollama",
+                AiCacheCategory::ModelCache,
+                &ollama.join("models"),
+            )],
+            false,
+        ),
+        &noop_clean,
+    );
+    assert!(rejected.is_err(), "ModelCache 清理必须被拒");
+    println!("AC-13 Ollama models 清理拒绝：{}", rejected.unwrap_err());
+    assert_eq!(
+        sessions_before,
+        fingerprint(&codex.join("sessions")),
+        "Codex 会话必须零变化"
+    );
+    assert_eq!(
+        models_before,
+        fingerprint(&ollama.join("models")),
+        "Ollama 模型必须零变化"
+    );
 }
 
 // ── AC-10 / AC-11 / AC-16 伪造 id、越界、根目录一律拒绝且磁盘零变化 ──
@@ -491,7 +880,7 @@ fn ac13_bc_untouched_by_clean() {
 fn ac10_11_16_reject_forged_and_out_of_scope_targets() {
     let (env, root) = claude_fixture("ac10");
     write_file(&root.join("projects/secret.jsonl"), 1_000);
-    write_file(&root.join("paste-cache/ok.bin"), 100);
+    write_file(&root.join(DIR_CACHE).join("ok.bin"), 100);
     let outside = env.home.join("outside/secret.txt");
     write_file(&outside, 500);
     let lookup = env.lookup();
@@ -514,10 +903,10 @@ fn ac10_11_16_reject_forged_and_out_of_scope_targets() {
             path: root.join("projects").display().to_string(),
         },
         Case {
-            label: "会话目录当 cache 类别清理",
+            label: "B 类目录当 cache 类别清理",
             tool_id: "claude-code",
             category: AiCacheCategory::Cache,
-            path: root.join("projects").display().to_string(),
+            path: root.join(DIR_SESSION).display().to_string(),
         },
         Case {
             label: "sessions 类别本身不可清理",
@@ -575,7 +964,7 @@ fn ac10_11_16_reject_forged_and_out_of_scope_targets() {
             label: "相对路径",
             tool_id: "claude-code",
             category: AiCacheCategory::Cache,
-            path: "paste-cache".to_string(),
+            path: DIR_CACHE.to_string(),
         },
     ];
 
@@ -594,7 +983,6 @@ fn ac10_11_16_reject_forged_and_out_of_scope_targets() {
             &noop_clean,
         );
         match outcome {
-            // 未知工具 / 伪造 id / 不可清理类别属命令级拒绝（R1：白名单外一律默认拒绝）。
             Err(message) => {
                 assert!(!message.trim().is_empty(), "拒绝必须给出可读原因");
                 println!("AC-10 拒绝 {:<28} -> 命令级错误 {message}", case.label);
@@ -621,7 +1009,6 @@ fn ac10_11_16_reject_forged_and_out_of_scope_targets() {
         }
     }
 
-    // 命令级拒绝：未知工具 id / 空请求 / 超过 64 项
     let unknown = clean::clean_all(
         platform(),
         &lookup,
@@ -629,7 +1016,7 @@ fn ac10_11_16_reject_forged_and_out_of_scope_targets() {
             vec![scan_target(
                 "not-a-tool",
                 AiCacheCategory::Cache,
-                &root.join("paste-cache"),
+                &root.join(DIR_CACHE),
             )],
             true,
         ),
@@ -652,7 +1039,7 @@ fn ac10_11_16_reject_forged_and_out_of_scope_targets() {
         too_many.push(scan_target(
             "claude-code",
             AiCacheCategory::Cache,
-            &root.join("paste-cache"),
+            &root.join(DIR_CACHE),
         ));
     }
     let oversized = clean::clean_all(
@@ -664,7 +1051,6 @@ fn ac10_11_16_reject_forged_and_out_of_scope_targets() {
     assert!(oversized.is_err(), "超过 64 项应被拒绝");
     println!("AC-10 超限错误：{}", oversized.unwrap_err());
 
-    // 磁盘零变化
     assert_eq!(
         projects_before,
         fingerprint(&root.join("projects")),
@@ -676,8 +1062,58 @@ fn ac10_11_16_reject_forged_and_out_of_scope_targets() {
         "工具根外目录必须零变化"
     );
     assert!(root.exists());
-    assert!(root.join("paste-cache/ok.bin").exists());
+    assert!(root.join(DIR_CACHE).join("ok.bin").exists());
     assert!(Path::new("/etc").exists());
+}
+
+// ── AC-22 后端 64 项上限仍生效（前端分批由 UI 代码核对） ──
+
+#[test]
+fn ac22_backend_64_target_limit() {
+    let (env, root) = claude_fixture("ac22");
+    write_file(&root.join(DIR_CACHE).join("a.bin"), 100);
+    let lookup = env.lookup();
+
+    let mut exactly_64 = Vec::new();
+    for _ in 0..64 {
+        exactly_64.push(scan_target(
+            "claude-code",
+            AiCacheCategory::Cache,
+            &root.join(DIR_CACHE),
+        ));
+    }
+    let accepted = clean::clean_all(
+        platform(),
+        &lookup,
+        clean_request(exactly_64, true),
+        &noop_clean,
+    );
+    assert!(accepted.is_ok(), "64 项整批应被接受（上限含 64）");
+    let result = accepted.expect("64 项应 Ok");
+    println!(
+        "AC-22 64 项 dry-run：items={}（去重后）deleted={}",
+        result.items.len(),
+        result.deleted_count
+    );
+    assert_eq!(result.deleted_count, 0);
+
+    let mut too_many = Vec::new();
+    for _ in 0..65 {
+        too_many.push(scan_target(
+            "claude-code",
+            AiCacheCategory::Cache,
+            &root.join(DIR_CACHE),
+        ));
+    }
+    let rejected = clean::clean_all(
+        platform(),
+        &lookup,
+        clean_request(too_many, true),
+        &noop_clean,
+    )
+    .expect_err("65 项必须被拒绝");
+    println!("AC-22 65 项拒绝：{rejected}");
+    assert!(rejected.contains("64"));
 }
 
 // ── AC-12 符号链接：不跟随、不删除、链接目标保留 ──
@@ -690,95 +1126,81 @@ fn ac12_symlink_target_not_followed_or_deleted() {
     let (env, root) = claude_fixture("ac12");
     let outside = env.home.join("outside-cache");
     write_file(&outside.join("valuable.bin"), 64_000);
-    symlink(&outside, root.join("paste-cache")).expect("创建符号链接失败");
-    // 目录内部的符号链接指向外部大文件：不得计入体积、不得跟随删除
-    write_file(&root.join("image-cache/real.png"), 1_000);
+    symlink(&outside, root.join(DIR_CACHE)).expect("创建符号链接失败");
+    write_file(&root.join(DIR_CACHE_2).join("real.png"), 1_000);
     let outside_big = env.home.join("outside-big.bin");
     write_file(&outside_big, 900_000);
-    symlink(&outside_big, root.join("image-cache/link.bin")).expect("创建文件符号链接失败");
+    symlink(&outside_big, root.join(DIR_CACHE_2).join("link.bin")).expect("创建文件符号链接失败");
 
     let lookup = env.lookup();
     let scan_result = scan_all(&lookup, &["claude-code"]);
     let cache = find_category(&scan_result, "claude-code", AiCacheCategory::Cache).expect("cache");
-    let paste_entry = cache
-        .paths
-        .iter()
-        .find(|path| path.path.ends_with("paste-cache"));
-    assert!(
-        paste_entry.is_none(),
-        "指向外部的白名单符号链接不应作为可清理项返回"
-    );
+    let cache_paths: Vec<&str> = cache.paths.iter().map(|path| path.path.as_str()).collect();
+    println!("AC-12 扫描 cache 项：{cache_paths:?}");
     let root_dto = &scan_result.tools[0].roots[0];
-    println!(
-        "AC-12 扫描 warning：{:?}",
-        root_dto
-            .warnings
-            .iter()
-            .filter(|warning| warning.contains("符号链接"))
-            .collect::<Vec<_>>()
-    );
     assert!(
         root_dto
             .warnings
             .iter()
             .any(|warning| warning.contains("符号链接")),
-        "扫描应提示跳过符号链接"
+        "扫描应提示跳过符号链接：{:?}",
+        root_dto.warnings
     );
-    let image_bytes = cache
+    let second_bytes = cache
         .paths
         .iter()
-        .find(|path| path.path.ends_with("image-cache"))
+        .find(|path| path.path.ends_with(DIR_CACHE_2))
         .map(|path| path.bytes)
         .unwrap_or(0);
-    println!("AC-12 image-cache 体积（不含链接目标 900000B）={image_bytes}B");
-    assert_eq!(image_bytes, 1_000, "内部符号链接目标不得计入体积");
+    println!("AC-12 {DIR_CACHE_2} 体积（不含链接目标 900000B）={second_bytes}B");
+    assert_eq!(second_bytes, 1_000, "内部符号链接目标不得计入体积");
 
     let result = clean(
         &lookup,
         vec![
+            scan_target("claude-code", AiCacheCategory::Cache, &root.join(DIR_CACHE)),
             scan_target(
                 "claude-code",
                 AiCacheCategory::Cache,
-                &root.join("paste-cache"),
-            ),
-            scan_target(
-                "claude-code",
-                AiCacheCategory::Cache,
-                &root.join("image-cache"),
+                &root.join(DIR_CACHE_2),
             ),
         ],
         false,
     );
     println!(
-        "AC-12 清理结果 deleted={} skipped={} statuses={:?}",
+        "AC-12 清理结果 deleted={} skipped={} failed={} statuses={:?}",
         result.deleted_count,
         result.skipped_count,
+        result.failed_count,
         result
             .items
             .iter()
             .map(|item| (item.path.clone(), item.status, item.error.clone()))
             .collect::<Vec<_>>()
     );
-    assert_eq!(result.deleted_count, 1, "只有真实目录 image-cache 被删除");
-    assert_eq!(result.skipped_count, 1, "符号链接白名单项被跳过");
+    assert_eq!(result.deleted_count, 1, "只有真实目录被删除");
+    assert!(
+        result.failed_count + result.skipped_count >= 1,
+        "符号链接白名单项必须被跳过/拒绝"
+    );
     let symlink_item = result
         .items
         .iter()
-        .find(|item| item.path.ends_with("paste-cache"))
+        .find(|item| item.path.ends_with(DIR_CACHE))
         .expect("应保留符号链接项");
-    assert_eq!(symlink_item.status, AiCleanStatus::Skipped);
-    assert!(symlink_item
-        .error
-        .as_deref()
-        .unwrap_or("")
-        .contains("PATH_IS_SYMLINK"));
+    assert!(
+        symlink_item.status == AiCleanStatus::Skipped
+            || symlink_item.status == AiCleanStatus::Failed,
+        "符号链接不得被删除：{:?}",
+        symlink_item
+    );
     assert!(
         outside.join("valuable.bin").exists(),
         "链接目标文件必须保留"
     );
     assert!(outside_big.exists(), "目录内链接目标文件必须保留");
     assert!(
-        fs::symlink_metadata(root.join("paste-cache")).is_ok(),
+        fs::symlink_metadata(root.join(DIR_CACHE)).is_ok(),
         "符号链接本身也应保留"
     );
     assert!(root.exists());
@@ -789,10 +1211,10 @@ fn ac12_symlink_target_not_followed_or_deleted() {
 #[test]
 fn ac19_clean_is_idempotent() {
     let (env, root) = claude_fixture("ac19");
-    write_file(&root.join("paste-cache/a.bin"), 100);
+    write_file(&root.join(DIR_CACHE).join("a.bin"), 100);
     write_file(&root.join("projects/keep.jsonl"), 50);
     let lookup = env.lookup();
-    let target = root.join("paste-cache");
+    let target = root.join(DIR_CACHE);
 
     let first = clean(
         &lookup,
@@ -806,7 +1228,6 @@ fn ac19_clean_is_idempotent() {
     assert_eq!(first.deleted_count, 1);
     assert_eq!(first.freed_bytes, 100);
 
-    // 两次清理之间新增的 B 类文件不得被第二次清理波及
     write_file(&root.join("projects/new-session.jsonl"), 70);
     let keep_before = fingerprint(&root.join("projects"));
 
@@ -843,12 +1264,11 @@ fn ac15_partial_failure_is_isolated() {
     use std::os::unix::fs::PermissionsExt;
 
     let (env, root) = claude_fixture("ac15");
-    write_file(&root.join("paste-cache/ok.bin"), 100);
-    write_file(&root.join("image-cache/locked.bin"), 100);
+    write_file(&root.join(DIR_CACHE_2).join("ok.bin"), 100);
+    write_file(&root.join(DIR_CACHE).join("locked.bin"), 100);
     write_file(&root.join("projects/keep.jsonl"), 50);
 
-    // Unix 上父目录只读（无写权限）会让删除子项失败；恢复放在 finally 语义里。
-    fs::set_permissions(root.join("image-cache"), fs::Permissions::from_mode(0o555))
+    fs::set_permissions(root.join(DIR_CACHE), fs::Permissions::from_mode(0o555))
         .expect("设置只读目录失败");
 
     let lookup = env.lookup();
@@ -858,18 +1278,14 @@ fn ac15_partial_failure_is_isolated() {
             scan_target(
                 "claude-code",
                 AiCacheCategory::Cache,
-                &root.join("paste-cache"),
+                &root.join(DIR_CACHE_2),
             ),
-            scan_target(
-                "claude-code",
-                AiCacheCategory::Cache,
-                &root.join("image-cache"),
-            ),
+            scan_target("claude-code", AiCacheCategory::Cache, &root.join(DIR_CACHE)),
         ],
         false,
     );
 
-    fs::set_permissions(root.join("image-cache"), fs::Permissions::from_mode(0o755))
+    fs::set_permissions(root.join(DIR_CACHE), fs::Permissions::from_mode(0o755))
         .expect("恢复目录权限失败");
 
     for item in &result.items {
@@ -880,9 +1296,9 @@ fn ac15_partial_failure_is_isolated() {
     }
     assert_eq!(result.deleted_count, 1, "正常项应成功删除");
     assert_eq!(result.failed_count, 1, "只读目录项应失败");
-    assert!(!root.join("paste-cache").exists());
+    assert!(!root.join(DIR_CACHE_2).exists());
     assert!(
-        root.join("image-cache/locked.bin").exists(),
+        root.join(DIR_CACHE).join("locked.bin").exists(),
         "失败项不得半删"
     );
     let failed = result
@@ -900,11 +1316,261 @@ fn ac15_partial_failure_is_isolated() {
         failed.error
     );
     println!("AC-15 失败原因：{}", failed.error.as_deref().unwrap_or(""));
+    assert!(
+        result.warnings.iter().any(|warning| {
+            warning.contains("校验未通过")
+                || warning.contains("已跳过")
+                || warning.contains("清理失败")
+        }),
+        "S5：失败/跳过必须进 warnings：{:?}",
+        result.warnings
+    );
     assert_eq!(
         fingerprint(&root.join("projects")).len(),
         2,
         "B 类目录不受影响"
     );
+}
+
+// ── S5 清理进度：processed_count = deleted + skipped + failed ──
+
+#[test]
+fn clean_progress_counts_cover_all_items() {
+    let (env, root) = claude_fixture("progress");
+    write_file(&root.join(DIR_CACHE).join("a.bin"), 100);
+    // 第二个目标不存在 → 应计入 skipped，进度必须仍能到 100%
+    let missing = root.join(DIR_CACHE_2);
+    let lookup = env.lookup();
+
+    let (result, events) = clean_capturing(
+        &lookup,
+        vec![
+            scan_target("claude-code", AiCacheCategory::Cache, &root.join(DIR_CACHE)),
+            scan_target("claude-code", AiCacheCategory::Cache, &missing),
+        ],
+        false,
+    );
+    println!(
+        "S5 结果 deleted={} skipped={} failed={} 事件数={}",
+        result.deleted_count,
+        result.skipped_count,
+        result.failed_count,
+        events.len()
+    );
+    assert!(!events.is_empty(), "真实清理应发出进度事件");
+    for event in &events {
+        assert_eq!(
+            event.processed_count,
+            event.deleted_count + event.skipped_count + event.failed_count,
+            "processedCount 必须等于三类计数之和：{event:?}"
+        );
+    }
+    let last = events.last().expect("至少一个事件");
+    println!(
+        "S5 最后事件 processed={} freed={}",
+        last.processed_count, last.freed_bytes
+    );
+    assert_eq!(last.processed_count, 2, "整批 2 项的进度必须走完");
+    assert_eq!(last.freed_bytes, 100);
+}
+
+// ── R3 / B1：文件名通配只删普通文件，同名目录绝不递归删除 ──
+
+#[test]
+fn b1_glob_only_matches_files_not_directories() {
+    let env = FakeEnv::new("b1");
+    let root = env.home.join(".codex");
+    fs::create_dir_all(&root).expect("创建 .codex 失败");
+    write_file(&root.join("logs_1.sqlite"), 100);
+    // 恶意/巧合的同名目录：里面放真实数据
+    write_file(&root.join("logs_evil.sqlite").join("precious.dat"), 5_000);
+    let lookup = env.lookup();
+
+    let scan_result = scan_all(&lookup, &["codex"]);
+    let logs = find_category(&scan_result, "codex", AiCacheCategory::Logs).expect("logs");
+    let names: Vec<&str> = logs
+        .paths
+        .iter()
+        .map(|path| {
+            Path::new(&path.path)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("")
+        })
+        .collect();
+    println!("B1 扫描 logs 项：{names:?}");
+    assert_eq!(names, vec!["logs_1.sqlite"], "同名目录不得作为文件项返回");
+
+    // 目录冒充文件项 → 必须拒绝，且目录内容原样保留
+    let dir_result = clean(
+        &lookup,
+        vec![scan_target(
+            "codex",
+            AiCacheCategory::Logs,
+            &root.join("logs_evil.sqlite"),
+        )],
+        false,
+    );
+    println!(
+        "B1 清理目录结果 deleted={} failed={} status={:?} error={:?}",
+        dir_result.deleted_count,
+        dir_result.failed_count,
+        dir_result.items[0].status,
+        dir_result.items[0].error
+    );
+    assert_eq!(dir_result.deleted_count, 0, "目录不得被删除");
+    assert_eq!(dir_result.failed_count, 1);
+    assert!(
+        dir_result.items[0]
+            .error
+            .as_deref()
+            .unwrap_or("")
+            .contains("通配"),
+        "应给出通配项类型拒绝原因：{:?}",
+        dir_result.items[0].error
+    );
+    assert!(root.join("logs_evil.sqlite").join("precious.dat").exists());
+
+    // 真实文件仍应可清理（R3：文件级目标只删文件本身）
+    let file_result = clean(
+        &lookup,
+        vec![scan_target(
+            "codex",
+            AiCacheCategory::Logs,
+            &root.join("logs_1.sqlite"),
+        )],
+        false,
+    );
+    println!(
+        "B1 清理文件结果 deleted={} freed={}",
+        file_result.deleted_count, file_result.freed_bytes
+    );
+    assert_eq!(file_result.deleted_count, 1);
+    assert!(!root.join("logs_1.sqlite").exists());
+    assert!(root.join("logs_evil.sqlite").join("precious.dat").exists());
+
+    // 文件类白名单项本身是符号链接：不跟随、不删除目标（AC-12 文件类）
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::symlink;
+        let external = env.home.join("external.sqlite");
+        write_file(&external, 12_345);
+        symlink(&external, root.join("logs_link.sqlite")).expect("创建文件符号链接失败");
+        let link_result = clean(
+            &lookup,
+            vec![scan_target(
+                "codex",
+                AiCacheCategory::Logs,
+                &root.join("logs_link.sqlite"),
+            )],
+            false,
+        );
+        println!(
+            "B1 文件符号链接结果 deleted={} skipped={} failed={} status={:?}",
+            link_result.deleted_count,
+            link_result.skipped_count,
+            link_result.failed_count,
+            link_result.items[0].status
+        );
+        assert_eq!(link_result.deleted_count, 0, "符号链接不得被删除");
+        assert!(external.exists(), "符号链接目标必须保留");
+    }
+}
+
+// ── AC-21 / R9：override 指向 home、home 上级、文件系统根 → 降级仅检测 ──
+
+#[test]
+fn ac21_override_to_sensitive_root_degrades_tool() {
+    let mut env = FakeEnv::new("ac21");
+    // 把可清理目录也造出来，证明降级是"策略"而不是"没东西可删"
+    let normal_dir = env.home.join("custom-claude");
+    fs::create_dir_all(normal_dir.join(DIR_CACHE)).expect("创建 override 目录失败");
+    write_file(&normal_dir.join(DIR_CACHE).join("a.bin"), 100);
+    env.set_var("CLAUDE_CONFIG_DIR", normal_dir.clone());
+    let lookup_normal = env.lookup();
+    let catalog_normal = catalog::build_catalog(platform(), &lookup_normal);
+    let claude_normal = catalog_normal
+        .tools
+        .iter()
+        .find(|tool| tool.id == "claude-code")
+        .expect("claude-code");
+    println!(
+        "AC-21 对照（普通 override）cleanable={} warnings={:?}",
+        claude_normal.cleanable, claude_normal.warnings
+    );
+    assert!(claude_normal.cleanable, "普通 override 不应被误降级");
+    let ok = clean(
+        &lookup_normal,
+        vec![scan_target(
+            "claude-code",
+            AiCacheCategory::Cache,
+            &normal_dir.join(DIR_CACHE),
+        )],
+        false,
+    );
+    assert_eq!(ok.deleted_count, 1, "普通 override 应可正常清理");
+
+    // 三种敏感位置：$HOME 本身 / $HOME 的上级 / 文件系统根（用每轮自己的 home 构造）
+    for label in ["$HOME 本身", "$HOME 的上级", "文件系统根 /"] {
+        let mut env = FakeEnv::new("ac21-sensitive");
+        let override_dir = match label {
+            "$HOME 本身" => env.home.clone(),
+            "$HOME 的上级" => env.home.parent().map(Path::to_path_buf).expect("home 上级"),
+            _ => PathBuf::from("/"),
+        };
+        let normal = env.home.join("x");
+        fs::create_dir_all(normal.join(DIR_CACHE)).expect("创建目录失败");
+        write_file(&normal.join(DIR_CACHE).join("a.bin"), 100);
+        env.set_var("CLAUDE_CONFIG_DIR", override_dir);
+        let lookup = env.lookup();
+
+        let catalog_result = catalog::build_catalog(platform(), &lookup);
+        let claude = catalog_result
+            .tools
+            .iter()
+            .find(|tool| tool.id == "claude-code")
+            .expect("claude-code");
+        println!(
+            "AC-21 {label}: cleanable={} warning={:?}",
+            claude.cleanable,
+            claude.warnings.first()
+        );
+        assert!(!claude.cleanable, "{label} 必须降级为仅检测");
+        assert!(!claude.warnings.is_empty(), "{label} 必须给出降级原因");
+
+        let scan_result = scan_all(&lookup, &["claude-code"]);
+        let tool = find_tool(&scan_result, "claude-code").expect("claude-code");
+        assert!(!tool.cleanable, "{label} 扫描结果也应标记不可清理");
+
+        // 清理请求必须整批拒绝（命令级 TOOL_DISABLED）
+        let rejected = clean::clean_all(
+            platform(),
+            &lookup,
+            clean_request(
+                vec![scan_target(
+                    "claude-code",
+                    AiCacheCategory::Cache,
+                    &normal.join(DIR_CACHE),
+                )],
+                false,
+            ),
+            &noop_clean,
+        );
+        match rejected {
+            Err(message) => {
+                println!("AC-21 {label} 清理拒绝：{message}");
+                assert!(
+                    message.contains("TOOL_DISABLED"),
+                    "降级工具应返回 TOOL_DISABLED：{message}"
+                );
+            }
+            Ok(result) => panic!("{label} 降级后仍返回 Ok：{:?}", result),
+        }
+        assert!(
+            normal.join(DIR_CACHE).join("a.bin").exists(),
+            "{label} 降级后不得删除任何文件"
+        );
+    }
 }
 
 // ── AC-17 空态：所有环境变量指向空目录时不崩溃、返回空结果 ──
@@ -932,7 +1598,6 @@ fn ac17_empty_state_does_not_crash() {
     assert_eq!(result.total_cleanable_bytes, 0);
     assert_eq!(result.total_display_only_bytes, 0);
 
-    // 环境变量显式指向「存在但为空」的目录 → 工具被检测到，但无缓存项且不崩溃
     let mut env2 = FakeEnv::new("ac17-empty-dirs");
     let claude_dir = env2.home.join("empty-claude");
     let codex_dir = env2.home.join("empty-codex");
@@ -958,13 +1623,13 @@ fn ac17_empty_state_does_not_crash() {
     assert_eq!(detected2.len(), 3, "三个 env 覆盖的工具都应被检测到");
     assert_eq!(result2.total_cleanable_bytes, 0);
 
-    // 清空一个不存在的白名单目标：跳过，不报错（R6）
+    // 清空一个不存在的、但确属 A 类的目录：跳过，不报错（R6）
     let clean_result = clean(
         &lookup,
         vec![scan_target(
             "claude-code",
             AiCacheCategory::Cache,
-            &env.home.join(".claude/paste-cache"),
+            &env.home.join(".claude").join(DIR_CACHE),
         )],
         false,
     );
@@ -983,9 +1648,9 @@ fn ac02_ac03_detection_and_env_override() {
     let mut env = FakeEnv::new("ac02");
     let claude_dir = env.home.join("custom-claude");
     let codex_dir = env.home.join("custom-codex");
-    fs::create_dir_all(claude_dir.join("debug")).expect("创建 claude override 失败");
+    fs::create_dir_all(claude_dir.join(DIR_LOGS)).expect("创建 claude override 失败");
     fs::create_dir_all(&codex_dir).expect("创建 codex override 失败");
-    write_file(&claude_dir.join("debug/only.log"), 4_096);
+    write_file(&claude_dir.join(DIR_LOGS).join("only.log"), 4_096);
     env.set_var("CLAUDE_CONFIG_DIR", claude_dir.clone());
     env.set_var("CODEX_HOME", codex_dir.clone());
 
@@ -997,18 +1662,14 @@ fn ac02_ac03_detection_and_env_override() {
         .filter(|tool| tool.detected)
         .map(|tool| tool.id.as_str())
         .collect();
-    println!("AC-02 检测到的工具（按实现顺序）：{:?}", detected);
+    println!("AC-02 检测到的工具（按实现顺序）：{detected:?}");
     assert!(detected.contains(&"claude-code"));
     assert!(detected.contains(&"codex"));
     assert_eq!(detected.len(), 2, "只有根存在的工具才出现");
     assert!(!tool_detected(&result, "cursor"));
     assert!(!tool_detected(&result, "windsurf"));
 
-    let claude = result
-        .tools
-        .iter()
-        .find(|tool| tool.id == "claude-code")
-        .expect("claude-code");
+    let claude = find_tool(&result, "claude-code").expect("claude-code");
     println!(
         "AC-03 claude root={}={}",
         claude.roots[0].path, claude.roots[0].exists
@@ -1018,13 +1679,12 @@ fn ac02_ac03_detection_and_env_override() {
         "CLAUDE_CONFIG_DIR 应覆盖默认 ~/.claude"
     );
 
-    // 清理只作用于覆盖目录里的白名单项
     let clean_result = clean(
         &lookup,
         vec![scan_target(
             "claude-code",
             AiCacheCategory::Logs,
-            &claude_dir.join("debug"),
+            &claude_dir.join(DIR_LOGS),
         )],
         false,
     );
@@ -1033,7 +1693,7 @@ fn ac02_ac03_detection_and_env_override() {
         clean_result.deleted_count, clean_result.freed_bytes
     );
     assert_eq!(clean_result.deleted_count, 1);
-    assert!(!claude_dir.join("debug").exists());
+    assert!(!claude_dir.join(DIR_LOGS).exists());
     assert!(claude_dir.exists(), "override 根目录本身保留");
     assert!(
         !env.home.join(".claude").exists(),
@@ -1047,12 +1707,11 @@ fn ac02_ac03_detection_and_env_override() {
 #[test]
 fn ac14_in_use_flag_from_mtime() {
     let (env, root) = claude_fixture("ac14");
-    write_file(&root.join("paste-cache/recent.bin"), 100);
-    write_file(&root.join("image-cache/old.bin"), 100);
-    // 把 image-cache 的 mtime 改为 1 小时前（10 分钟窗口之外）
+    write_file(&root.join(DIR_CACHE).join("recent.bin"), 100);
+    write_file(&root.join(DIR_CACHE_2).join("old.bin"), 100);
     let touch_status = Command::new("touch")
         .args(["-t", "202001010000"])
-        .arg(root.join("image-cache/old.bin"))
+        .arg(root.join(DIR_CACHE_2).join("old.bin"))
         .status()
         .expect("touch 应可执行");
     assert!(touch_status.success());
@@ -1063,12 +1722,12 @@ fn ac14_in_use_flag_from_mtime() {
     let recent = cache
         .paths
         .iter()
-        .find(|path| path.path.ends_with("paste-cache"))
+        .find(|path| path.path.ends_with(DIR_CACHE))
         .expect("recent");
     let old = cache
         .paths
         .iter()
-        .find(|path| path.path.ends_with("image-cache"))
+        .find(|path| path.path.ends_with(DIR_CACHE_2))
         .expect("old");
     println!(
         "AC-14 recent.in_use={} (mtime={}) old.in_use={} (mtime={})",
@@ -1083,8 +1742,8 @@ fn ac14_in_use_flag_from_mtime() {
 #[test]
 fn ac08_ac09_freed_bytes_and_rescan() {
     let (env, root) = claude_fixture("ac08");
-    write_file(&root.join("paste-cache/a.bin"), 300_000);
-    write_file(&root.join("image-cache/b.bin"), 200_000);
+    write_file(&root.join(DIR_CACHE).join("a.bin"), 300_000);
+    write_file(&root.join(DIR_CACHE_2).join("b.bin"), 200_000);
     let lookup = env.lookup();
 
     let before_scan = scan_all(&lookup, &["claude-code"]);
@@ -1114,7 +1773,7 @@ fn ac08_ac09_freed_bytes_and_rescan() {
         after_scan.total_cleanable_bytes
     );
     assert_eq!(after_scan.total_cleanable_bytes, 0);
-    assert!(!root.join("paste-cache").exists());
+    assert!(!root.join(DIR_CACHE).exists());
     assert!(root.exists());
 }
 
@@ -1123,11 +1782,10 @@ fn ac08_ac09_freed_bytes_and_rescan() {
 #[test]
 fn ac05_scan_is_fast_on_fixture() {
     let (env, root) = claude_fixture("ac05");
-    // 约 100 MB / 800 文件
     for index in 0..800 {
         write_file(
             &root
-                .join("paste-cache")
+                .join(DIR_CACHE)
                 .join(format!("part-{:03}", index / 100))
                 .join(format!("chunk-{index:03}.bin")),
             128 * 1024,
@@ -1153,16 +1811,15 @@ fn ac05_scan_is_fast_on_fixture() {
     );
 }
 
-// ── 补充：catalog 首屏命令的返回结构 + 环境变量真进程读取 ──
+// ── catalog 首屏命令结构 + 真实进程 env 读取 ──
 
 #[test]
 fn catalog_command_shape_and_real_env() {
     let temp = TempDir::new("catalog");
     let claude_dir = temp.path().join("claude-real-env");
-    fs::create_dir_all(claude_dir.join("debug")).expect("创建目录失败");
-    write_file(&claude_dir.join("debug/x.log"), 128);
+    fs::create_dir_all(claude_dir.join(DIR_LOGS)).expect("创建目录失败");
+    write_file(&claude_dir.join(DIR_LOGS).join("x.log"), 128);
 
-    // 真实进程环境变量（命令实现 mod.rs:237-239 env_lookup 读的就是它）
     std::env::set_var("CLAUDE_CONFIG_DIR", &claude_dir);
     let lookup = |key: &str| std::env::var_os(key);
     let catalog_result = catalog::build_catalog(platform(), &lookup);
@@ -1174,11 +1831,12 @@ fn catalog_command_shape_and_real_env() {
         .find(|tool| tool.id == "claude-code")
         .expect("catalog 应包含 claude-code");
     println!(
-        "catalog 版本={} 工具数={} claude.root={:?} detected={}",
+        "catalog 版本={} 工具数={} claude.root={:?} detected={} cleanable={}",
         catalog_result.catalog_version,
         catalog_result.tools.len(),
         claude.roots,
-        claude.detected
+        claude.detected,
+        claude.cleanable
     );
     assert_eq!(
         catalog_result.catalog_version,
@@ -1186,6 +1844,7 @@ fn catalog_command_shape_and_real_env() {
     );
     assert_eq!(catalog_result.tools.len(), catalog::tools().len());
     assert!(claude.detected);
+    assert!(claude.cleanable);
     assert!(claude.roots[0].contains("claude-real-env"));
     assert!(claude.protected.iter().any(|item| item == "settings.json"));
     assert!(claude

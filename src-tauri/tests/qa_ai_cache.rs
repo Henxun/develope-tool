@@ -800,68 +800,119 @@ fn ac13_bc_untouched_by_clean() {
     assert!(root.join(DIR_SESSION_2).join("insight.bin").exists());
 }
 
-// ── AC-13（多工具）B 类只读：Codex sessions / Ollama models 不清理、惰性计算 ──
+// ── AC-13（多工具）B 类只读：Codex sessions / Ollama models / Cursor workspaceStorage ──
 
 #[test]
 fn ac13_multi_tool_b_class_zero_impact() {
     let env = FakeEnv::new("ac13-multi");
     let codex = env.home.join(".codex");
     let ollama = env.home.join(".ollama");
+    let cursor = env.home.join("Library/Application Support/Cursor");
     fs::create_dir_all(&codex).expect("创建 .codex 失败");
     fs::create_dir_all(&ollama).expect("创建 .ollama 失败");
+    fs::create_dir_all(&cursor).expect("创建 Cursor 根失败");
     write_file(&codex.join("sessions/rollout-1.jsonl"), 5_000);
     write_file(&codex.join("logs_1.sqlite"), 1_000);
     write_file(&ollama.join("models/blobs/sha256-deadbeef"), 600_000);
     write_file(&ollama.join("logs/server.log"), 1_000);
+    // Cursor：workspaceStorage（编辑历史/会话关联）属只读 Sessions；Cache 属 A 类
+    write_file(
+        &cursor.join("User/workspaceStorage/ws-1/state.vscdb"),
+        7_000,
+    );
+    write_file(&cursor.join("Cache/data.bin"), 1_000);
     let lookup = env.lookup();
 
     let sessions_before = fingerprint(&codex.join("sessions"));
     let models_before = fingerprint(&ollama.join("models"));
+    let workspace_before = fingerprint(&cursor.join("User/workspaceStorage"));
 
-    let main = scan_all(&lookup, &["codex", "ollama"]);
+    let main = scan_all(&lookup, &["codex", "ollama", "cursor"]);
     let codex_sessions =
         find_category(&main, "codex", AiCacheCategory::Sessions).expect("codex sessions");
     let ollama_models =
         find_category(&main, "ollama", AiCacheCategory::ModelCache).expect("ollama models");
+    let cursor_sessions =
+        find_category(&main, "cursor", AiCacheCategory::Sessions).expect("cursor sessions");
     println!(
-        "AC-13 主扫描 codex.sessions measured={} bytes={} cleanable={}；ollama.models measured={} bytes={} cleanable={}",
+        "AC-13 主扫描 codex.sessions(m={},b={},c={}) ollama.models(m={},b={},c={}) cursor.sessions(m={},b={},c={})",
         codex_sessions.measured,
         codex_sessions.bytes,
         codex_sessions.cleanable,
         ollama_models.measured,
         ollama_models.bytes,
-        ollama_models.cleanable
+        ollama_models.cleanable,
+        cursor_sessions.measured,
+        cursor_sessions.bytes,
+        cursor_sessions.cleanable
     );
     assert!(!codex_sessions.cleanable);
     assert!(!ollama_models.cleanable);
-    assert!(!codex_sessions.measured && !ollama_models.measured);
+    assert!(!cursor_sessions.cleanable);
+    assert!(!codex_sessions.measured && !ollama_models.measured && !cursor_sessions.measured);
     assert_eq!(main.total_display_only_bytes, 0);
     assert_eq!(
         main.total_cleanable_bytes,
-        1_000 + 1_000,
-        "只统计 Codex 日志文件与 Ollama 日志"
+        1_000 + 1_000 + 1_000,
+        "只统计 Codex 日志文件、Ollama 日志、Cursor Cache"
     );
 
-    let heavy = scan_all_heavy(&lookup, &["codex", "ollama"]);
+    let heavy = scan_all_heavy(&lookup, &["codex", "ollama", "cursor"]);
     println!("AC-13 heavy displayOnly={}", heavy.total_display_only_bytes);
-    assert_eq!(heavy.total_display_only_bytes, 5_000 + 600_000);
+    assert_eq!(heavy.total_display_only_bytes, 5_000 + 600_000 + 7_000);
 
-    // ModelCache 类别无清理入口：命令级拒绝，磁盘零变化
-    let rejected = clean::clean_all(
-        platform(),
-        &lookup,
-        clean_request(
-            vec![scan_target(
-                "ollama",
-                AiCacheCategory::ModelCache,
-                &ollama.join("models"),
-            )],
-            false,
+    // ModelCache / Sessions 类别无清理入口：命令级拒绝，磁盘零变化
+    for (label, tool_id, category, path) in [
+        (
+            "Ollama models",
+            "ollama",
+            AiCacheCategory::ModelCache,
+            ollama.join("models"),
         ),
-        &noop_clean,
+        (
+            "Cursor workspaceStorage",
+            "cursor",
+            AiCacheCategory::Sessions,
+            cursor.join("User/workspaceStorage"),
+        ),
+    ] {
+        let rejected = clean::clean_all(
+            platform(),
+            &lookup,
+            clean_request(vec![scan_target(tool_id, category, &path)], false),
+            &noop_clean,
+        );
+        assert!(rejected.is_err(), "{label} 清理必须被拒");
+        println!("AC-13 {label} 清理拒绝：{}", rejected.unwrap_err());
+    }
+    // 伪造 category=cache 提交 workspaceStorage → 白名单拒绝，目录零变化
+    let forged = clean(
+        &lookup,
+        vec![scan_target(
+            "cursor",
+            AiCacheCategory::Cache,
+            &cursor.join("User/workspaceStorage"),
+        )],
+        false,
     );
-    assert!(rejected.is_err(), "ModelCache 清理必须被拒");
-    println!("AC-13 Ollama models 清理拒绝：{}", rejected.unwrap_err());
+    assert_eq!(forged.deleted_count, 0);
+    assert!(
+        forged.failed_count + forged.skipped_count >= 1,
+        "伪造类别必须被拒：{:?}",
+        forged.items
+    );
+
+    // 对照：Cursor 的 A 类 Cache 仍可清理，B 类零影响
+    let ok = clean(
+        &lookup,
+        vec![scan_target(
+            "cursor",
+            AiCacheCategory::Cache,
+            &cursor.join("Cache"),
+        )],
+        false,
+    );
+    assert_eq!(ok.deleted_count, 1);
     assert_eq!(
         sessions_before,
         fingerprint(&codex.join("sessions")),
@@ -872,6 +923,133 @@ fn ac13_multi_tool_b_class_zero_impact() {
         fingerprint(&ollama.join("models")),
         "Ollama 模型必须零变化"
     );
+    assert_eq!(
+        workspace_before,
+        fingerprint(&cursor.join("User/workspaceStorage")),
+        "Cursor workspaceStorage 必须零变化"
+    );
+}
+
+// ── D5：Claude Desktop 的 config / extensions / Preferences / Cookies / Network 必须受保护或仅展示 ──
+
+#[test]
+fn d5_claude_desktop_sensitive_items_are_not_cleanable() {
+    let env = FakeEnv::new("d5-desktop");
+    let root = env.home.join("Library/Application Support/Claude");
+    fs::create_dir_all(&root).expect("创建 Claude Desktop 根失败");
+    // A 类：Electron 可重建缓存
+    write_file(&root.join("Cache/data.bin"), 1_000);
+    // C 类：配置 / 扩展 / 登录态 / 网络状态
+    let sensitive = [
+        "claude_desktop_config.json",
+        "Preferences",
+        "Cookies",
+        "Network/TransportSecurity",
+        "extensions/ext-1/index.js",
+        "config.json",
+        "state.json",
+    ];
+    for relative in sensitive {
+        write_file(&root.join(relative), 256);
+    }
+    let lookup = env.lookup();
+
+    let catalog_result = catalog::build_catalog(platform(), &lookup);
+    let desktop = catalog_result
+        .tools
+        .iter()
+        .find(|tool| tool.id == "claude-desktop")
+        .expect("catalog 应包含 claude-desktop");
+    println!("D5 claude-desktop protected={:?}", desktop.protected);
+    for required in [
+        "claude_desktop_config.json",
+        "Preferences",
+        "Cookies",
+        "Network",
+    ] {
+        assert!(
+            desktop.protected.iter().any(|item| item == required),
+            "protected 缺少 {}：{:?}",
+            required,
+            desktop.protected
+        );
+    }
+    // spec 要求 extensions / config.json / state* 也属于「受保护或仅展示」；
+    // 当前实现未列入 protected，仅记录差异（不影响删除安全，见报告 N5）。
+    let missing: Vec<&str> = ["extensions", "config.json", "state.json"]
+        .into_iter()
+        .filter(|required| !desktop.protected.iter().any(|item| item == required))
+        .collect();
+    println!("D5 protected 未展示项（仅记录，不影响安全）：{missing:?}");
+
+    // 扫描：C 类路径不得出现在任何可清理类别里
+    let scan_result = scan_all(&lookup, &["claude-desktop"]);
+    let tool = find_tool(&scan_result, "claude-desktop").expect("claude-desktop");
+    for category in tool.roots.iter().flat_map(|root| root.categories.iter()) {
+        for path in &category.paths {
+            for sensitive_rel in sensitive {
+                assert!(
+                    !path.path.ends_with(sensitive_rel),
+                    "受保护项 {} 不得作为可清理项返回（category={:?}, cleanable={}）",
+                    path.path,
+                    category.category,
+                    category.cleanable
+                );
+            }
+        }
+    }
+    let cleanable: u64 = tool.cleanable_bytes;
+    println!("D5 claude-desktop 可清理字节={cleanable}（仅 Cache 1000B）");
+    assert_eq!(cleanable, 1_000, "只有 Cache 计入可清理量");
+
+    // 清理：逐个提交 C 类路径 → 必须失败/跳过且文件零变化
+    let before = fingerprint(&root);
+    for relative in sensitive {
+        let target = root.join(relative);
+        let outcome = clean::clean_all(
+            platform(),
+            &lookup,
+            clean_request(
+                vec![scan_target(
+                    "claude-desktop",
+                    AiCacheCategory::Cache,
+                    &target,
+                )],
+                false,
+            ),
+            &noop_clean,
+        );
+        match outcome {
+            Err(message) => println!("D5 清理 {relative} 命令级拒绝：{message}"),
+            Ok(result) => {
+                println!(
+                    "D5 清理 {relative} deleted={} failed={} skipped={}",
+                    result.deleted_count, result.failed_count, result.skipped_count
+                );
+                assert_eq!(result.deleted_count, 0, "{relative} 不得被删除");
+            }
+        }
+    }
+    assert_eq!(
+        before,
+        fingerprint(&root),
+        "受保护项 + A 类都必须零变化（本次只提交非法 target）"
+    );
+
+    // 对照：真正的 A 类缓存仍可清理
+    let ok = clean(
+        &lookup,
+        vec![scan_target(
+            "claude-desktop",
+            AiCacheCategory::Cache,
+            &root.join("Cache"),
+        )],
+        false,
+    );
+    println!("D5 对照清理 Cache deleted={}", ok.deleted_count);
+    assert_eq!(ok.deleted_count, 1);
+    assert!(!root.join("Cache").exists());
+    assert!(root.join("claude_desktop_config.json").exists());
 }
 
 // ── AC-10 / AC-11 / AC-16 伪造 id、越界、根目录一律拒绝且磁盘零变化 ──

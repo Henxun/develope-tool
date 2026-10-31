@@ -322,8 +322,16 @@ pub fn expand_targets(root: &Path, category: &CategorySpec) -> Vec<ResolvedTarge
             let Ok(entries) = fs::read_dir(&directory) else {
                 continue;
             };
+            // 文件名型通配只接受**普通文件**：同名目录不能因为名字匹配就被当成
+            // 文件项（否则 clean 会走 remove_dir_all 递归删掉整个目录，B1）。
             let mut matches: Vec<PathBuf> = entries
                 .filter_map(Result::ok)
+                .filter(|entry| {
+                    entry
+                        .file_type()
+                        .map(|file_type| file_type.is_file())
+                        .unwrap_or(false)
+                })
                 .filter(|entry| matcher.is_match(Path::new(&entry.file_name())))
                 .map(|entry| entry.path())
                 .collect();
@@ -338,6 +346,70 @@ pub fn expand_targets(root: &Path, category: &CategorySpec) -> Vec<ResolvedTarge
         }
     }
     targets
+}
+
+// ── 工具清理策略（Chief 裁决 1：override 指向敏感位置时降级为仅检测） ──
+
+/// 单个工具的清理策略。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolPolicy {
+    /// false = 该工具只做检测/展示，任何清理请求都必须被拒绝。
+    pub cleanable: bool,
+    /// 降级原因（展示在 catalog 与扫描结果的 warnings 里）。
+    pub warnings: Vec<String>,
+}
+
+/// 根目录是否落在不允许清理的敏感位置：用户主目录本身、主目录的祖先、文件系统根。
+///
+/// 用户可以把 `CLAUDE_CONFIG_DIR` / `CODEX_HOME` 等 override 指到任意目录；
+/// 一旦指到 `$HOME`，白名单里的 `backups` / `plans` / `logs` 就会变成家目录下的同名目录，
+/// 删除它们是不可接受的，因此该工具整体降级为仅检测。
+fn unsafe_root_reason(root: &Path, home: Option<&Path>) -> Option<String> {
+    let canonical_root = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    if let Some(home) = home {
+        let canonical_home = fs::canonicalize(home).unwrap_or_else(|_| home.to_path_buf());
+        if path_eq(&canonical_root, &canonical_home) {
+            return Some(format!(
+                "根目录指向用户主目录，已降级为仅检测（不提供清理）：{}",
+                root.display()
+            ));
+        }
+        if is_within(&canonical_home, &canonical_root) {
+            return Some(format!(
+                "根目录是用户主目录的上级，已降级为仅检测（不提供清理）：{}",
+                root.display()
+            ));
+        }
+    }
+    if canonical_root.parent().is_none() {
+        return Some(format!(
+            "根目录是文件系统根，已降级为仅检测（不提供清理）：{}",
+            root.display()
+        ));
+    }
+    None
+}
+
+/// 根据已解析的根目录计算工具策略（可单测，不读真实环境变量）。
+pub fn tool_policy_for_roots(roots: &[ResolvedRoot], home: Option<&Path>) -> ToolPolicy {
+    let warnings: Vec<String> = roots
+        .iter()
+        .filter_map(|root| unsafe_root_reason(&root.path, home))
+        .collect();
+    ToolPolicy {
+        cleanable: warnings.is_empty(),
+        warnings,
+    }
+}
+
+/// 解析根目录并计算清理策略（生产命令与测试共用）。
+pub fn tool_policy(
+    spec: &ToolSpec,
+    platform: Platform,
+    lookup: &dyn Fn(&str) -> Option<OsString>,
+) -> ToolPolicy {
+    let roots = resolve_roots_with(spec, platform, lookup);
+    tool_policy_for_roots(&roots, resolve_home(platform, lookup).as_deref())
 }
 
 /// 判断候选路径是否精确命中某个白名单模板。
@@ -423,6 +495,7 @@ pub fn build_catalog(
         .map(|spec| {
             let roots = resolve_roots_with(spec, platform, lookup);
             let detected = roots.iter().any(|root| root.exists);
+            let policy = tool_policy_for_roots(&roots, resolve_home(platform, lookup).as_deref());
             AiToolCatalogDto {
                 id: spec.id.to_string(),
                 name: spec.name.to_string(),
@@ -433,6 +506,8 @@ pub fn build_catalog(
                     .collect(),
                 detected,
                 protected: spec.protected.iter().map(|item| item.to_string()).collect(),
+                cleanable: policy.cleanable,
+                warnings: policy.warnings,
             }
         })
         .collect();

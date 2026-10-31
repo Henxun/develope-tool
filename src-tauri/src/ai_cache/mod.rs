@@ -80,6 +80,9 @@ pub struct AiCacheCategoryDto {
     pub risk: AiRisk,
     /// false = 仅展示，不提供任何删除入口。
     pub cleanable: bool,
+    /// 体积是否已计算。惰性类别（sessions / model_cache）在主扫描中为 false，
+    /// 前端点「计算占用」后带 `includeHeavy` 再扫一次才变 true（Chief 裁决 2）。
+    pub measured: bool,
     pub default_selected: bool,
     pub description: String,
     pub paths: Vec<AiCachePathDto>,
@@ -102,10 +105,12 @@ pub struct AiToolScanDto {
     pub name: String,
     pub vendor: String,
     pub detected: bool,
+    /// false = 根目录落到了敏感位置（override 指到 home 等），仅检测、不可清理。
+    pub cleanable: bool,
     pub roots: Vec<AiCacheRootDto>,
     /// 仅统计可清理类别（cache / logs）。
     pub cleanable_bytes: u64,
-    /// 仅统计展示类别（sessions / model_cache）。
+    /// 仅统计已计算的展示类别（sessions / model_cache）。
     pub display_only_bytes: u64,
     pub warnings: Vec<String>,
 }
@@ -135,6 +140,10 @@ pub struct AiToolCatalogDto {
     pub roots: Vec<String>,
     pub detected: bool,
     pub protected: Vec<String>,
+    /// false = 该工具已降级为仅检测（根目录指向 home / home 上级 / 文件系统根）。
+    pub cleanable: bool,
+    /// 降级原因等提示。
+    pub warnings: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -153,6 +162,10 @@ pub struct AiCacheScanRequest {
     /// 空 = 扫描全部工具。
     #[serde(default)]
     pub tool_ids: Vec<String>,
+    /// false（默认）= 主扫描只算可清理类别，sessions / model_cache 不递归统计；
+    /// true = 前端点「计算占用」时的二次请求，把展示类别也统计出来（Chief 裁决 2）。
+    #[serde(default)]
+    pub include_heavy: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -229,6 +242,10 @@ pub struct AiCacheCleanProgressEvent {
     pub tool_id: String,
     pub path: String,
     pub deleted_count: u64,
+    pub skipped_count: u64,
+    pub failed_count: u64,
+    /// 已处理项 = deleted + skipped + failed，前端进度条按它推进。
+    pub processed_count: u64,
     pub freed_bytes: u64,
 }
 
@@ -248,6 +265,7 @@ pub fn get_ai_cache_catalog() -> Result<AiCacheCatalog, String> {
 /// 只读：自动检测 + 扫描可清理/仅展示类别体积。
 ///
 /// `spawn_blocking` 保证大目录扫描不阻塞 WebView 事件循环；进度事件按 plan §6.8 节流。
+/// 主扫描只统计可清理类别；`includeHeavy=true` 时才递归统计 sessions / model_cache。
 #[tauri::command]
 pub async fn scan_ai_cache_usage(
     window: tauri::Window,
@@ -258,7 +276,13 @@ pub async fn scan_ai_cache_usage(
         let emit = |event: AiCacheScanProgressEvent| {
             let _ = window.emit("ai-cache-scan-progress", event);
         };
-        scan::scan_all(platform, &env_lookup, &request.tool_ids, &emit)
+        scan::scan_all_with_heavy(
+            platform,
+            &env_lookup,
+            &request.tool_ids,
+            request.include_heavy,
+            &emit,
+        )
     })
     .await
     .map_err(|error| format!("SCAN_FAILED: 扫描任务执行失败：{error}"))?

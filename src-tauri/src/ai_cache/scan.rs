@@ -144,13 +144,15 @@ fn measure_with(path: &Path, on_entry: &mut dyn FnMut(&Path)) -> MeasureOutcome 
     outcome
 }
 
-fn empty_category(category: super::AiCacheCategory) -> AiCacheCategoryDto {
+fn empty_category(category: super::AiCacheCategory, tool_cleanable: bool) -> AiCacheCategoryDto {
     let meta = catalog::category_meta(category);
     AiCacheCategoryDto {
         category,
         label: meta.label.to_string(),
         risk: meta.risk,
-        cleanable: category.is_cleanable(),
+        cleanable: category.is_cleanable() && tool_cleanable,
+        // 根目录不存在 = 没有可计算的内容；保持 true，避免前端显示"未计算"。
+        measured: true,
         default_selected: meta.default_selected,
         description: meta.description.to_string(),
         paths: Vec::new(),
@@ -158,13 +160,23 @@ fn empty_category(category: super::AiCacheCategory) -> AiCacheCategoryDto {
     }
 }
 
-fn scan_root(root: &ResolvedRoot, spec: &ToolSpec, progress: &ScanProgress<'_>) -> AiCacheRootDto {
+/// 降级工具的类别说明：替代默认的"可安全删除"文案，避免误导。
+const DISABLED_DESCRIPTION: &str =
+    "该工具根目录指向敏感位置，已降级为仅检测，不提供清理（详见工具提示）。";
+
+fn scan_root(
+    root: &ResolvedRoot,
+    spec: &ToolSpec,
+    progress: &ScanProgress<'_>,
+    tool_cleanable: bool,
+    include_heavy: bool,
+) -> AiCacheRootDto {
     let mut categories = Vec::new();
     let mut warnings: Vec<String> = Vec::new();
 
     if !root.exists {
         for category_spec in spec.categories {
-            categories.push(empty_category(category_spec.category));
+            categories.push(empty_category(category_spec.category, tool_cleanable));
         }
         return AiCacheRootDto {
             path: root.path.display().to_string(),
@@ -177,6 +189,15 @@ fn scan_root(root: &ResolvedRoot, spec: &ToolSpec, progress: &ScanProgress<'_>) 
     let now = epoch_millis();
     for category_spec in spec.categories {
         let meta = catalog::category_meta(category_spec.category);
+        let category_cleanable = category_spec.category.is_cleanable() && tool_cleanable;
+        // 惰性计算（Chief 裁决 2）：主扫描不递归统计 sessions / model_cache，
+        // 只列出路径；带 includeHeavy 的二次请求才算体积。
+        let measured = include_heavy || category_cleanable;
+        let description = if tool_cleanable {
+            meta.description.to_string()
+        } else {
+            DISABLED_DESCRIPTION.to_string()
+        };
         let mut paths: Vec<AiCachePathDto> = Vec::new();
         let mut category_bytes: u64 = 0;
 
@@ -188,6 +209,22 @@ fn scan_root(root: &ResolvedRoot, spec: &ToolSpec, progress: &ScanProgress<'_>) 
             };
             if metadata.file_type().is_symlink() {
                 warnings.push(format!("已跳过符号链接：{}", target.path.display()));
+                continue;
+            }
+
+            if !measured {
+                progress.maybe_emit(&target.path, false);
+                paths.push(AiCachePathDto {
+                    path: target.path.display().to_string(),
+                    bytes: 0,
+                    kind: if metadata.is_dir() {
+                        AiPathKind::Dir
+                    } else {
+                        AiPathKind::File
+                    },
+                    last_modified_ms: 0,
+                    in_use: false,
+                });
                 continue;
             }
 
@@ -224,9 +261,10 @@ fn scan_root(root: &ResolvedRoot, spec: &ToolSpec, progress: &ScanProgress<'_>) 
             category: category_spec.category,
             label: meta.label.to_string(),
             risk: meta.risk,
-            cleanable: category_spec.category.is_cleanable(),
+            cleanable: category_cleanable,
+            measured,
             default_selected: meta.default_selected,
-            description: meta.description.to_string(),
+            description,
             paths,
             bytes: category_bytes,
         });
@@ -245,20 +283,28 @@ fn scan_tool(
     platform: Platform,
     lookup: Lookup<'_>,
     progress: &ScanProgress<'_>,
+    include_heavy: bool,
 ) -> AiToolScanDto {
     let roots = catalog::resolve_roots_with(spec, platform, lookup);
+    // 降级判定（Chief 裁决 1）：任何根目录指向 home / home 上级 / 文件系统根时，
+    // 整个工具只检测不清理。
+    let policy =
+        catalog::tool_policy_for_roots(&roots, catalog::resolve_home(platform, lookup).as_deref());
     let root_dtos: Vec<AiCacheRootDto> = roots
         .iter()
-        .map(|root| scan_root(root, spec, progress))
+        .map(|root| scan_root(root, spec, progress, policy.cleanable, include_heavy))
         .collect();
 
     let detected = root_dtos.iter().any(|root| root.exists);
     let mut cleanable_bytes: u64 = 0;
     let mut display_only_bytes: u64 = 0;
-    let mut warnings: Vec<String> = Vec::new();
+    let mut warnings: Vec<String> = policy.warnings.clone();
     for root in &root_dtos {
         warnings.extend(root.warnings.iter().cloned());
         for category in &root.categories {
+            if !category.measured {
+                continue;
+            }
             if category.cleanable {
                 cleanable_bytes = cleanable_bytes.saturating_add(category.bytes);
             } else {
@@ -272,6 +318,7 @@ fn scan_tool(
         name: spec.name.to_string(),
         vendor: spec.vendor.to_string(),
         detected,
+        cleanable: policy.cleanable,
         roots: root_dtos,
         cleanable_bytes,
         display_only_bytes,
@@ -279,11 +326,25 @@ fn scan_tool(
     }
 }
 
-/// 扫描入口。`tool_ids` 为空表示全部工具；未知 id 返回命令级错误（不静默忽略）。
+/// 扫描入口（保持旧签名：等价于 `include_heavy = false` 的惰性主扫描）。
 pub fn scan_all(
     platform: Platform,
     lookup: Lookup<'_>,
     tool_ids: &[String],
+    sink: ProgressSink<'_>,
+) -> Result<AiCacheScanResult, String> {
+    scan_all_with_heavy(platform, lookup, tool_ids, false, sink)
+}
+
+/// 扫描入口。`tool_ids` 为空表示全部工具；未知 id 返回命令级错误（不静默忽略）。
+///
+/// `include_heavy=false`：只统计可清理类别，展示类别只列路径（AC-05 的 5s 预算）；
+/// `include_heavy=true`：连 sessions / model_cache 一起递归统计（前端「计算占用」）。
+pub fn scan_all_with_heavy(
+    platform: Platform,
+    lookup: Lookup<'_>,
+    tool_ids: &[String],
+    include_heavy: bool,
     sink: ProgressSink<'_>,
 ) -> Result<AiCacheScanResult, String> {
     let all = catalog::tools();
@@ -315,7 +376,7 @@ pub fn scan_all(
                 last_emit_ms: AtomicU64::new(0),
                 sink,
             };
-            scan_tool(spec, platform, lookup, &progress)
+            scan_tool(spec, platform, lookup, &progress, include_heavy)
         })
         .collect();
 

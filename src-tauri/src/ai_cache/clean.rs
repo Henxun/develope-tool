@@ -28,6 +28,8 @@ pub struct ValidatedTarget {
     pub display_path: String,
     pub lexical_path: PathBuf,
     pub canonical_path: PathBuf,
+    /// 白名单模板末段含 `*`：只允许删除普通文件，目录一律拒绝（B1）。
+    pub expects_file: bool,
 }
 
 #[derive(Debug)]
@@ -104,19 +106,43 @@ pub fn validate_target(
         ));
     };
 
+    // 降级护栏（Chief 裁决 1）：根目录指向 home / home 上级 / 文件系统根时，
+    // 该工具只检测不清理；即使路径命中白名单也必须拒绝。
     let roots = catalog::resolve_roots_with(spec, platform, lookup);
-    let matched = roots.iter().any(|root| {
-        category_spec
-            .paths
-            .iter()
-            .any(|template| catalog::template_matches(&root.path, template, &lexical_path))
-    });
-    if !matched {
+    let policy =
+        catalog::tool_policy_for_roots(&roots, catalog::resolve_home(platform, lookup).as_deref());
+    if !policy.cleanable {
+        return Err(Rejection::failed(
+            "TOOL_DISABLED",
+            policy
+                .warnings
+                .first()
+                .cloned()
+                .unwrap_or_else(|| "该工具已降级为仅检测，不提供清理".to_string()),
+        ));
+    }
+
+    let mut matched_template: Option<&'static str> = None;
+    for root in &roots {
+        for &template in category_spec.paths {
+            if catalog::template_matches(&root.path, template, &lexical_path) {
+                matched_template = Some(template);
+                break;
+            }
+        }
+        if matched_template.is_some() {
+            break;
+        }
+    }
+    let Some(matched_template) = matched_template else {
         return Err(Rejection::failed(
             "PATH_NOT_ALLOWED",
             "路径不在白名单目录内",
         ));
-    }
+    };
+    // 文件名型通配（如 codex 的 `logs_*.sqlite`）只允许删除普通文件：
+    // 同名目录绝不能因为文件名匹配就被当成文件递归删除（B1）。
+    let expects_file = matched_template.contains('*');
 
     // 先判断链接（不 follow），再 canonicalize —— 顺序不能反。
     let metadata = match fs::symlink_metadata(&lexical_path) {
@@ -135,6 +161,12 @@ pub fn validate_target(
         return Err(Rejection::skipped(
             "PATH_IS_SYMLINK",
             "已跳过符号链接，不删除链接目标",
+        ));
+    }
+    if expects_file && !metadata.is_file() {
+        return Err(Rejection::failed(
+            "PATH_NOT_ALLOWED",
+            "通配白名单项只允许删除普通文件，目标不是文件",
         ));
     }
 
@@ -204,6 +236,7 @@ pub fn validate_target(
         display_path: trimmed.to_string(),
         lexical_path,
         canonical_path,
+        expects_file,
     })
 }
 
@@ -242,8 +275,12 @@ fn cleanup_item(
     }
 }
 
-/// 命令级校验：请求自洽（非空、≤64 项、工具存在、类别可清理）。
-fn validate_request(request: &AiCacheCleanRequest) -> Result<(), String> {
+/// 命令级校验：请求自洽（非空、≤64 项、工具存在、类别可清理、工具未被降级）。
+fn validate_request(
+    request: &AiCacheCleanRequest,
+    platform: Platform,
+    lookup: &dyn Fn(&str) -> Option<OsString>,
+) -> Result<(), String> {
     if request.targets.is_empty() {
         return Err("INVALID_ARGUMENT: 清理目标不能为空".to_string());
     }
@@ -269,8 +306,42 @@ fn validate_request(request: &AiCacheCleanRequest) -> Result<(), String> {
                 catalog::category_meta(target.category).label
             ));
         }
+        // 降级工具在命令级就整批拒绝，保证"一个字节都不删"。
+        let policy = catalog::tool_policy(spec, platform, lookup);
+        if !policy.cleanable {
+            return Err(format!(
+                "TOOL_DISABLED: 工具 {} {}",
+                spec.name,
+                policy
+                    .warnings
+                    .first()
+                    .cloned()
+                    .unwrap_or_else(|| "已降级为仅检测，不提供清理".to_string())
+            ));
+        }
     }
     Ok(())
+}
+
+fn progress_event(
+    tool_id: &str,
+    path: &str,
+    deleted_count: u64,
+    skipped_count: u64,
+    failed_count: u64,
+    freed_bytes: u64,
+) -> AiCacheCleanProgressEvent {
+    AiCacheCleanProgressEvent {
+        tool_id: tool_id.to_string(),
+        path: path.to_string(),
+        deleted_count,
+        skipped_count,
+        failed_count,
+        processed_count: deleted_count
+            .saturating_add(skipped_count)
+            .saturating_add(failed_count),
+        freed_bytes,
+    }
 }
 
 /// 清理入口。dry-run 与真实删除共用同一套校验；单条失败不打断整体。
@@ -280,7 +351,7 @@ pub fn clean_all(
     request: AiCacheCleanRequest,
     sink: &dyn Fn(AiCacheCleanProgressEvent),
 ) -> Result<AiCacheCleanResult, String> {
-    validate_request(&request)?;
+    validate_request(&request, platform, lookup)?;
 
     let dry_run = request.dry_run;
     let mut rejected: Vec<AiCleanItem> = Vec::new();
@@ -308,12 +379,18 @@ pub fn clean_all(
 
     let mut warnings: Vec<String> = Vec::new();
     for item in &rejected {
-        if item.status == AiCleanStatus::Skipped {
-            warnings.push(format!(
+        match item.status {
+            AiCleanStatus::Skipped => warnings.push(format!(
                 "已跳过 {}：{}",
                 item.path,
                 item.error.as_deref().unwrap_or("目标不可用")
-            ));
+            )),
+            AiCleanStatus::Failed => warnings.push(format!(
+                "校验未通过 {}：{}",
+                item.path,
+                item.error.as_deref().unwrap_or("目标不可用")
+            )),
+            _ => {}
         }
     }
 
@@ -321,6 +398,28 @@ pub fn clean_all(
     let mut accepted: Vec<AiCleanItem> = Vec::new();
     let mut freed_bytes: u64 = 0;
     let mut deleted_count: u64 = 0;
+    let mut progress_skipped: u64 = 0;
+    let mut progress_failed: u64 = 0;
+
+    // 真实清理时，校验阶段即判定跳过/失败的目标也计入进度：
+    // 前端进度分母是"整批目标数"，否则进度条永远到不了 100%。
+    if !dry_run {
+        for item in &rejected {
+            match item.status {
+                AiCleanStatus::Skipped => progress_skipped = progress_skipped.saturating_add(1),
+                AiCleanStatus::Failed => progress_failed = progress_failed.saturating_add(1),
+                _ => continue,
+            }
+            sink(progress_event(
+                &item.tool_id,
+                &item.path,
+                deleted_count,
+                progress_skipped,
+                progress_failed,
+                freed_bytes,
+            ));
+        }
+    }
 
     for target in kept {
         let outcome = scan::measure_bytes(&target.lexical_path);
@@ -342,6 +441,7 @@ pub fn clean_all(
         let metadata = match fs::symlink_metadata(&target.lexical_path) {
             Ok(metadata) => metadata,
             Err(error) if error.kind() == ErrorKind::NotFound => {
+                progress_skipped = progress_skipped.saturating_add(1);
                 accepted.push(cleanup_item(
                     &target.tool_id,
                     target.category,
@@ -350,9 +450,18 @@ pub fn clean_all(
                     AiCleanStatus::Skipped,
                     Some("PATH_NOT_FOUND: 目标已不存在".to_string()),
                 ));
+                sink(progress_event(
+                    &target.tool_id,
+                    &target.display_path,
+                    deleted_count,
+                    progress_skipped,
+                    progress_failed,
+                    freed_bytes,
+                ));
                 continue;
             }
             Err(error) => {
+                progress_failed = progress_failed.saturating_add(1);
                 accepted.push(cleanup_item(
                     &target.tool_id,
                     target.category,
@@ -361,10 +470,19 @@ pub fn clean_all(
                     AiCleanStatus::Failed,
                     Some(format!("PATH_NOT_READABLE: 无法读取目标：{error}")),
                 ));
+                sink(progress_event(
+                    &target.tool_id,
+                    &target.display_path,
+                    deleted_count,
+                    progress_skipped,
+                    progress_failed,
+                    freed_bytes,
+                ));
                 continue;
             }
         };
         if metadata.file_type().is_symlink() {
+            progress_skipped = progress_skipped.saturating_add(1);
             accepted.push(cleanup_item(
                 &target.tool_id,
                 target.category,
@@ -373,12 +491,42 @@ pub fn clean_all(
                 AiCleanStatus::Skipped,
                 Some("PATH_IS_SYMLINK: 已跳过符号链接，不删除链接目标".to_string()),
             ));
+            sink(progress_event(
+                &target.tool_id,
+                &target.display_path,
+                deleted_count,
+                progress_skipped,
+                progress_failed,
+                freed_bytes,
+            ));
+            continue;
+        }
+        // 通配白名单只允许文件：检查后被换成目录 → 跳过（B1 的 TOCTOU 兜底）。
+        if target.expects_file && !metadata.is_file() {
+            progress_skipped = progress_skipped.saturating_add(1);
+            accepted.push(cleanup_item(
+                &target.tool_id,
+                target.category,
+                &target.display_path,
+                0,
+                AiCleanStatus::Skipped,
+                Some("PATH_CHANGED: 通配白名单项目标已不是普通文件，已跳过".to_string()),
+            ));
+            sink(progress_event(
+                &target.tool_id,
+                &target.display_path,
+                deleted_count,
+                progress_skipped,
+                progress_failed,
+                freed_bytes,
+            ));
             continue;
         }
         // 路径在扫描/预览后被替换成指向白名单外的链接 → 跳过。
         match fs::canonicalize(&target.lexical_path) {
             Ok(canonical) if catalog::path_eq(&canonical, &target.canonical_path) => {}
             _ => {
+                progress_skipped = progress_skipped.saturating_add(1);
                 accepted.push(cleanup_item(
                     &target.tool_id,
                     target.category,
@@ -386,6 +534,14 @@ pub fn clean_all(
                     0,
                     AiCleanStatus::Skipped,
                     Some("PATH_CHANGED: 目标在清理前发生变化，已跳过".to_string()),
+                ));
+                sink(progress_event(
+                    &target.tool_id,
+                    &target.display_path,
+                    deleted_count,
+                    progress_skipped,
+                    progress_failed,
+                    freed_bytes,
                 ));
                 continue;
             }
@@ -409,14 +565,17 @@ pub fn clean_all(
                     AiCleanStatus::Deleted,
                     None,
                 ));
-                sink(AiCacheCleanProgressEvent {
-                    tool_id: target.tool_id.clone(),
-                    path: target.display_path.clone(),
+                sink(progress_event(
+                    &target.tool_id,
+                    &target.display_path,
                     deleted_count,
+                    progress_skipped,
+                    progress_failed,
                     freed_bytes,
-                });
+                ));
             }
             Err(error) => {
+                progress_failed = progress_failed.saturating_add(1);
                 accepted.push(cleanup_item(
                     &target.tool_id,
                     target.category,
@@ -425,7 +584,32 @@ pub fn clean_all(
                     AiCleanStatus::Failed,
                     Some(format!("DELETE_FAILED: 删除失败：{error}")),
                 ));
+                sink(progress_event(
+                    &target.tool_id,
+                    &target.display_path,
+                    deleted_count,
+                    progress_skipped,
+                    progress_failed,
+                    freed_bytes,
+                ));
             }
+        }
+    }
+
+    // 删除阶段的跳过/失败同样要进 warnings（不再只报校验阶段的问题）。
+    for item in &accepted {
+        match item.status {
+            AiCleanStatus::Skipped => warnings.push(format!(
+                "已跳过 {}：{}",
+                item.path,
+                item.error.as_deref().unwrap_or("目标不可用")
+            )),
+            AiCleanStatus::Failed => warnings.push(format!(
+                "清理失败 {}：{}",
+                item.path,
+                item.error.as_deref().unwrap_or("未知原因")
+            )),
+            _ => {}
         }
     }
 

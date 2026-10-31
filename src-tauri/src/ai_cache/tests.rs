@@ -279,6 +279,197 @@ fn env_override_wins_for_claude_root() {
     let roots = catalog::resolve_roots_with(spec, catalog::current_platform(), &lookup);
     assert_eq!(roots.len(), 1);
     assert!(catalog::path_eq(&roots[0].path, &override_dir));
+    // 主目录内的普通 override 不受降级护栏影响。
+    let policy = catalog::tool_policy(spec, catalog::current_platform(), &lookup);
+    assert!(policy.cleanable, "主目录内的 override 应保持可清理");
+    assert!(policy.warnings.is_empty());
+}
+
+// ── 11.1b 降级护栏（Chief 裁决 1：override → home / home 上级 / 文件系统根） ──
+
+#[test]
+fn catalog_override_to_home_degrades_tool() {
+    let mut env = FakeEnv::new("policy-home");
+    env.set_var("CLAUDE_CONFIG_DIR", env.home.clone());
+    let lookup = env.lookup();
+    let platform = catalog::current_platform();
+
+    let built = catalog::build_catalog(platform, &lookup);
+    let claude = built
+        .tools
+        .iter()
+        .find(|tool| tool.id == "claude-code")
+        .expect("catalog 应包含 claude-code");
+    assert!(
+        !claude.cleanable,
+        "override 指向 home 时必须 cleanable=false"
+    );
+    assert!(
+        claude
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("降级")),
+        "catalog 必须带降级 warning：{:?}",
+        claude.warnings
+    );
+    println!(
+        "OVERRIDE_HOME_EVIDENCE tool=claude-code cleanable={} roots={:?} warnings={:?}",
+        claude.cleanable, claude.roots, claude.warnings
+    );
+
+    // 其它工具（未受影响）仍可清理。
+    let codex = built
+        .tools
+        .iter()
+        .find(|tool| tool.id == "codex")
+        .expect("catalog 应包含 codex");
+    assert!(codex.cleanable, "无关工具不应被降级");
+}
+
+#[test]
+fn catalog_override_to_home_ancestor_degrades_tool() {
+    let mut env = FakeEnv::new("policy-ancestor");
+    let ancestor = env
+        .home
+        .parent()
+        .expect("临时 HOME 应有上级目录")
+        .to_path_buf();
+    env.set_var("CLAUDE_CONFIG_DIR", ancestor);
+    let lookup = env.lookup();
+    let built = catalog::build_catalog(catalog::current_platform(), &lookup);
+    let claude = built
+        .tools
+        .iter()
+        .find(|tool| tool.id == "claude-code")
+        .expect("catalog 应包含 claude-code");
+    assert!(!claude.cleanable, "override 指向 home 上级时必须降级");
+    assert!(claude
+        .warnings
+        .iter()
+        .any(|warning| warning.contains("上级")));
+}
+
+#[test]
+fn policy_rejects_home_ancestor_and_allows_inside_home() {
+    let temp = TempDir::new("policy-pure");
+    let home = temp.path().join("home");
+    fs::create_dir_all(&home).expect("创建临时 HOME 失败");
+
+    let ancestor = catalog::tool_policy_for_roots(
+        &[catalog::ResolvedRoot {
+            path: temp.path().to_path_buf(),
+            exists: true,
+        }],
+        Some(&home),
+    );
+    assert!(!ancestor.cleanable);
+    assert!(ancestor
+        .warnings
+        .iter()
+        .any(|warning| warning.contains("上级")));
+
+    let inside = catalog::tool_policy_for_roots(
+        &[catalog::ResolvedRoot {
+            path: home.join(".claude"),
+            exists: false,
+        }],
+        Some(&home),
+    );
+    assert!(inside.cleanable, "home 内的根目录应允许清理");
+}
+
+#[cfg(unix)]
+#[test]
+fn policy_rejects_filesystem_root() {
+    let policy = catalog::tool_policy_for_roots(
+        &[catalog::ResolvedRoot {
+            path: PathBuf::from("/"),
+            exists: true,
+        }],
+        None,
+    );
+    assert!(!policy.cleanable, "文件系统根必须降级");
+    assert!(policy.warnings.iter().any(|warning| warning.contains("根")));
+}
+
+#[test]
+fn scan_downgraded_tool_has_no_cleanable_paths() {
+    let mut env = FakeEnv::new("scan-downgraded");
+    env.set_var("CLAUDE_CONFIG_DIR", env.home.clone());
+    fs::create_dir_all(env.home.join("backups")).expect("创建 home/backups 失败");
+    write_file(&env.home.join("backups").join("old.zip"), 200);
+    let lookup = env.lookup();
+    let platform = catalog::current_platform();
+
+    let lazy = scan::scan_all_with_heavy(
+        platform,
+        &lookup,
+        &["claude-code".to_string()],
+        false,
+        &noop_scan,
+    )
+    .expect("扫描应成功");
+    let tool = &lazy.tools[0];
+    assert!(!tool.cleanable, "降级工具 cleanable 必须为 false");
+    assert_eq!(tool.cleanable_bytes, 0);
+    assert_eq!(lazy.total_cleanable_bytes, 0);
+    for root in &tool.roots {
+        for category in &root.categories {
+            assert!(
+                !category.cleanable,
+                "降级工具的任何类别都不得可清理：{:?}",
+                category.category
+            );
+        }
+    }
+    assert!(
+        tool.warnings.iter().any(|warning| warning.contains("降级")),
+        "扫描结果必须带降级提示：{:?}",
+        tool.warnings
+    );
+
+    let heavy = scan::scan_all_with_heavy(
+        platform,
+        &lookup,
+        &["claude-code".to_string()],
+        true,
+        &noop_scan,
+    )
+    .expect("扫描应成功");
+    let tool = &heavy.tools[0];
+    assert_eq!(tool.cleanable_bytes, 0);
+    assert_eq!(heavy.total_cleanable_bytes, 0);
+    assert!(
+        tool.display_only_bytes >= 200,
+        "降级工具的体积只能进展示类别"
+    );
+}
+
+#[test]
+fn clean_rejects_downgraded_tool_and_keeps_files() {
+    let mut env = FakeEnv::new("clean-disabled");
+    env.set_var("CLAUDE_CONFIG_DIR", env.home.clone());
+    let backups = env.home.join("backups");
+    fs::create_dir_all(&backups).expect("创建 home/backups 失败");
+    write_file(&backups.join("old.zip"), 200);
+    let lookup = env.lookup();
+
+    let error = clean::clean_all(
+        catalog::current_platform(),
+        &lookup,
+        clean_request(
+            vec![scan_target("claude-code", AiCacheCategory::Cache, &backups)],
+            false,
+        ),
+        &noop_clean,
+    )
+    .expect_err("降级工具必须整批拒绝");
+    assert!(
+        error.contains("TOOL_DISABLED"),
+        "错误码应为 TOOL_DISABLED：{error}"
+    );
+    assert!(backups.exists(), "降级工具的文件不得被删除");
+    assert!(backups.join("old.zip").exists());
 }
 
 // ── 11.2 路径校验（拒绝用例） ──
@@ -488,6 +679,50 @@ fn scan_expands_root_level_file_glob() {
 }
 
 #[test]
+fn scan_lazy_heavy_categories_not_measured() {
+    let (env, root) = claude_fixture("scan-lazy-heavy");
+    write_file(&root.join("paste-cache").join("a.bin"), 100);
+    write_file(&root.join("projects").join("session.jsonl"), 500);
+    let lookup = env.lookup();
+    let platform = catalog::current_platform();
+
+    // 主扫描：可清理类别照常统计，sessions / model_cache 只列路径不算体积。
+    let lazy = scan::scan_all_with_heavy(
+        platform,
+        &lookup,
+        &["claude-code".to_string()],
+        false,
+        &noop_scan,
+    )
+    .expect("主扫描应成功");
+    let cache = find_category(&lazy, "claude-code", AiCacheCategory::Cache);
+    assert!(cache.measured);
+    assert_eq!(cache.bytes, 100);
+    assert_eq!(lazy.total_cleanable_bytes, 100);
+    assert_eq!(lazy.total_display_only_bytes, 0, "主扫描不得统计 B 类体积");
+    let sessions = find_category(&lazy, "claude-code", AiCacheCategory::Sessions);
+    assert!(!sessions.measured, "主扫描中 B 类应为未计算");
+    assert_eq!(sessions.bytes, 0);
+    assert_eq!(sessions.paths.len(), 1, "路径仍需列出，供「计算占用」");
+    assert_eq!(sessions.paths[0].bytes, 0);
+
+    // 二次请求：带 includeHeavy 才递归统计 B 类。
+    let heavy = scan::scan_all_with_heavy(
+        platform,
+        &lookup,
+        &["claude-code".to_string()],
+        true,
+        &noop_scan,
+    )
+    .expect("计算占用应成功");
+    let sessions = find_category(&heavy, "claude-code", AiCacheCategory::Sessions);
+    assert!(sessions.measured);
+    assert_eq!(sessions.bytes, 500);
+    assert_eq!(heavy.total_display_only_bytes, 500);
+    assert_eq!(heavy.total_cleanable_bytes, 100);
+}
+
+#[test]
 fn scan_aggregates_multiple_roots() {
     let env = FakeEnv::new("scan-multi-root");
     let lookup = env.lookup();
@@ -523,6 +758,7 @@ fn scan_result_serializes_camel_case() {
         label: "模型文件".to_string(),
         risk: AiRisk::Redownload,
         cleanable: false,
+        measured: true,
         default_selected: false,
         description: String::new(),
         paths: Vec::new(),
@@ -532,6 +768,7 @@ fn scan_result_serializes_camel_case() {
     assert_eq!(value["category"], "model_cache");
     assert_eq!(value["defaultSelected"], false);
     assert_eq!(value["cleanable"], false);
+    assert_eq!(value["measured"], true);
 
     let result = AiCacheScanResult {
         platform: "macos".to_string(),
@@ -826,6 +1063,7 @@ fn dedupe_targets_drops_duplicates_and_descendants() {
         display_path: path.display().to_string(),
         lexical_path: path.clone(),
         canonical_path: fs::canonicalize(&path).expect("canonicalize 失败"),
+        expects_file: false,
     };
 
     let kept = clean::dedupe_targets(vec![

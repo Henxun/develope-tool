@@ -1282,7 +1282,10 @@ fn try_remove_source_dir(source: &Path, warnings: &mut Vec<String>) -> Result<bo
     }
 }
 
+// Windows 语义下用 set_readonly(false) 清除只读属性是正确的；clippy 该 lint 的
+// “文件会变成全局可写”是 Unix 语境，在此不适用。
 #[cfg(windows)]
+#[allow(clippy::permissions_set_readonly_false)]
 fn clear_readonly_attributes(root: &Path) -> Result<(), String> {
     for entry in WalkDir::new(root).into_iter().filter_map(Result::ok) {
         let path = entry.path();

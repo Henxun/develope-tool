@@ -2,7 +2,8 @@
 
 - 状态：已按实现回写（2026-10-31，对齐 Chief 裁决与已合并实现；QA 以本版为准）
 - D4 系统缓存根：按终裁**不进 v1**，设计移入 §16（v1.1 backlog），不进入 v1 验收
-- 代码基线：HEAD `5ed9d30`；§12 每条裁决已对照代码逐条核对（D1/D2/D3/D5–D10 已实现，D4 未实现）
+- 代码基线：`5ed9d30`（本次逐条核对时）；其后 `e991341` 只修 heavy 扫描并发与降级文案，不影响 §12 状态
+- §12 每条裁决已对照代码逐条核对：D1/D2/D3/D5–D10 已实现，D4 未实现（v1.1 backlog）
 - 特性分支：`feat/ai-cache-clean`（基于 `main`）
 - 目标读者：Coder（实现）、Reviewer（设计/安全审查）、Tester（验收）
 - 约束来源：`.specify/memory/constitution.md`、`CLAUDE.md`、`AGENTS.md`

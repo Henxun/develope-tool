@@ -568,12 +568,12 @@ fn validate_rejects_symlink_target() {
     let outside = env.home.join("outside-cache");
     fs::create_dir_all(&outside).expect("创建外部缓存目录失败");
     write_file(&outside.join("data.bin"), 64);
-    symlink(&outside, root.join("paste-cache")).expect("创建符号链接失败");
+    symlink(&outside, root.join("image-cache")).expect("创建符号链接失败");
     let lookup = env.lookup();
     let rejection = clean::validate_target(
         "claude-code",
         AiCacheCategory::Cache,
-        &root.join("paste-cache").display().to_string(),
+        &root.join("image-cache").display().to_string(),
         catalog::current_platform(),
         &lookup,
     )
@@ -619,7 +619,7 @@ fn scan_missing_root_is_not_error() {
 #[test]
 fn scan_sums_only_allowlisted_dirs() {
     let (env, root) = claude_fixture("scan-allowlist");
-    write_file(&root.join("paste-cache").join("a.bin"), 100);
+    write_file(&root.join("image-cache").join("a.bin"), 100);
     write_file(&root.join("settings.json"), 999);
     write_file(&root.join("random").join("x.bin"), 50);
     let lookup = env.lookup();
@@ -645,10 +645,10 @@ fn scan_skips_symlink_children() {
     use std::os::unix::fs::symlink;
 
     let (env, root) = claude_fixture("scan-symlink-children");
-    write_file(&root.join("paste-cache").join("real.bin"), 10);
+    write_file(&root.join("image-cache").join("real.bin"), 10);
     let outside = env.home.join("outside-large.bin");
     write_file(&outside, 5000);
-    symlink(&outside, root.join("paste-cache").join("link.bin")).expect("创建符号链接失败");
+    symlink(&outside, root.join("image-cache").join("link.bin")).expect("创建符号链接失败");
     let lookup = env.lookup();
     let result = scan::scan_all(
         catalog::current_platform(),
@@ -686,7 +686,7 @@ fn scan_expands_root_level_file_glob() {
 #[test]
 fn scan_lazy_heavy_categories_not_measured() {
     let (env, root) = claude_fixture("scan-lazy-heavy");
-    write_file(&root.join("paste-cache").join("a.bin"), 100);
+    write_file(&root.join("image-cache").join("a.bin"), 100);
     write_file(&root.join("projects").join("session.jsonl"), 500);
     let lookup = env.lookup();
     let platform = catalog::current_platform();
@@ -828,9 +828,9 @@ fn scan_result_serializes_camel_case() {
 #[test]
 fn clean_dry_run_touches_nothing() {
     let (env, root) = claude_fixture("clean-dry-run");
-    write_file(&root.join("paste-cache").join("a.bin"), 100);
+    write_file(&root.join("image-cache").join("a.bin"), 100);
     let lookup = env.lookup();
-    let target = root.join("paste-cache");
+    let target = root.join("image-cache");
     let result = clean::clean_all(
         catalog::current_platform(),
         &lookup,
@@ -856,11 +856,11 @@ fn clean_dry_run_touches_nothing() {
 #[test]
 fn clean_permanent_removes_only_selected() {
     let (env, root) = claude_fixture("clean-permanent");
-    write_file(&root.join("paste-cache").join("a.bin"), 100);
+    write_file(&root.join("image-cache").join("a.bin"), 100);
     write_file(&root.join("settings.json"), 999);
     write_file(&root.join("random").join("x.bin"), 50);
     let lookup = env.lookup();
-    let target = root.join("paste-cache");
+    let target = root.join("image-cache");
 
     let result = clean::clean_all(
         catalog::current_platform(),
@@ -887,9 +887,9 @@ fn clean_permanent_removes_only_selected() {
 #[test]
 fn clean_is_idempotent() {
     let (env, root) = claude_fixture("clean-idempotent");
-    write_file(&root.join("paste-cache").join("a.bin"), 100);
+    write_file(&root.join("image-cache").join("a.bin"), 100);
     let lookup = env.lookup();
-    let target = root.join("paste-cache");
+    let target = root.join("image-cache");
 
     let first = clean::clean_all(
         catalog::current_platform(),
@@ -942,6 +942,81 @@ fn clean_rejects_sessions_category() {
     assert!(root.join("projects").exists());
 }
 
+/// D1：`paste-cache`（历史粘贴内容）与 `usage-data`（/insights 历史报告）是用户可见
+/// 痕迹，v1 从 A 类移到仅展示；clean 命令必须返回 CATEGORY_NOT_CLEANABLE 且零删除。
+#[test]
+fn d1_paste_cache_and_usage_data_are_display_only() {
+    let (env, root) = claude_fixture("d1-display-only");
+    // 仍在 A 类的 image-cache 作对照，保证 Cache 类别非空。
+    write_file(&root.join("image-cache").join("keep.bin"), 50);
+    write_file(&root.join("paste-cache").join("pasted.txt"), 120);
+    write_file(&root.join("usage-data").join("report.json"), 80);
+    let lookup = env.lookup();
+    let platform = catalog::current_platform();
+
+    // 扫描：两者只出现在 Sessions（仅展示）类别，不计入可清理体积。
+    let result = scan::scan_all(platform, &lookup, &["claude-code".to_string()], &noop_scan)
+        .expect("扫描应成功");
+    let cache = find_category(&result, "claude-code", AiCacheCategory::Cache);
+    assert_eq!(cache.bytes, 50, "A 类只应统计 image-cache");
+    assert!(
+        cache.paths.iter().all(|path| {
+            !path.path.ends_with("paste-cache") && !path.path.ends_with("usage-data")
+        }),
+        "D1 目标不得出现在可清理类别：{:?}",
+        cache.paths
+    );
+    let sessions = find_category(&result, "claude-code", AiCacheCategory::Sessions);
+    assert!(!sessions.cleanable, "Sessions 类别必须不可清理");
+    for name in ["paste-cache", "usage-data"] {
+        assert!(
+            sessions.paths.iter().any(|path| path.path.ends_with(name)),
+            "D1：{name} 应在仅展示类别出现"
+        );
+    }
+    assert_eq!(result.total_cleanable_bytes, 50);
+
+    // clean 命令：归到 Sessions 类别 → CATEGORY_NOT_CLEANABLE，目录零变化。
+    for name in ["paste-cache", "usage-data"] {
+        let dir = root.join(name);
+        let error = clean::clean_all(
+            platform,
+            &lookup,
+            clean_request(
+                vec![scan_target("claude-code", AiCacheCategory::Sessions, &dir)],
+                false,
+            ),
+            &noop_clean,
+        )
+        .expect_err("D1 目标不可清理");
+        assert!(
+            error.contains("CATEGORY_NOT_CLEANABLE"),
+            "{name} 的错误码应为 CATEGORY_NOT_CLEANABLE：{error}"
+        );
+    }
+    // 前端伪造 category=cache 也不能删：路径已不在 A 类白名单。
+    let forged = clean::clean_all(
+        platform,
+        &lookup,
+        clean_request(
+            vec![scan_target(
+                "claude-code",
+                AiCacheCategory::Cache,
+                &root.join("paste-cache"),
+            )],
+            false,
+        ),
+        &noop_clean,
+    )
+    .expect("请求合法，单条拒绝");
+    assert_eq!(forged.deleted_count, 0);
+    assert_eq!(forged.failed_count, 1);
+
+    assert!(root.join("paste-cache").join("pasted.txt").exists());
+    assert!(root.join("usage-data").join("report.json").exists());
+    assert!(root.join("image-cache").join("keep.bin").exists());
+}
+
 #[test]
 fn clean_rejects_unknown_tool() {
     let (env, root) = claude_fixture("clean-unknown-tool");
@@ -966,10 +1041,10 @@ fn clean_rejects_unknown_tool() {
 #[test]
 fn clean_reports_partial_failure() {
     let (env, root) = claude_fixture("clean-partial");
-    write_file(&root.join("paste-cache").join("a.bin"), 100);
+    write_file(&root.join("image-cache").join("a.bin"), 100);
     let lookup = env.lookup();
-    let existing = root.join("paste-cache");
-    let missing = root.join("image-cache");
+    let existing = root.join("image-cache");
+    let missing = root.join("todos");
     let result = clean::clean_all(
         catalog::current_platform(),
         &lookup,
@@ -1039,9 +1114,9 @@ fn clean_skips_symlinked_target() {
     let outside = env.home.join("outside-cache");
     fs::create_dir_all(&outside).expect("创建外部目录失败");
     write_file(&outside.join("data.bin"), 64);
-    symlink(&outside, root.join("paste-cache")).expect("创建符号链接失败");
+    symlink(&outside, root.join("image-cache")).expect("创建符号链接失败");
     let lookup = env.lookup();
-    let target = root.join("paste-cache");
+    let target = root.join("image-cache");
 
     let result = clean::clean_all(
         catalog::current_platform(),
@@ -1062,9 +1137,9 @@ fn clean_skips_symlinked_target() {
 #[test]
 fn clean_dedupes_duplicate_targets() {
     let (env, root) = claude_fixture("clean-duplicates");
-    write_file(&root.join("paste-cache").join("a.bin"), 100);
+    write_file(&root.join("image-cache").join("a.bin"), 100);
     let lookup = env.lookup();
-    let target = root.join("paste-cache");
+    let target = root.join("image-cache");
     let mut second = scan_target("claude-code", AiCacheCategory::Cache, &target);
     second.path = format!("{}/", second.path);
 
@@ -1142,10 +1217,10 @@ fn clean_rejects_directory_matching_glob_and_keeps_contents() {
 #[test]
 fn clean_progress_counts_skipped_and_failed_as_processed() {
     let (env, root) = claude_fixture("clean-progress");
-    write_file(&root.join("paste-cache").join("a.bin"), 100);
+    write_file(&root.join("image-cache").join("a.bin"), 100);
     let lookup = env.lookup();
-    let existing = root.join("paste-cache");
-    let missing = root.join("image-cache");
+    let existing = root.join("image-cache");
+    let missing = root.join("todos");
     let events = std::sync::Mutex::new(Vec::new());
 
     let result = clean::clean_all(

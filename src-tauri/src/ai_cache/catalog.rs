@@ -103,7 +103,7 @@ pub fn category_meta(category: AiCacheCategory) -> CategoryMeta {
             label: "会话记录",
             risk: AiRisk::History,
             default_selected: false,
-            description: "聊天记录、编辑历史与工作区状态，删除后不可恢复；v1 仅展示，不提供清理。",
+            description: "聊天记录、历史数据与工作区状态，删除后不可恢复；v1 仅展示，不提供清理。",
         },
         AiCacheCategory::ModelCache => CategoryMeta {
             label: "模型文件",
@@ -544,7 +544,6 @@ const TOOLS: &[ToolSpec] = &[
                 paths: &[
                     "cache",
                     "shell-snapshots",
-                    "paste-cache",
                     "image-cache",
                     "todos",
                     "statsig",
@@ -552,7 +551,6 @@ const TOOLS: &[ToolSpec] = &[
                     "plans",
                     "session-env",
                     "backups",
-                    "usage-data",
                 ],
             },
             CategorySpec {
@@ -562,6 +560,10 @@ const TOOLS: &[ToolSpec] = &[
             CategorySpec {
                 category: AiCacheCategory::Sessions,
                 paths: &[
+                    // D1：历史粘贴内容与 /insights 历史报告是用户可见痕迹（永久删除
+                    // 不可恢复），v1 不清理、只展示（cleanable=false）。
+                    "paste-cache",
+                    "usage-data",
                     "projects",
                     "file-history",
                     "tasks",

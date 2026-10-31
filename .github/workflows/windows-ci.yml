@@ -1,0 +1,69 @@
+name: Windows Validation
+
+# 目的：在真 Windows 上验证 Rust 侧质量门（fmt / clippy / test）。
+#
+# 为什么需要它：项目里大量代码用 #[cfg(windows)] 门控（注册表、shell、junction 检测等），
+# 这些代码在 macOS / Linux 上根本不参与编译，等于从未被验证。
+#
+# 与 build.yml 的关系：build.yml 负责 tag 触发的跨平台发布打包，本工作流只做验证，
+# 两者互不干扰；本工作流不监听 tag，也不会产出安装包。
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-validation-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  RUST_BACKTRACE: "1"
+
+jobs:
+  verify:
+    name: Windows verify (fmt · clippy · test)
+    runs-on: windows-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install Rust stable (clippy + rustfmt)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Cache cargo registry and target
+        uses: swatinem/rust-cache@v2
+        with:
+          # 项目在 src-tauri/ 下，target 也在那里
+          workspaces: src-tauri -> target
+          # 额外把锁文件纳入 key，依赖变动即失效缓存
+          key: ${{ hashFiles('src-tauri/Cargo.lock') }}
+          cache-on-failure: true
+
+      - name: cargo fmt --check
+        run: cargo fmt --manifest-path src-tauri/Cargo.toml --check
+
+      - name: cargo clippy (all targets, warnings as errors)
+        run: cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
+
+      - name: cargo test
+        run: cargo test --manifest-path src-tauri/Cargo.toml
+
+      # 两个 junction 用例标了 #[ignore]（需要真实 Windows 才能 mklink /J）。
+      # junction 的创建不需要管理员权限，所以 GitHub 的 windows-latest 可以直接跑；
+      # 单独一步执行，避免被普通测试的 --skip 掉，也让失败信号更清晰。
+      - name: cargo test (Windows junction cases, #[ignore])
+        run: cargo test --manifest-path src-tauri/Cargo.toml --lib -- --ignored

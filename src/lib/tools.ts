@@ -65,6 +65,12 @@ export const TOOL_ITEMS: ToolItem[] = [
     shortLabel: "磁盘热力图",
     description: "可视化磁盘使用分布，按文件类型着色，支持钻入查看子目录。",
   },
+  {
+    href: "/tools/ai-cache-clean",
+    title: "AI 智能体缓存清理",
+    shortLabel: "缓存清理",
+    description: "扫描 Claude Code、Codex CLI、Cursor 等 AI 工具缓存，按工具分组查看并清理。",
+  },
 ];
 
 const RECENT_TOOLS_KEY = "devtoolkit.recent-tools";

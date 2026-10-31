@@ -13,10 +13,13 @@ use std::{
 };
 use tar::{Archive as TarArchive, Builder as TarBuilder};
 use tauri::Emitter;
+#[cfg(windows)]
 use uuid::Uuid;
 use walkdir::WalkDir;
 use xz2::{read::XzDecoder, write::XzEncoder};
 use zip::{write::FileOptions, CompressionMethod, ZipArchive, ZipWriter};
+
+pub mod ai_cache;
 
 #[cfg(windows)]
 use windows_sys::Win32::{
@@ -59,6 +62,7 @@ struct ArchiveResult {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(not(windows), allow(dead_code))]
 struct ProgramMigrationRequest {
     app_name: String,
     source_dir: String,
@@ -86,6 +90,7 @@ struct ProgramMigrationResult {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(not(windows), allow(dead_code))]
 struct ProgramDetectRequest {
     app_name: String,
     source_dir: String,
@@ -106,6 +111,7 @@ struct ProgramDetectResult {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(not(windows), allow(dead_code))]
 struct ToolDataMigrationRequest {
     tool_name: String,
     source_dir: String,
@@ -126,6 +132,7 @@ struct ToolDataMigrationResult {
 
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(not(windows), allow(dead_code))]
 struct ToolMigrationLogEvent {
     level: String,
     message: String,
@@ -266,7 +273,7 @@ fn list_directory(path: Option<String>) -> Result<Vec<FileEntry>, String> {
         })
         .collect();
 
-    entries.sort_by(|left, right| left.name.to_lowercase().cmp(&right.name.to_lowercase()));
+    entries.sort_by_key(|entry| entry.name.to_lowercase());
     Ok(entries)
 }
 
@@ -361,7 +368,7 @@ fn migrate_installed_program(
     #[cfg(not(windows))]
     {
         let _ = request;
-        return Err("程序迁移工具仅支持 Windows 平台".to_string());
+        Err("程序迁移工具仅支持 Windows 平台".to_string())
     }
 
     #[cfg(windows)]
@@ -401,7 +408,7 @@ fn detect_program_references(request: ProgramDetectRequest) -> Result<ProgramDet
     #[cfg(not(windows))]
     {
         let _ = request;
-        return Err("程序检测仅支持 Windows 平台".to_string());
+        Err("程序检测仅支持 Windows 平台".to_string())
     }
 
     #[cfg(windows)]
@@ -415,7 +422,7 @@ fn check_directory_locked(dir_path: String) -> Result<Vec<String>, String> {
     #[cfg(not(windows))]
     {
         let _ = dir_path;
-        return Err("目录占用检测仅支持 Windows 平台".to_string());
+        Err("目录占用检测仅支持 Windows 平台".to_string())
     }
 
     #[cfg(windows)]
@@ -469,7 +476,7 @@ fn migrate_tool_data(
     {
         let _ = window;
         let _ = request;
-        return Err("工具数据迁移仅支持 Windows 平台".to_string());
+        Err("工具数据迁移仅支持 Windows 平台".to_string())
     }
 
     #[cfg(windows)]
@@ -766,7 +773,7 @@ fn scan_directory_recursive(
     let self_path = path.display().to_string();
     let self_modified = modified_secs_of(path);
 
-    let can_recurse = max_depth.map_or(true, |max| depth < max);
+    let can_recurse = max_depth.is_none_or(|max| depth < max);
 
     if !can_recurse {
         return Ok(DiskNode {
@@ -844,7 +851,7 @@ fn scan_directory_recursive(
             });
 
             let count = items_scanned.fetch_add(1, Ordering::Relaxed) + 1;
-            if count % 500 == 0 {
+            if count.is_multiple_of(500) {
                 emit_disk_scan_progress(window, &entry.path().display().to_string(), count);
             }
         }
@@ -855,7 +862,7 @@ fn scan_directory_recursive(
         .into_par_iter()
         .filter_map(|child_path| {
             let count = items_scanned.fetch_add(1, Ordering::Relaxed) + 1;
-            if count % 500 == 0 {
+            if count.is_multiple_of(500) {
                 emit_disk_scan_progress(window, &child_path.display().to_string(), count);
             }
             scan_directory_recursive(
@@ -874,8 +881,8 @@ fn scan_directory_recursive(
         + file_children.iter().map(|c| c.size).sum::<u64>();
 
     // Sort children by size descending (largest first)
-    dir_children.sort_by(|a, b| b.size.cmp(&a.size));
-    file_children.sort_by(|a, b| b.size.cmp(&a.size));
+    dir_children.sort_by_key(|node| std::cmp::Reverse(node.size));
+    file_children.sort_by_key(|node| std::cmp::Reverse(node.size));
 
     let mut children = dir_children;
     children.extend(file_children);
@@ -1275,7 +1282,10 @@ fn try_remove_source_dir(source: &Path, warnings: &mut Vec<String>) -> Result<bo
     }
 }
 
+// Windows 语义下用 set_readonly(false) 清除只读属性是正确的；clippy 该 lint 的
+// “文件会变成全局可写”是 Unix 语境，在此不适用。
 #[cfg(windows)]
+#[allow(clippy::permissions_set_readonly_false)]
 fn clear_readonly_attributes(root: &Path) -> Result<(), String> {
     for entry in WalkDir::new(root).into_iter().filter_map(Result::ok) {
         let path = entry.path();
@@ -2290,7 +2300,10 @@ pub fn run() {
             check_directory_locked,
             open_path,
             reveal_in_file_manager,
-            delete_path
+            delete_path,
+            ai_cache::get_ai_cache_catalog,
+            ai_cache::scan_ai_cache_usage,
+            ai_cache::clean_ai_caches
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

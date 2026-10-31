@@ -26,7 +26,7 @@
 
 | 裁决 | 结论 | 证据 |
 |---|---|---|
-| **D1**：`paste-cache` / `usage-data` 只展示不清理 | ✅ 通过 | 两者归入 `Sessions`（`cleanable=false`）；用 `Cache` 类别伪造提交 → `PATH_NOT_ALLOWED`；用 `Sessions` 类别 → 命令级 `CATEGORY_NOT_CLEANABLE`；清理后文件与 SHA-256 零变化（`d1_*`、`ac06_*`、`ac13_*`） |
+| **D1**：`paste-cache` / `usage-data` 只展示不清理 | ✅ 通过 | 两者归入 `Sessions`（`cleanable=false`）；用 `Cache` 类别伪造提交 → `PATH_NOT_ALLOWED`；用 `Sessions` 类别 → 命令级 `CATEGORY_NOT_CLEANABLE`；清理后文件与内容指纹（FNV-1a）零变化（`d1_*`、`ac06_*`、`ac13_*`） |
 | **D4**：系统缓存根不进 v1 | ✅ 符合基线（不计验收） | `catalog.rs` 中无 `claude-cli-nodejs` 等系统缓存根（grep 0 命中），与 v1.3「不进 v1」一致；原 AC-23 已移 backlog |
 | **D5**：9 工具矩阵保留；Claude Desktop 敏感项受保护/仅展示 | ✅ 通过（1 处展示清单小缺口） | 9 工具均在 catalog；Claude Desktop 的 `claude_desktop_config.json` / `Preferences` / `Cookies` / `Network` / `extensions` / `config.json` / `state*` **逐项实测清理被拒且文件零变化**，扫描中不作为可清理项返回；仅 `protected` 展示清单缺少 `extensions`/`config.json`/`state*`（见 N5，无删除风险） |
 
@@ -71,16 +71,16 @@ npm run build                                       → exit 0（静态导出含
 | AC-01 | 工具入口 | ⚠️ **无法验证** | 原因：本机无法运行 `npm run tauri:dev`（需编译并开窗 Tauri 应用），无法做真机导航/页面走查。可做的静态证据：`src/lib/tools.ts` 已注册且无 `windowsOnly`；`npm run build` 静态导出包含 `/tools/ai-cache-clean`；导航由 `useVisibleTools()` 数据驱动 |
 | AC-02 | 自动检测（9 工具） | ✅ 通过 | 只建 claude/codex 根 → detected 恰好 `["claude-code","codex"]`，其余 7 个 false；前端按可清理体积降序（`page.tsx:84-89`，后端不排序，见 N4） |
 | AC-03 | 环境变量根 | ✅ 通过 | `CLAUDE_CONFIG_DIR=<tmp>/custom-claude`：检测根切换，清理只删其中 `debug/`，默认 `~/.claude` 未被创建 |
-| AC-04 | 体积准确性 vs `du -sk` ≤5% | ✅ 通过 | 合计 2,090,000 B vs 2,097,152 B，偏差 **0.34%**；单项最大 0.54%；B 类 5 MB 不计入 |
+| AC-04 | 体积准确性 vs `du -sk` ≤5% | ✅ 通过 | macOS：合计 2,090,000 B vs 2,097,152 B，偏差 **0.34%**（单项最大 0.54%）；B 类 5 MB 不计入。Windows 无 `du -sk` 等效通用命令 → 改用「扫描字节 == 期望文件字节和」精确断言（见 §5.3） |
 | AC-05 | 扫描性能 ≤5 s | ⚠️ **无法验证** | 原因：本机无真实 AI 工具目录，无法构造 "A 类合计 <5 GB + 冷缓存" 场景；仅 800 文件/100 MB 夹具实测 ≈1 ms（只做元数据遍历）。B 类已惰性（主扫描不遍历 GB 级 sessions/models），风险已下降，但真实性能未验 |
 | AC-06 | 分级展示 + B 类按需计算 | ✅ 通过 | 主扫描 sessions `measured=false`、bytes=0、`cleanable=false`、`totalDisplayOnlyBytes=0`；heavy 扫描 → measured=true、61,000 B；Sessions/ModelCache 清理命令级拒绝；UI「计算占用」按钮 + 合并回卡片（代码核对）；**AC-06b 10 万 B 类文件证据**：`projects/` 下 100×1,000 个 8 B 文件（合计 800,000 B），主扫描 duration=0ms / displayOnly=0 / cleanable=1,000 B，heavy 281ms / displayOnly=800,000 B——主扫描确实不遍历 B 类 |
-| AC-07 | 预览 + 确认 | ✅ 通过 | 缺省 `dryRun=true`；dry-run 前后目录树 SHA-256 完全一致；前端先 dry-run 预览再弹窗（逐条绝对路径 + 合计 + 「清理后无法恢复」+ 默认焦点「取消」） |
+| AC-07 | 预览 + 确认 | ✅ 通过 | 缺省 `dryRun=true`；dry-run 前后目录树内容指纹完全一致；前端先 dry-run 预览再弹窗（逐条绝对路径 + 合计 + 「清理后无法恢复」+ 默认焦点「取消」） |
 | AC-08 | 释放量 | ✅ 通过 | 清理前 500,000 B = freed 500,000 B，误差 0.00% |
 | AC-09 | 清理后重扫 | ✅ 通过 | 重扫 cleanable=0 B；目录类与文件类目标均验证（`logs_1.sqlite` 删除后文件不存在）；UI 800ms 自动重扫（代码核对） |
 | AC-10 | 白名单拒绝 | ✅ 通过 | 11 类非法目标全拒：B 类目录冒充 cache（`PATH_NOT_ALLOWED`）、Sessions 类别（`CATEGORY_NOT_CLEANABLE`）、`../`、`/etc`、工具根、主目录、白名单外目录、凭据文件、空路径、相对路径；未知工具/空请求/65 项命令级拒绝；磁盘零变化 |
 | AC-11 | 路径越界拒绝 | ✅ 通过 | `..` → `PATH_NOT_ALLOWED: 路径不允许包含 ..`；根外路径、被替换链接均拒绝 |
 | AC-12 | 符号链接（目录 + 文件） | ✅ 通过 | 目录型 symlink → `Skipped/PATH_IS_SYMLINK`（链接与目标都保留，内部链接目标 900 KB 不计数）；文件型 symlink（`logs_link.sqlite`）→ `Skipped`，目标保留 |
-| AC-13 | B/C 类零影响 | ✅ 通过 | Claude：11 个 B/C 文件文件数 11=11、SHA-256 11 个全部一致；Codex `sessions`、Ollama `models`、Cursor `User/workspaceStorage` 零变化且不可清理（伪造 cache 类别也被拒）；Cursor A 类 `Cache` 可正常清理 |
+| AC-13 | B/C 类零影响 | ✅ 通过 | Claude：11 个 B/C 文件文件数 11=11、内容指纹（FNV-1a）11 个全部一致；Codex `sessions`、Ollama `models`、Cursor `User/workspaceStorage` 零变化且不可清理（伪造 cache 类别也被拒）；Cursor A 类 `Cache` 可正常清理 |
 | AC-14 | 运行中保护 | ✅ 通过 | 新写文件 `in_use=true`；`touch -t 202001010000` 的 `in_use=false`；前端默认勾选排除 `inUse`，手动可勾选后仍可清理 |
 | AC-15 | 单项失败隔离 | ✅ 通过（macOS 路径） | 只读目录 `0555`：`Failed / DELETE_FAILED: Permission denied`；另一项 `Deleted`；失败项未半删；B 类不受影响；失败进 warnings。Windows「独占打开文件」导致失败的场景本机无 Windows，未验证 |
 | AC-16 | 根目录保护 | ✅ 通过 | 工具根、用户主目录均被拒且零变化。注：实际错误码为 `PATH_NOT_ALLOWED`（白名单先拒），`ROOT_PROTECTED` 分支不可达（N2，保护效果成立） |
@@ -104,8 +104,8 @@ npm run build                                       → exit 0（静态导出含
 | # | 必测项 | 结论 | 证据 |
 |---|---|---|---|
 | 1 | 扫描体积 vs `du -sk` ≤5% | ✅ | 偏差 0.34%（合计），单项 ≤0.54% |
-| 2 | 不传 `dry_run` 时零删除 | ✅ | 缺省 `dryRun=true`；SHA-256 目录树前后一致、deleted=0 |
-| 3 | 只影响 A 类，B/C 零影响 | ✅ | 11 个 Claude B/C 文件 SHA-256 一致；Codex/Ollama/Cursor B 类均不可清理、零变化 |
+| 2 | 不传 `dry_run` 时零删除 | ✅ | 缺省 `dryRun=true`；目录树内容指纹前后一致、deleted=0 |
+| 3 | 只影响 A 类，B/C 零影响 | ✅ | 11 个 Claude B/C 文件内容指纹一致；Codex/Ollama/Cursor B 类均不可清理、零变化 |
 | 4 | 伪造 cacheId / `../` / 根目录 → 拒绝 | ✅ | 11 类非法目标全拒，磁盘零变化；含 D1 两项伪造类别 |
 | 5 | 符号链接不跟随、不删 | ✅ | 目录型 + 文件型 symlink 均 `Skipped`，目标保留 |
 | 6 | 幂等 | ✅ | 第二次 freed=0、无错误、无新删除 |
@@ -151,7 +151,7 @@ npm run build                                       → exit 0（静态导出含
 AC-04 合计 scan=2090000B du=2097152B 偏差=0.34%（阈值 5%）
 AC-06 主扫描 sessions measured=false bytes=0 cleanable=false
 AC-06 heavy 扫描 sessions measured=true bytes=61000 displayOnly=61000
-AC-07 缺省 dryRun 反序列化结果 dryRun=true；dry-run 后 SHA-256 一致
+AC-07 缺省 dryRun 反序列化结果 dryRun=true；dry-run 后内容指纹一致
 AC-08 清理前 scan=500000B freed=500000B 误差=0.00%
 AC-10 拒绝 B 类目录当 cache 类别清理 -> PATH_NOT_ALLOWED: 路径不在白名单目录内
 AC-10 拒绝 sessions 类别 -> CATEGORY_NOT_CLEANABLE: 会话记录 类别在 v1 仅展示，不提供清理
@@ -159,7 +159,7 @@ AC-10 超限错误：INVALID_ARGUMENT: 单次清理最多 64 项
 AC-12 清理结果 deleted=1 skipped=1（symlink 项 PATH_IS_SYMLINK，链接目标 900000B 未计数）
 AC-13 主扫描 codex.sessions/ollama.models/cursor.sessions 均 measured=false cleanable=false
 AC-13 heavy displayOnly=612000（5000+600000+7000）
-AC-13 B/C 类文件数 before=11 after=11 含 SHA-256 的文件数=11
+AC-13 B/C 类文件数 before=11 after=11 含内容指纹的文件数=11
 AC-15 失败原因：DELETE_FAILED: 删除失败：Permission denied (os error 13)
 AC-19 第二次 freed=0 deleted=0 skipped=1 failed=0
 AC-21 $HOME 本身 清理拒绝：TOOL_DISABLED: 工具 Claude Code 根目录指向用户主目录…
@@ -200,7 +200,19 @@ S5 最后事件 processed=2 freed=100（processed = deleted+skipped+failed）
 | `ac02_ac03_detection_and_env_override` | AC-02/03 |
 | `catalog_command_shape_and_real_env` | catalog 契约 + 真实 env |
 
-### 5.3 本机工具链说明（非产品缺陷）
+### 5.3 跨平台测试说明（Windows CI 对齐，2026-10-31 晚）
+
+CI 建好后 Windows 首跑有 5 条集成用例失败，**均为测试用例的 Unix 假设，产品代码未改**；已一次性跨平台化：
+
+- 内容指纹不再调系统 `shasum`，改为纯 Rust **FNV-1a**（不新增依赖、不改 Cargo.lock），同样用于检测「内容是否变化」；
+- AC-04 的 `du -sk` 对比只在 Unix 执行；Windows 无等价通用命令，改用「扫描字节 == 期望文件字节和」精确断言（不弱化）；
+- AC-10 的「系统绝对路径」不再硬编码 `/etc`：Unix 用 `/etc`、Windows 用 `%SystemRoot%`（`C:\Windows`）；
+- AC-21 的「文件系统根」不再硬编码 `/`：Unix `/`、Windows `C:\`（优先 `SystemDrive`）；
+- Cursor / Claude Desktop 夹具根目录改用 `catalog` 同一套解析（macOS `~/Library/Application Support/...`、Windows `%APPDATA%\...`），不再硬编码 macOS 路径；
+- 路径末段判断改为路径组件比较（不再依赖展示字符串里的 `/` 分隔符）；
+- 3 个 Unix 专属用例（symlink 目录、只读目录删除失败、mtime `touch`）仍 `#[cfg(unix)]`，Windows 跳过——Windows junction/独占文件语义本机无法验证，见 §4。
+
+### 5.4 本机工具链说明（非产品缺陷）
 
 `cargo` 直连 crates.io 会卡在索引更新、并发 cargo 因 `.package-cache` 锁互等。本次用隔离 `CARGO_HOME` + rsproxy 稀疏镜像 + 隔离 `CARGO_TARGET_DIR` 完成验证（不改仓库与 `.ops` 全局配置）。建议 Ops 把镜像写入 `.ops/env.sh` 的 `CARGO_HOME/config.toml`。
 

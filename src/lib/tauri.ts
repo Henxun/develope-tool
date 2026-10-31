@@ -60,6 +60,8 @@ export type AiCacheCategoryInfo = {
   risk: AiRisk;
   /** false = 仅展示，不提供任何删除入口（sessions / model_cache）。 */
   cleanable: boolean;
+  /** 体积是否已计算。主扫描不统计 sessions / model_cache，点「计算占用」后才为 true。 */
+  measured: boolean;
   defaultSelected: boolean;
   description: string;
   paths: AiCachePath[];
@@ -78,6 +80,8 @@ export type AiToolScan = {
   name: string;
   vendor: string;
   detected: boolean;
+  /** false = 根目录指向敏感位置，已降级为仅检测、不可清理。 */
+  cleanable: boolean;
   roots: AiCacheRoot[];
   cleanableBytes: number;
   displayOnlyBytes: number;
@@ -102,6 +106,9 @@ export type AiToolCatalog = {
   roots: string[];
   detected: boolean;
   protected: string[];
+  /** false = 该工具已降级为仅检测（根目录指向 home / home 上级 / 文件系统根）。 */
+  cleanable: boolean;
+  warnings: string[];
 };
 
 export type AiCacheCatalog = {
@@ -148,6 +155,10 @@ export type AiCacheCleanProgressEvent = {
   toolId: string;
   path: string;
   deletedCount: number;
+  skippedCount: number;
+  failedCount: number;
+  /** 已处理项 = deleted + skipped + failed，进度条按它推进。 */
+  processedCount: number;
   freedBytes: number;
 };
 
@@ -155,9 +166,12 @@ export async function getAiCacheCatalog(): Promise<AiCacheCatalog> {
   return invokeTauri<AiCacheCatalog>("get_ai_cache_catalog");
 }
 
-export async function scanAiCacheUsage(toolIds: string[] = []): Promise<AiCacheScanResult> {
+export async function scanAiCacheUsage(
+  toolIds: string[] = [],
+  includeHeavy = false,
+): Promise<AiCacheScanResult> {
   return invokeTauri<AiCacheScanResult>("scan_ai_cache_usage", {
-    request: { toolIds },
+    request: { toolIds, includeHeavy },
   });
 }
 

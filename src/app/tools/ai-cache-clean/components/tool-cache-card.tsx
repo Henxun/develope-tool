@@ -11,10 +11,12 @@ type ToolCacheCardProps = {
   selected: Set<string>;
   busy: boolean;
   color: string;
+  heavyLoading: boolean;
   onToggleTool: (paths: string[], selectAll: boolean) => void;
   onToggleCategory: (paths: string[], selectAll: boolean) => void;
   onTogglePath: (path: string) => void;
   onOpenPath: (path: string) => void;
+  onMeasureHeavy: () => void;
 };
 
 /** 工具分组卡：卡头（色点 / 名称 / 体积 / 占比条 / 打开目录 / 折叠）+ 类别行。 */
@@ -24,10 +26,12 @@ export default function ToolCacheCard({
   selected,
   busy,
   color,
+  heavyLoading,
   onToggleTool,
   onToggleCategory,
   onTogglePath,
   onOpenPath,
+  onMeasureHeavy,
 }: ToolCacheCardProps) {
   const [collapsed, setCollapsed] = useState(false);
   const groupCheckboxRef = useRef<HTMLInputElement | null>(null);
@@ -83,6 +87,14 @@ export default function ToolCacheCard({
           <div className="flex flex-wrap items-baseline gap-2">
             <h2 className="text-base font-semibold text-slate-900">{tool.name}</h2>
             <span className="text-[11px] text-slate-400">{tool.vendor}</span>
+            {!tool.cleanable ? (
+              <span
+                className="rounded-md border border-amber-200 bg-amber-50 px-1.5 py-0.5 text-[11px] font-medium text-amber-800"
+                title="根目录指向敏感位置，本工具只检测、不提供清理"
+              >
+                仅检测
+              </span>
+            ) : null}
             {selectedCount > 0 ? (
               <span className="text-[11px] text-slate-500">
                 已选 {selectedCount}/{selectablePaths.length}
@@ -154,6 +166,8 @@ export default function ToolCacheCard({
                   onToggleCategory={onToggleCategory}
                   onTogglePath={onTogglePath}
                   onOpenPath={onOpenPath}
+                  onMeasureHeavy={onMeasureHeavy}
+                  heavyLoading={heavyLoading}
                 />
               ))}
             </>
@@ -164,7 +178,7 @@ export default function ToolCacheCard({
           {readonlyCategories.length > 0 ? (
             <>
               <p className="px-4 pt-3 pb-1 text-[11px] font-medium tracking-[0.15em] text-slate-400 uppercase">
-                会话与模型数据（仅展示，不清理）
+                {tool.cleanable ? "会话与模型数据（仅展示，不清理）" : "仅检测（不清理）"}
               </p>
               {readonlyCategories.map((category) => (
                 <CategorySection
@@ -175,6 +189,8 @@ export default function ToolCacheCard({
                   onToggleCategory={onToggleCategory}
                   onTogglePath={onTogglePath}
                   onOpenPath={onOpenPath}
+                  onMeasureHeavy={onMeasureHeavy}
+                  heavyLoading={heavyLoading}
                 />
               ))}
             </>

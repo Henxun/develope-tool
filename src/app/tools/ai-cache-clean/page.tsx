@@ -93,7 +93,7 @@ function buildToolViews(scan: AiCacheScanResult): ToolView[] {
 function buildDefaultSelection(result: AiCacheScanResult): Set<string> {
   const next = new Set<string>();
   for (const tool of result.tools) {
-    if (!tool.detected) continue;
+    if (!tool.detected || !tool.cleanable) continue;
     for (const root of tool.roots) {
       if (!root.exists) continue;
       for (const category of root.categories) {
@@ -105,6 +105,69 @@ function buildDefaultSelection(result: AiCacheScanResult): Set<string> {
     }
   }
   return next;
+}
+
+/**
+ * 后端单次清理最多 64 项（`clean.rs` 的 `MAX_TARGETS_PER_REQUEST`，规格 R10）。
+ * 前端按 64 分批串行提交，避免整批被拒；预览（dry-run）同样分批。
+ */
+const CLEAN_BATCH_SIZE = 64;
+
+function chunkTargets(
+  targets: AiCacheCleanTarget[],
+  size: number,
+): AiCacheCleanTarget[][] {
+  const batches: AiCacheCleanTarget[][] = [];
+  for (let index = 0; index < targets.length; index += size) {
+    batches.push(targets.slice(index, index + size));
+  }
+  return batches;
+}
+
+function emptyCleanResult(dryRun: boolean): AiCacheCleanResult {
+  return {
+    dryRun,
+    freedBytes: 0,
+    deletedCount: 0,
+    skippedCount: 0,
+    failedCount: 0,
+    items: [],
+    warnings: [],
+  };
+}
+
+type CleanBatchHooks = {
+  /** 每批开始：用于重置单批进度事件。 */
+  onBatchStart?: (batchIndex: number, batchTotal: number) => void;
+  /** 每批结束：done = 已完成的目标数（含跳过/失败）。 */
+  onBatchDone?: (done: number, merged: AiCacheCleanResult) => void;
+};
+
+async function runCleanBatches(
+  targets: AiCacheCleanTarget[],
+  dryRun: boolean,
+  hooks: CleanBatchHooks = {},
+): Promise<AiCacheCleanResult> {
+  const batches = chunkTargets(targets, CLEAN_BATCH_SIZE);
+  let merged = emptyCleanResult(dryRun);
+  let done = 0;
+  for (let index = 0; index < batches.length; index += 1) {
+    const batch = batches[index];
+    hooks.onBatchStart?.(index + 1, batches.length);
+    const result = await cleanAiCaches({ targets: batch, dryRun });
+    merged = {
+      ...merged,
+      freedBytes: merged.freedBytes + result.freedBytes,
+      deletedCount: merged.deletedCount + result.deletedCount,
+      skippedCount: merged.skippedCount + result.skippedCount,
+      failedCount: merged.failedCount + result.failedCount,
+      items: [...merged.items, ...result.items],
+      warnings: [...merged.warnings, ...result.warnings],
+    };
+    done += batch.length;
+    hooks.onBatchDone?.(done, merged);
+  }
+  return merged;
 }
 
 function Stat({
@@ -170,6 +233,8 @@ export default function AiCacheCleanPage() {
   const [scan, setScan] = useState<AiCacheScanResult | null>(null);
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [scanning, setScanning] = useState(false);
+  /** 后端扫描任务是否仍未结束（「停止显示结果」只是不再等待，任务仍在跑）。 */
+  const [scanTaskPending, setScanTaskPending] = useState(false);
   const [progress, setProgress] = useState<AiCacheScanProgressEvent | null>(null);
   const [scanStartedAt, setScanStartedAt] = useState(0);
   const [elapsedMs, setElapsedMs] = useState(0);
@@ -185,12 +250,23 @@ export default function AiCacheCleanPage() {
   const [cleanProgress, setCleanProgress] = useState<AiCacheCleanProgressEvent | null>(null);
   const [cleanResult, setCleanResult] = useState<AiCacheCleanResult | null>(null);
   const [cleanTotal, setCleanTotal] = useState(0);
+  /** 已完成批次的项数（含跳过/失败），与当前批已处理数相加作为进度分子。 */
+  const [cleanDone, setCleanDone] = useState(0);
+  /** 当前清理批次（>64 项时前端分批串行提交）。 */
+  const [cleanBatch, setCleanBatch] = useState<{ index: number; total: number } | null>(null);
   const [cleanDurationMs, setCleanDurationMs] = useState(0);
+  /** 正在「计算占用」的工具 id（展示类别惰性计算，互不阻塞）。 */
+  const [heavyLoading, setHeavyLoading] = useState<Set<string>>(new Set());
 
   const scanTokenRef = useRef(0);
   const refreshTimerRef = useRef(0);
+  const scanTaskPendingRef = useRef(false);
 
   const runScan = useCallback(async (mode: ScanMode) => {
+    // 后端扫描不可中断：旧任务结束前不再发起新扫描，避免并发扫描。
+    if (scanTaskPendingRef.current) return;
+    scanTaskPendingRef.current = true;
+    setScanTaskPending(true);
     const token = ++scanTokenRef.current;
     const isRefresh = mode === "refresh";
     setScanning(true);
@@ -222,6 +298,8 @@ export default function AiCacheCleanPage() {
       setError(extractErrorMessage(scanError, "扫描失败"));
       if (isRefresh) setNotice("");
     } finally {
+      scanTaskPendingRef.current = false;
+      setScanTaskPending(false);
       if (token === scanTokenRef.current) setScanning(false);
     }
   }, []);
@@ -307,6 +385,7 @@ export default function AiCacheCleanPage() {
     if (!scan) return 0;
     let count = 0;
     for (const tool of scan.tools) {
+      if (!tool.cleanable) continue;
       for (const root of tool.roots) {
         for (const category of root.categories) {
           if (category.cleanable) count += category.paths.length;
@@ -320,7 +399,7 @@ export default function AiCacheCleanPage() {
     if (!scan) return [];
     const targets: AiCacheCleanTarget[] = [];
     for (const tool of scan.tools) {
-      if (!tool.detected) continue;
+      if (!tool.detected || !tool.cleanable) continue;
       for (const root of tool.roots) {
         if (!root.exists) continue;
         for (const category of root.categories) {
@@ -340,6 +419,7 @@ export default function AiCacheCleanPage() {
     if (!scan) return 0;
     let total = 0;
     for (const tool of scan.tools) {
+      if (!tool.cleanable) continue;
       for (const root of tool.roots) {
         for (const category of root.categories) {
           if (!category.cleanable) continue;
@@ -376,6 +456,12 @@ export default function AiCacheCleanPage() {
       }
     }
     return paths;
+  }, [catalog]);
+
+  const protectedByTool = useMemo(() => {
+    const map: Record<string, string[]> = {};
+    for (const tool of catalog?.tools ?? []) map[tool.id] = tool.protected;
+    return map;
   }, [catalog]);
 
   const supportedToolNames = useMemo(() => {
@@ -420,6 +506,7 @@ export default function AiCacheCleanPage() {
     if (!scan) return;
     const paths: string[] = [];
     for (const tool of scan.tools) {
+      if (!tool.cleanable) continue;
       for (const root of tool.roots) {
         for (const category of root.categories) {
           if (!category.cleanable) continue;
@@ -438,7 +525,7 @@ export default function AiCacheCleanPage() {
     scanTokenRef.current += 1;
     setScanning(false);
     setProgress(null);
-    setNotice("扫描已取消");
+    setNotice("已停止显示结果；后端扫描仍会在后台完成，稍后可点「重新扫描」刷新。");
   }, []);
 
   const handleOpenPath = useCallback(async (path: string) => {
@@ -449,12 +536,45 @@ export default function AiCacheCleanPage() {
     }
   }, []);
 
+  /** 「计算占用」：只对该工具补扫展示类别（sessions / model_cache），结果合并回原卡。 */
+  const handleMeasureHeavy = useCallback(async (toolId: string) => {
+    const token = scanTokenRef.current;
+    setError("");
+    setHeavyLoading((current) => new Set(current).add(toolId));
+    try {
+      const result = await scanAiCacheUsage([toolId], true);
+      if (token !== scanTokenRef.current) return;
+      const measured = result.tools[0];
+      if (!measured) return;
+      setScan((current) => {
+        if (!current) return current;
+        const tools = current.tools.map((tool) => (tool.id === toolId ? measured : tool));
+        return {
+          ...current,
+          tools,
+          totalCleanableBytes: tools.reduce((sum, tool) => sum + tool.cleanableBytes, 0),
+          totalDisplayOnlyBytes: tools.reduce((sum, tool) => sum + tool.displayOnlyBytes, 0),
+        };
+      });
+    } catch (measureError) {
+      if (token === scanTokenRef.current) {
+        setError(extractErrorMessage(measureError, "计算占用失败"));
+      }
+    } finally {
+      setHeavyLoading((current) => {
+        const next = new Set(current);
+        next.delete(toolId);
+        return next;
+      });
+    }
+  }, []);
+
   const handleRequestClean = useCallback(async () => {
     if (busy || selectedTargets.length === 0) return;
     setError("");
     setPreviewLoading(true);
     try {
-      const result = await cleanAiCaches({ targets: selectedTargets, dryRun: true });
+      const result = await runCleanBatches(selectedTargets, true);
       setPreview(result);
     } catch (previewError) {
       setError(extractErrorMessage(previewError, "生成清理预览失败"));
@@ -475,11 +595,19 @@ export default function AiCacheCleanPage() {
     setCleanResult(null);
     setCleanProgress(null);
     setCleanTotal(targets.length);
+    setCleanDone(0);
+    setCleanBatch(null);
     setError("");
     const startedAt = Date.now();
 
     try {
-      const result = await cleanAiCaches({ targets, dryRun: false });
+      const result = await runCleanBatches(targets, false, {
+        onBatchStart: (batchIndex, batchTotal) => {
+          setCleanProgress(null);
+          setCleanBatch({ index: batchIndex, total: batchTotal });
+        },
+        onBatchDone: (done) => setCleanDone(done),
+      });
       setCleanResult(result);
       setCleanDurationMs(Date.now() - startedAt);
       setSelected(new Set());
@@ -491,13 +619,18 @@ export default function AiCacheCleanPage() {
       setError(extractErrorMessage(cleanError, "清理失败"));
     } finally {
       setCleaning(false);
+      setCleanBatch(null);
     }
   }, [cleaning, selectedTargets, runScan]);
 
+  /**
+   * 进度分子 = 已完成批次项数 + 当前批已处理数。
+   * `processedCount` 含删除/跳过/失败，跳过项不会让进度条停在 100% 之前。
+   */
+  const cleanDoneCount =
+    cleanDone + (cleanProgress?.processedCount ?? cleanProgress?.deletedCount ?? 0);
   const cleanPercent =
-    cleanTotal > 0
-      ? Math.min(100, Math.round(((cleanProgress?.deletedCount ?? 0) / cleanTotal) * 100))
-      : 0;
+    cleanTotal > 0 ? Math.min(100, Math.round((cleanDoneCount / cleanTotal) * 100)) : 0;
 
   const showEmpty = Boolean(scan) && !scanning && toolViews.length === 0;
   const totalCleanableBytes = scan?.totalCleanableBytes ?? 0;
@@ -526,21 +659,29 @@ export default function AiCacheCleanPage() {
               <button
                 type="button"
                 onClick={handleCancelScan}
+                title="只停止界面显示与计时，后端扫描任务仍会跑完"
                 className="h-9 rounded-xl border border-slate-300 bg-white/80 px-3 text-sm font-medium text-slate-700 transition hover:bg-white"
               >
-                取消扫描
+                停止显示结果
               </button>
             ) : (
               <button
                 type="button"
                 onClick={() => void runScan("manual")}
-                disabled={cleaning || previewLoading}
+                disabled={cleaning || previewLoading || scanTaskPending}
+                title={scanTaskPending ? "后台扫描任务仍在进行，完成前无法重新扫描" : undefined}
                 className="h-9 rounded-xl bg-[var(--accent)] px-3 text-sm font-medium text-white transition hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-60"
               >
                 重新扫描
               </button>
             )}
           </div>
+          {scanning ? (
+            <p className="text-[11px] text-slate-400">停止显示只影响界面，后端扫描仍会完成</p>
+          ) : null}
+          {scanTaskPending && !scanning ? (
+            <p className="text-[11px] text-amber-600">后台扫描仍在进行，完成前无法重新扫描。</p>
+          ) : null}
           <p className="text-[11px] text-slate-400">
             {lastScanAt > 0 ? `上次扫描 ${formatClock(lastScanAt)}` : "尚未扫描"}
             {scanDurationMs > 0 ? ` · 用时 ${formatDuration(scanDurationMs)}` : ""}
@@ -660,10 +801,13 @@ export default function AiCacheCleanPage() {
             selected={selected}
             busy={busy}
             color={TOOL_COLORS[tool.id] ?? DEFAULT_TOOL_COLOR}
+            heavyLoading={heavyLoading.has(tool.id)}
+            protectedItems={protectedByTool[tool.id] ?? []}
             onToggleTool={setPathsSelection}
             onToggleCategory={setPathsSelection}
             onTogglePath={handleTogglePath}
             onOpenPath={(path) => void handleOpenPath(path)}
+            onMeasureHeavy={() => void handleMeasureHeavy(tool.id)}
           />
         ))}
 
@@ -674,7 +818,10 @@ export default function AiCacheCleanPage() {
                 <div className="flex flex-wrap items-center gap-2">
                   <span className="inline-block h-4 w-4 animate-spin rounded-full border-2 border-slate-300 border-t-[var(--accent)]" />
                   <p className="text-sm font-medium text-slate-800">
-                    正在清理 {cleanProgress?.deletedCount ?? 0}/{cleanTotal}
+                    正在清理 {cleanDoneCount}/{cleanTotal}
+                    {cleanBatch && cleanBatch.total > 1
+                      ? ` · 第 ${cleanBatch.index}/${cleanBatch.total} 批`
+                      : ""}
                   </p>
                   <span className="min-w-0 truncate font-mono text-[11px] text-slate-500">
                     {cleanProgress?.toolId ? toolNameById[cleanProgress.toolId] ?? cleanProgress.toolId : ""}

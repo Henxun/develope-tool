@@ -26,6 +26,9 @@ type CategorySectionProps = {
   onToggleCategory: (paths: string[], selectAll: boolean) => void;
   onTogglePath: (path: string) => void;
   onOpenPath: (path: string) => void;
+  /** 仅展示类别：点击后按需计算体积（Chief 裁决 2，includeHeavy 二次请求）。 */
+  onMeasureHeavy?: () => void;
+  heavyLoading?: boolean;
 };
 
 /** 单个类别行：类别勾选 + 风险徽标 + 体积 + 展开后的路径明细。 */
@@ -36,6 +39,8 @@ export default function CategorySection({
   onToggleCategory,
   onTogglePath,
   onOpenPath,
+  onMeasureHeavy,
+  heavyLoading = false,
 }: CategorySectionProps) {
   const [expanded, setExpanded] = useState(false);
   const checkboxRef = useRef<HTMLInputElement | null>(null);
@@ -98,9 +103,21 @@ export default function CategorySection({
           <p className="mt-0.5 text-xs leading-5 text-slate-500">{category.description}</p>
         </div>
 
-        <span className="font-mono text-sm font-semibold tabular-nums text-slate-800">
-          {formatBytes(category.bytes)}
-        </span>
+        <div className="flex flex-wrap items-center justify-end gap-2">
+          <span className="font-mono text-sm font-semibold tabular-nums text-slate-800">
+            {category.measured ? formatBytes(category.bytes) : "未计算"}
+          </span>
+          {!category.cleanable && !category.measured && paths.length > 0 && onMeasureHeavy ? (
+            <button
+              type="button"
+              onClick={onMeasureHeavy}
+              disabled={busy || heavyLoading}
+              className="h-7 rounded-lg border border-[var(--accent)]/40 bg-white px-2 text-[11px] font-medium text-[var(--accent)] transition hover:bg-[var(--accent)]/10 disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              {heavyLoading ? "计算中…" : "计算占用"}
+            </button>
+          ) : null}
+        </div>
 
         <button
           type="button"
@@ -142,7 +159,7 @@ export default function CategorySection({
                   </span>
                 ) : null}
                 <span className="font-mono text-xs tabular-nums text-slate-500">
-                  {formatBytes(path.bytes)}
+                  {category.measured ? formatBytes(path.bytes) : "—"}
                 </span>
                 <button
                   type="button"

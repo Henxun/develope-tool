@@ -139,6 +139,36 @@ fn find_category<'a>(
 
 // ── 11.1 catalog / 静态安全断言 ──
 
+/// spec §2.1 的 9 工具矩阵：数量与 id 集合必须字面一致（顺序无关）。
+///
+/// 防止矩阵被悄悄增/减一个工具却没人发现（QA 原先只在测试内部自比）。
+#[test]
+fn catalog_tool_matrix_matches_spec() {
+    let expected: std::collections::HashSet<&str> = [
+        "claude-code",
+        "claude-desktop",
+        "codex",
+        "cursor",
+        "copilot-vscode",
+        "copilot-cli",
+        "windsurf",
+        "gemini-cli",
+        "ollama",
+    ]
+    .into_iter()
+    .collect();
+    let actual: std::collections::HashSet<&str> =
+        catalog::tools().iter().map(|tool| tool.id).collect();
+    assert_eq!(
+        catalog::tools().len(),
+        expected.len(),
+        "工具数量应为 {}（实际 {}）：{actual:?}",
+        expected.len(),
+        catalog::tools().len()
+    );
+    assert_eq!(actual, expected, "工具 id 集合与 spec §2.1 不一致");
+}
+
 #[test]
 fn catalog_tool_ids_unique() {
     let mut ids = std::collections::HashSet::new();

@@ -313,6 +313,11 @@ fn catalog_override_to_home_degrades_tool() {
         claude.warnings
     );
     println!(
+        "catalog claude-code cleanable={} warning={:?}",
+        claude.cleanable,
+        claude.warnings.first()
+    );
+    println!(
         "OVERRIDE_HOME_EVIDENCE tool=claude-code cleanable={} roots={:?} warnings={:?}",
         claude.cleanable, claude.roots, claude.warnings
     );
@@ -723,6 +728,37 @@ fn scan_lazy_heavy_categories_not_measured() {
 }
 
 #[test]
+fn scan_glob_ignores_directory_matches() {
+    let env = FakeEnv::new("scan-glob-dir");
+    let root = env.home.join(".codex");
+    fs::create_dir_all(root.join("logs_trap.sqlite")).expect("创建同名目录失败");
+    write_file(&root.join("logs_trap.sqlite").join("payload.bin"), 64);
+    write_file(&root.join("logs_ok.sqlite"), 10);
+    let lookup = env.lookup();
+    let result = scan::scan_all(
+        catalog::current_platform(),
+        &lookup,
+        &["codex".to_string()],
+        &noop_scan,
+    )
+    .expect("扫描应成功");
+    let logs = find_category(&result, "codex", AiCacheCategory::Logs);
+    assert_eq!(
+        logs.paths.len(),
+        1,
+        "目录不能命中文件型 glob：{:?}",
+        logs.paths
+    );
+    assert!(
+        logs.paths
+            .iter()
+            .all(|path| !path.path.ends_with("logs_trap.sqlite")),
+        "同名目录不得作为文件项返回"
+    );
+    assert_eq!(logs.bytes, 10);
+}
+
+#[test]
 fn scan_aggregates_multiple_roots() {
     let env = FakeEnv::new("scan-multi-root");
     let lookup = env.lookup();
@@ -1075,6 +1111,75 @@ fn dedupe_targets_drops_duplicates_and_descendants() {
     assert_eq!(
         kept[0].canonical_path,
         fs::canonicalize(&parent).expect("canonicalize 失败")
+    );
+}
+
+#[test]
+fn clean_rejects_directory_matching_glob_and_keeps_contents() {
+    let env = FakeEnv::new("clean-glob-dir");
+    let root = env.home.join(".codex");
+    let trap = root.join("logs_trap.sqlite");
+    fs::create_dir_all(&trap).expect("创建同名目录失败");
+    write_file(&trap.join("payload.bin"), 64);
+    let lookup = env.lookup();
+
+    let result = clean::clean_all(
+        catalog::current_platform(),
+        &lookup,
+        clean_request(
+            vec![scan_target("codex", AiCacheCategory::Logs, &trap)],
+            false,
+        ),
+        &noop_clean,
+    )
+    .expect("请求合法，单条应被拒绝");
+    assert_eq!(result.deleted_count, 0);
+    assert_eq!(result.failed_count, 1);
+    assert!(trap.join("payload.bin").exists(), "同名目录内容不得被删除");
+    assert!(trap.exists(), "同名目录本身不得被删除");
+}
+
+#[test]
+fn clean_progress_counts_skipped_and_failed_as_processed() {
+    let (env, root) = claude_fixture("clean-progress");
+    write_file(&root.join("paste-cache").join("a.bin"), 100);
+    let lookup = env.lookup();
+    let existing = root.join("paste-cache");
+    let missing = root.join("image-cache");
+    let events = std::sync::Mutex::new(Vec::new());
+
+    let result = clean::clean_all(
+        catalog::current_platform(),
+        &lookup,
+        clean_request(
+            vec![
+                scan_target("claude-code", AiCacheCategory::Cache, &existing),
+                scan_target("claude-code", AiCacheCategory::Cache, &missing),
+            ],
+            false,
+        ),
+        &|event| {
+            events
+                .lock()
+                .expect("进度锁")
+                .push((event.processed_count, event.skipped_count));
+        },
+    )
+    .expect("部分失败整体应 Ok");
+
+    assert_eq!(result.deleted_count, 1);
+    assert_eq!(result.skipped_count, 1);
+    let events = events.into_inner().expect("进度锁");
+    let last = events.last().expect("应至少有一个进度事件");
+    assert_eq!(last.0, 2, "已处理项应等于 deleted + skipped");
+    assert_eq!(last.1, 1);
+    assert!(
+        result
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("已跳过")),
+        "删除阶段的跳过项要进 warnings：{:?}",
+        result.warnings
     );
 }
 

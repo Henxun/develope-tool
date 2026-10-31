@@ -7,6 +7,7 @@
 //! - 不调用 shell / PowerShell，统一用 Rust 原生 `fs`。
 
 use super::catalog::{self, Platform};
+use super::links;
 use super::scan;
 use super::{
     AiCacheCategory, AiCacheCleanProgressEvent, AiCacheCleanRequest, AiCacheCleanResult,
@@ -157,10 +158,10 @@ pub fn validate_target(
             ));
         }
     };
-    if metadata.file_type().is_symlink() {
+    if links::metadata_is_link_like(&metadata, &lexical_path) {
         return Err(Rejection::skipped(
             "PATH_IS_SYMLINK",
-            "已跳过符号链接，不删除链接目标",
+            "已跳过链接类目标（符号链接/junction），不删除链接目标",
         ));
     }
     if expects_file && !metadata.is_file() {
@@ -481,7 +482,7 @@ pub fn clean_all(
                 continue;
             }
         };
-        if metadata.file_type().is_symlink() {
+        if links::metadata_is_link_like(&metadata, &target.lexical_path) {
             progress_skipped = progress_skipped.saturating_add(1);
             accepted.push(cleanup_item(
                 &target.tool_id,
@@ -489,7 +490,10 @@ pub fn clean_all(
                 &target.display_path,
                 0,
                 AiCleanStatus::Skipped,
-                Some("PATH_IS_SYMLINK: 已跳过符号链接，不删除链接目标".to_string()),
+                Some(
+                    "PATH_IS_SYMLINK: 已跳过链接类目标（符号链接/junction），不删除链接目标"
+                        .to_string(),
+                ),
             ));
             sink(progress_event(
                 &target.tool_id,

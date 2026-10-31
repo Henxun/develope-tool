@@ -13,6 +13,7 @@
 
 pub mod catalog;
 pub mod clean;
+pub mod links;
 pub mod scan;
 #[cfg(test)]
 mod tests;

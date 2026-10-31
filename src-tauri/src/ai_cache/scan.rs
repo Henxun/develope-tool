@@ -1,6 +1,7 @@
 //! 体积扫描：只累加字节数，不保留文件树；不跟随符号链接。
 
 use super::catalog::{self, Platform, ResolvedRoot, ToolSpec};
+use super::links;
 use super::{
     AiCacheCategoryDto, AiCachePathDto, AiCacheRootDto, AiCacheScanProgressEvent,
     AiCacheScanResult, AiPathKind, AiToolScanDto, CATALOG_VERSION,
@@ -98,8 +99,8 @@ fn measure_with(path: &Path, on_entry: &mut dyn FnMut(&Path)) -> MeasureOutcome 
             return outcome;
         }
     };
-    // 白名单目标本身是符号链接：不跟随、不统计（读取调用方负责给出提示）。
-    if metadata.file_type().is_symlink() {
+    // 白名单目标本身是链接类（符号链接 / Windows junction）：不跟随、不统计。
+    if links::metadata_is_link_like(&metadata, path) {
         return outcome;
     }
 
@@ -123,7 +124,7 @@ fn measure_with(path: &Path, on_entry: &mut dyn FnMut(&Path)) -> MeasureOutcome 
                 continue;
             }
         };
-        if entry.file_type().is_symlink() {
+        if links::entry_is_link_like(entry.file_type(), entry.path()) {
             continue;
         }
         on_entry(entry.path());
@@ -207,8 +208,11 @@ fn scan_root(
                 // 不存在的白名单目标不返回，避免用户勾选"空气"。
                 Err(_) => continue,
             };
-            if metadata.file_type().is_symlink() {
-                warnings.push(format!("已跳过符号链接：{}", target.path.display()));
+            if links::metadata_is_link_like(&metadata, &target.path) {
+                warnings.push(format!(
+                    "已跳过链接类目标（符号链接/junction）：{}",
+                    target.path.display()
+                ));
                 continue;
             }
 

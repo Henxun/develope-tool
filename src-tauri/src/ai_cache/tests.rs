@@ -519,6 +519,128 @@ fn clean_rejects_downgraded_tool_and_keeps_files() {
     assert!(backups.join("old.zip").exists());
 }
 
+// ── Windows junction / reparse point（macOS 本机无法创建 junction，真机验证） ──
+
+#[cfg(windows)]
+fn create_junction(link: &Path, target: &Path) -> std::io::Result<()> {
+    let status = std::process::Command::new("cmd")
+        .args(["/C", "mklink", "/J"])
+        .arg(link)
+        .arg(target)
+        .status()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(std::io::Error::other("mklink /J 失败"))
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_plain_directory_is_not_link_like() {
+    let temp = TempDir::new("win-plain");
+    let directory = temp.path().join("plain");
+    fs::create_dir_all(&directory).expect("创建普通目录失败");
+    assert!(!super::links::is_link_like(&directory));
+    let metadata = fs::symlink_metadata(&directory).expect("读取 metadata 失败");
+    assert!(!super::links::metadata_is_link_like(&metadata, &directory));
+}
+
+#[cfg(windows)]
+#[test]
+#[ignore = "需要 Windows 真机用 mklink /J 创建 junction；macOS 无法运行"]
+fn windows_junction_target_is_rejected_and_not_scanned() {
+    let temp = TempDir::new("win-junction");
+    let outside = temp.path().join("outside");
+    write_file(&outside.join("payload.bin"), 64);
+    let (env, root) = claude_fixture("win-junction");
+    let junction = root.join("image-cache");
+    create_junction(&junction, &outside).expect("创建 junction 失败");
+    assert!(
+        super::links::is_link_like(&junction),
+        "junction 必须被判定为链接类"
+    );
+
+    // 扫描：不进入、不计体积，并给出跳过提示。
+    let lookup = env.lookup();
+    let scan_result = scan::scan_all(
+        catalog::current_platform(),
+        &lookup,
+        &["claude-code".to_string()],
+        &noop_scan,
+    )
+    .expect("扫描应成功");
+    let cache = scan_result.tools[0]
+        .roots
+        .iter()
+        .flat_map(|root| root.categories.iter())
+        .find(|category| category.category == AiCacheCategory::Cache)
+        .expect("应有 cache 类别");
+    assert_eq!(cache.bytes, 0, "junction 目标内容不得计入体积");
+    assert!(
+        scan_result.tools[0]
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("链接类")),
+        "扫描应提示跳过 junction：{:?}",
+        scan_result.tools[0].warnings
+    );
+
+    // 清理：validate_target 拒绝，junction 目标内容保留。
+    let clean_result = clean::clean_all(
+        catalog::current_platform(),
+        &lookup,
+        clean_request(
+            vec![scan_target(
+                "claude-code",
+                AiCacheCategory::Cache,
+                &junction,
+            )],
+            false,
+        ),
+        &noop_clean,
+    )
+    .expect("请求合法，应跳过 junction");
+    assert_eq!(clean_result.deleted_count, 0);
+    assert_eq!(clean_result.skipped_count, 1);
+    assert!(
+        outside.join("payload.bin").exists(),
+        "junction 目标内容不得被删除"
+    );
+}
+
+#[cfg(windows)]
+#[test]
+#[ignore = "需要 Windows 真机用 mklink /J 创建 junction；macOS 无法运行"]
+fn windows_nested_junction_children_are_not_followed() {
+    let temp = TempDir::new("win-nested-junction");
+    let outside = temp.path().join("outside");
+    write_file(&outside.join("big.bin"), 5_000);
+    let (env, root) = claude_fixture("win-nested-junction");
+    write_file(&root.join("image-cache").join("real.bin"), 10);
+    create_junction(&root.join("image-cache").join("nested"), &outside)
+        .expect("创建 junction 失败");
+
+    let lookup = env.lookup();
+    let scan_result = scan::scan_all(
+        catalog::current_platform(),
+        &lookup,
+        &["claude-code".to_string()],
+        &noop_scan,
+    )
+    .expect("扫描应成功");
+    let cache = scan_result.tools[0]
+        .roots
+        .iter()
+        .flat_map(|root| root.categories.iter())
+        .find(|category| category.category == AiCacheCategory::Cache)
+        .expect("应有 cache 类别");
+    assert_eq!(
+        cache.bytes, 10,
+        "目录内 junction 子项不得被 walk 跟进计体积"
+    );
+}
+
 // ── 11.2 路径校验（拒绝用例） ──
 
 #[test]

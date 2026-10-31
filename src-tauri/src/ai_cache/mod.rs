@@ -11,9 +11,9 @@
 //! - 符号链接 / junction、工具根、用户主目录、文件系统根、凭据文件名一律拒绝；
 //! - v1 只做永久删除；确认弹窗必须逐条列出绝对路径（前端实现）。
 
-mod catalog;
-mod clean;
-mod scan;
+pub mod catalog;
+pub mod clean;
+pub mod scan;
 #[cfg(test)]
 mod tests;
 

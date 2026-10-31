@@ -19,7 +19,7 @@ use walkdir::WalkDir;
 use xz2::{read::XzDecoder, write::XzEncoder};
 use zip::{write::FileOptions, CompressionMethod, ZipArchive, ZipWriter};
 
-mod ai_cache;
+pub mod ai_cache;
 
 #[cfg(windows)]
 use windows_sys::Win32::{

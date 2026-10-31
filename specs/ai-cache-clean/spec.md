@@ -3,7 +3,7 @@ feature: ai-cache-clean
 status: draft
 owner: 产品（Product）
 created: 2026-10-31
-version: 1.2
+version: 1.3
 updated: 2026-10-31
 target: v1（MVP）
 ---
@@ -14,8 +14,13 @@ target: v1（MVP）
 
 ## 版本记录
 
+**v1.3（2026-10-31，D4 终裁）**
+- **D4 延后到 v1.1**：macOS 系统缓存根（`~/Library/Caches/claude-cli-nodejs` 等）**不进 v1**；R15 / AC-23 及精确条目设计移入 §12「v1.1 backlog」，标注"未实现，留待 v1.1"。
+- v1 工具矩阵、白名单与验收标准回到不含系统缓存根（9 工具不变，AC-01~22）；D5 维持。
+- 理由：代码已稳定全绿，SystemCache 根是新增的删除路径，临交付前加风险不划算。
+
 **v1.2（2026-10-31，D4 / D5 裁决回写）**
-- D4：macOS 系统缓存目录纳入 `Cache` 类可清理范围，但只按**精确白名单条目**删除（Claude Code `<proj>/--mcp-logs-*`；Cursor / Windsurf `~/Library/Caches/<app>` 下指定的缓存子目录），禁止整根或 `*/*` 通配删除。
+- D4：macOS 系统缓存目录纳入 `Cache` 类可清理范围，但只按**精确白名单条目**删除（Claude Code `<proj>/--mcp-logs-*`；Cursor / Windsurf `~/Library/Caches/<app>` 下指定的缓存子目录），禁止整根或 `*/*` 通配删除。（**已被 v1.3 取代：D4 延后到 v1.1**）
 - D5：v1.1 的 **9 工具矩阵保持不变**；Claude Desktop 的 `claude_desktop_config.json`、扩展安装目录、config/state 文件归入「仅展示 / 受保护」，不进入可清理类别。
 
 **v1.1（2026-10-31，回写实现与裁决）**
@@ -69,13 +74,13 @@ target: v1（MVP）
 
 | # | 工具 | 检测根目录 | 平台 | v1 能力 |
 |---|------|-----------|------|---------|
-| 1 | Claude Code | `~/.claude`（可用 `CLAUDE_CONFIG_DIR` 覆盖）；macOS 系统缓存根 `~/Library/Caches/claude-cli-nodejs` | 三平台 | 清理缓存/日志 + macOS 系统缓存根（MCP 日志，精确条目） + 只读展示会话记录 |
+| 1 | Claude Code | `~/.claude`（可用 `CLAUDE_CONFIG_DIR` 覆盖） | 三平台 | 清理缓存/日志 + 只读展示会话记录 |
 | 2 | Claude Desktop | macOS `~/Library/Application Support/Claude`；Windows `%APPDATA%\Claude`；Linux `~/.config/Claude` | 三平台 | 清理 Electron 缓存/日志 + 只读展示会话状态 |
 | 3 | Codex CLI | `~/.codex`（可用 `CODEX_HOME` 覆盖） | 三平台 | 清理缓存/日志（含 `logs_*.sqlite` 文件） + 只读展示会话记录 |
-| 4 | Cursor | macOS `~/Library/Application Support/Cursor`；Windows `%APPDATA%\Cursor`；Linux `~/.config/Cursor`；macOS 系统缓存根 `~/Library/Caches/Cursor` | 三平台 | 清理 Chromium 缓存/日志 + macOS 系统缓存根（精确子目录） + 只读展示工作区历史 |
+| 4 | Cursor | macOS `~/Library/Application Support/Cursor`；Windows `%APPDATA%\Cursor`；Linux `~/.config/Cursor` | 三平台 | 清理 Chromium 缓存/日志 + 只读展示工作区历史 |
 | 5 | GitHub Copilot（VS Code 扩展） | 各编辑器 `.../User/globalStorage`：`Code`、`Code - Insiders`、`VSCodium` | 三平台 | 清理扩展缓存 + 只读展示扩展会话数据 |
 | 6 | GitHub Copilot CLI | `~/.copilot` | 三平台 | 清理缓存/日志 + 只读展示会话状态 |
-| 7 | Windsurf | macOS `~/Library/Application Support/Windsurf`；Windows `%APPDATA%\Windsurf`；Linux `~/.config/Windsurf`；macOS 系统缓存根 `~/Library/Caches/com.exafunction.windsurf` | 三平台 | 清理 Chromium 缓存/日志 + macOS 系统缓存根（精确子目录） + 只读展示工作区历史 |
+| 7 | Windsurf | macOS `~/Library/Application Support/Windsurf`；Windows `%APPDATA%\Windsurf`；Linux `~/.config/Windsurf` | 三平台 | 清理 Chromium 缓存/日志 + 只读展示工作区历史 |
 | 8 | Gemini CLI | `~/.gemini`（可用 `GEMINI_CLI_HOME` 覆盖） | 三平台 | **只检测 + 只展示，不提供清理**（无 A 类白名单） |
 | 9 | Ollama | `~/.ollama` | 三平台 | 清理日志；**模型权重（`models`）只展示不清理** |
 
@@ -128,6 +133,7 @@ target: v1（MVP）
 
 | 版本 | 内容 | 触发条件 |
 |------|------|----------|
+| v1.1 | macOS 系统缓存根清理（D4，设计见 §12） | 真机实测路径与体积后再启用 |
 | v1.2 | 定时扫描提醒 / 阈值告警（>N GB 提示） | 不做后台常驻，仅打开页面时提示 |
 | v2 | 新增工具：Cline / Roo Code / Continue / Zed / Trae | 路径固化进白名单 + 测试 |
 | v2 | 模型权重管理（Ollama / HuggingFace 的下载与删除） | 独立需求：涉及重新下载成本，需单独确认流程 |
@@ -171,7 +177,6 @@ target: v1（MVP）
 | R12 | **全局兜底黑名单**：即使误写进白名单，以下 basename 也永不删除——`.credentials.json`、`auth.json`、`oauth_creds.json`、`credentials.json`、`config.json`、`config.toml`、`settings.json`、`settings.local.json`、`.claude.json`、`state.vscdb`、`state.vscdb.backup`、`history.jsonl`、`.env`、`id_ed25519`、`*.key`、`*.pem` 等（`FORBIDDEN_BASENAME`）。 |
 | R13 | 不写任何持久化记录（不落盘历史/日志/数据库）；清理结果仅在页面内存中展示。 |
 | R14 | 全程无网络请求；删除不用 shell/PowerShell，统一 Rust 原生 `fs`；`dry_run` 预览不得产生任何文件系统变更。 |
-| R15 | **系统缓存根规则**（D4）：`~/Library/Caches/<app>` 之类系统缓存根只允许**精确条目**——固定子路径，或「固定父目录 + 末段单层模式」（如 `<项目目录>/--mcp-logs-*`）；**禁止整根删除**，禁止 `*` / `*/*` 匹配根下任意子项；未列入白名单的子目录一律不动；根下无匹配条目时该根显示"无可清理项"，不退回整根删除。 |
 
 ### 4.2 各工具白名单
 
@@ -189,15 +194,6 @@ target: v1（MVP）
 | B · 会话 | `projects`、`file-history`、`tasks`、`uploads`、`dev-mods`、`feedback`、`feedback-bundles`、`history.jsonl` | 会话 transcript、检查点、任务、上传/反馈内容，不可恢复 → 只展示 |
 
 C 类（protected，绝不进入白名单）：`.credentials.json`、`settings.json`、`settings.local.json`、`plugins`、`skills`、`agents`、`commands`、`rules`、`output-styles`、`workflows`、`themes`、`keybindings.json`、`agent-memory`、`jobs`、`daemon`、`CLAUDE.md`、`remote-settings.json`、`policy-limits.json`、`stats-cache.json`。
-
-**系统缓存根（D4 纳入，精确条目）**
-
-| 系统缓存根 | 白名单条目 | 说明 |
-|-----------|-----------|------|
-| macOS `~/Library/Caches/claude-cli-nodejs` | `<项目目录>/--mcp-logs-*` | `<项目目录>` 必须来自该根下的实际磁盘枚举（单层路径段，不接受 `..` 或路径分隔符）；只删名称以 `--mcp-logs-` 开头的子目录本身——**不删项目目录、不删缓存根、不做 `*/*` 通配**。这是 472 GB 级异常增长的主要来源。 |
-| macOS `~/Library/Logs/Claude` | 该目录本身（目录类） | 旧版日志输出位置，整目录均为日志 |
-
-> Linux 对应根 `~/.cache/claude-cli-nodejs`，条目语义相同。Windows 对应根结构未实测，v1.2 不启用（不猜测路径）。
 
 #### 4.2.2 Claude Desktop
 
@@ -237,14 +233,6 @@ C 类：`auth.json`、`config.toml`、`AGENTS.md`、`state_*.sqlite`、`goals_*.
 
 C 类：`User/globalStorage`、`User/settings.json`、`User/keybindings.json`、`extensions`。
 
-**系统缓存根（D4 纳入，精确子目录）**
-
-| 系统缓存根 | 白名单条目 |
-|-----------|-----------|
-| macOS `~/Library/Caches/Cursor` | `Cache`、`Code Cache`、`CachedData`、`GPUCache`、`DawnGraphiteCache`、`DawnWebGPUCache`、`GrShaderCache`、`ShaderCache` |
-
-> 只删表中**精确子目录名**；不删 `~/Library/Caches/Cursor` 根本身，不删除未列出的子目录；根下无这些子目录时显示"无可清理项"，不退回整根删除（R15）。
-
 #### 4.2.5 GitHub Copilot（VS Code 扩展）
 
 根（分别检测）：`.../User/globalStorage`，其中 `...` 为 `Code`、`Code - Insiders`、`VSCodium`（macOS 在 `~/Library/Application Support`，Windows 在 `%APPDATA%`，Linux 在 `~/.config`）
@@ -280,14 +268,6 @@ C 类：`config.json`、`mcp-config.json`。
 
 C 类：`User/globalStorage`、`User/settings.json`、`extensions`；另 `~/.codeium`（账号 token + Cascade 记忆）不在扫描范围内。
 
-**系统缓存根（D4 纳入，精确子目录）**
-
-| 系统缓存根 | 白名单条目 |
-|-----------|-----------|
-| macOS `~/Library/Caches/com.exafunction.windsurf` | `Cache`、`Code Cache`、`CachedData`、`GPUCache`、`DawnGraphiteCache`、`DawnWebGPUCache`、`GrShaderCache`、`ShaderCache` |
-
-> 只删表中**精确子目录名**；不删缓存根本身、不删除未列出的子目录；根下无这些子目录时显示"无可清理项"，不退回整根删除（R15）。
-
 #### 4.2.8 Gemini CLI
 
 根：`~/.gemini`（可用 `GEMINI_CLI_HOME` 覆盖）。**v1 无 A 类白名单，完全只读。**
@@ -318,7 +298,6 @@ C 类：`id_ed25519`、`id_ed25519.pub`、`history`。
 3. 未命中白名单模板的一切目标（**默认拒绝**，不是"默认允许再过滤"）。
 4. 全局兜底黑名单 basename（R12：凭据、配置、状态库、密钥）。
 5. 未列入 A 类的一切内容：`Sessions`（会话记录、编辑历史、工作区状态）与 `ModelCache`（模型权重）**只展示，不提供清理入口**。
-6. 系统缓存根本身及其**未列出**的子目录（R15）：只删精确条目，不整根删除、不做通配。
 
 **按工具**
 
@@ -463,9 +442,8 @@ clean_ai_caches(request {
 | AC-20 | 隐私 | 清理结果不落盘（无历史文件、无 localStorage 路径记录）；代码中无上传/遥测调用 |
 | AC-21 | override 降级 | `CLAUDE_CONFIG_DIR=$HOME`、`CODEX_HOME=$HOME`、`CLAUDE_CONFIG_DIR=/`（及主目录上级）→ 该工具 `cleanable=false`：前端无勾选框、卡片显示降级原因、清理请求被 `TOOL_DOWNGRADED` 拒绝（`cargo test` + 手工验证） |
 | AC-22 | 分批提交 | 构造 65 个待清理目标：前端按 64 分批（1 批 64 + 1 批 1）串行提交，全部执行并合并 `freed_bytes`/items；UI **不出现**"单次最多 64 项"之类错误 |
-| AC-23 | 系统缓存根精确条目（D4） | macOS 夹具：`~/Library/Caches/claude-cli-nodejs/<proj>/--mcp-logs-x/` 可清理，同根下 `<proj>/other/`、`<proj>/`、缓存根本身保留（清理前后 SHA-256 不变）；`~/Library/Caches/Cursor` 下只删白名单子目录，其它子目录与根保留；根下无匹配条目时显示"无可清理项"且**不执行整根删除**（`cargo test` + 手工） |
 
-**质量门（沿用项目宪法）**：`npm run lint`、`cargo fmt --check`、`cargo clippy` 干净；`cargo test` 覆盖 AC-10/11/12/13/14/16/21/23；PR 需过 architect + senior-qa（+ staff-infrastructure 看 Windows 路径与 CI）。
+**质量门（沿用项目宪法）**：`npm run lint`、`cargo fmt --check`、`cargo clippy` 干净；`cargo test` 覆盖 AC-10/11/12/13/14/16/21；PR 需过 architect + senior-qa（+ staff-infrastructure 看 Windows 路径与 CI）。
 
 ---
 
@@ -505,8 +483,8 @@ clean_ai_caches(request {
 | R2 | 删除方式 | **v1 只有永久删除一种，不引入回收站** | 不新增回收站依赖/系统 API；回收站不释放空间，与目标矛盾 |
 | R3 | 会话记录（`Sessions` 类别，全工具） | **只展示占用，不提供清理入口** | 比"可勾选但默认不选"更严：从交互层消除误删可能 |
 | R4 | Ollama `models`（模型权重，`ModelCache` 类别） | **只展示，不提供清理入口** | 重新下载成本高（时间/流量），不属于"可自动重建" |
-| R5 | macOS 系统缓存目录（`~/Library/Caches/claude-cli-nodejs` 等） | **纳入 `Cache` 类可清理，但只按精确白名单条目删除**：Claude Code `<项目目录>/--mcp-logs-*`；Cursor / Windsurf 系统缓存根下指定的 Electron 缓存子目录 | MCP 日志是最大体积来源；整根/通配删除会波及未知内容，精确条目可审计（R15） |
-| R6 | 工具矩阵与 Claude Desktop 数据边界 | **保持 v1.1 的 9 工具矩阵**；Claude Desktop 的 `claude_desktop_config.json`、扩展安装目录、config/state 文件**仅展示 / 受保护**，不进入可清理类别 | 配置与扩展删后不可恢复；9 工具的覆盖范围已验证，不因新增缓存根而扩表 |
+| R5 | macOS 系统缓存目录（`~/Library/Caches/claude-cli-nodejs` 等） | **不进 v1，留 backlog（见 §12），v1.1 再做**；届时按精确白名单条目删除，不整根删、不做通配 | 代码已稳定全绿，SystemCache 根是新增的删除路径，临交付前加风险不划算 |
+| R6 | 工具矩阵与 Claude Desktop 数据边界 | **保持 v1.1 的 9 工具矩阵**；Claude Desktop 的 `claude_desktop_config.json`、扩展安装目录、config/state 文件**仅展示 / 受保护**，不进入可清理类别 | 配置与扩展删后不可恢复；9 工具的覆盖范围已验证，不因未启用的系统缓存根而扩表 |
 
 > 以上为已拍板结论。若后续要改（例如清理 `workspaceStorage`），需新开规格并按"会话清理"单独设计确认流程，不在 v1 范围内。
 
@@ -518,6 +496,32 @@ clean_ai_caches(request {
 - 改动面：`src-tauri/src/lib.rs`（2 个新命令 + 白名单表 + 测试）、`src/lib/tools.ts`（注册入口）、`src/app/tools/ai-cache-clean/page.tsx`（新页面）、`src/lib/tauri.ts`（封装）。
 - 粗估：Rust 1.5 人日、前端 1.5 人日、测试/联调 1 人日（不含评审与修复）。实现已落地；本规格 v1.1 为对实现与裁决的回写，后续改动以「先改规格 + 测试」为准。
 - 建议顺序：白名单 + 扫描（含测试）→ 页面 → 清理 + 确认 → 结果态与真机验证。
+
+---
+
+## 12. v1.1 backlog（D4 系统缓存根，未实现，留待 v1.1）
+
+> **终裁（v1.3）**：D4 不进 v1。代码已稳定全绿，SystemCache 根是新增的删除路径，临交付前加风险不划算；v1.1 再做。以下设计原样保留，v1 不做任何实现承诺，也不进入 AC-01~22。
+
+### 12.1 设计约束（原 R15；v1.1 实施时生效）
+
+- 概念：**系统缓存根** = macOS `~/Library/Caches/<app>`、`~/Library/Logs/<app>` 这类由系统约定存放缓存的根；与工具主根（`~/.claude` 等）分开建模，独立路径根 + 独立白名单。
+- 只允许**精确条目**：固定子路径，或「固定父目录 + 末段单层模式」（如 `<项目目录>/--mcp-logs-*`）。
+- **禁止整根删除**，禁止 `*` / `*/*` 匹配根下任意子项；未列入白名单的子目录一律不动；根下无匹配条目时显示"无可清理项"，不退回整根删除。
+- 校验沿用 v1 全部规则：候选路径必须命中条目模板且位于该系统缓存根之下，仍适用符号链接跳过（R4）、兜底黑名单（R12）、降级（R9）、单次 64 项分批（R10）。
+
+### 12.2 候选条目（未经真机实测，不启用）
+
+| 工具 | 系统缓存根 | 精确条目 | 说明 |
+|------|-----------|---------|------|
+| Claude Code | macOS `~/Library/Caches/claude-cli-nodejs` | `<项目目录>/--mcp-logs-*` | `<项目目录>` 必须来自该根下的实际磁盘枚举（单层路径段，不接受 `..` 或路径分隔符）；只删 `--mcp-logs-` 开头的子目录，不删项目目录、不删缓存根。Linux 对应 `~/.cache/claude-cli-nodejs`；Windows 未实测 |
+| Claude Code | macOS `~/Library/Logs/Claude` | 该目录本身（目录类） | 旧版日志输出位置，整目录均为日志 |
+| Cursor | macOS `~/Library/Caches/Cursor` | `Cache`、`Code Cache`、`CachedData`、`GPUCache`、`DawnGraphiteCache`、`DawnWebGPUCache`、`GrShaderCache`、`ShaderCache` | 只删精确子目录，不删根 |
+| Windsurf | macOS `~/Library/Caches/com.exafunction.windsurf` | 同上（同组 Electron 缓存子目录名） | 只删精确子目录，不删根 |
+
+### 12.3 验收标准（v1.1 启用时转为正式 AC）
+
+- **B-AC-23（原 AC-23，系统缓存根精确条目）**：macOS 夹具：`~/Library/Caches/claude-cli-nodejs/<proj>/--mcp-logs-x/` 可清理，同根下 `<proj>/other/`、`<proj>/`、缓存根本身保留（清理前后 SHA-256 不变）；`~/Library/Caches/Cursor` 下只删白名单子目录，其它子目录与根保留；根下无匹配条目时显示"无可清理项"且**不执行整根删除**（`cargo test` + 手工）。
 
 ---
 

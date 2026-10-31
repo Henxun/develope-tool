@@ -12,6 +12,8 @@ type ToolCacheCardProps = {
   busy: boolean;
   color: string;
   heavyLoading: boolean;
+  /** 该工具的受保护项（只读展示，永不清理）。 */
+  protectedItems: string[];
   onToggleTool: (paths: string[], selectAll: boolean) => void;
   onToggleCategory: (paths: string[], selectAll: boolean) => void;
   onTogglePath: (path: string) => void;
@@ -27,6 +29,7 @@ export default function ToolCacheCard({
   busy,
   color,
   heavyLoading,
+  protectedItems,
   onToggleTool,
   onToggleCategory,
   onTogglePath,
@@ -72,8 +75,8 @@ export default function ToolCacheCard({
         <input
           ref={groupCheckboxRef}
           type="checkbox"
-          checked={allSelected}
-          disabled={busy || selectablePaths.length === 0}
+          checked={tool.cleanable && allSelected}
+          disabled={busy || !tool.cleanable || selectablePaths.length === 0}
           onChange={() => onToggleTool(selectablePaths, !allSelected)}
           aria-label={`选择 ${tool.name} 的全部可清理缓存`}
           className="h-5 w-5 rounded border-slate-300 accent-[var(--accent)] disabled:cursor-not-allowed disabled:opacity-50"
@@ -143,6 +146,12 @@ export default function ToolCacheCard({
         ) : null}
       </div>
 
+      {!tool.cleanable ? (
+        <p className="border-t border-amber-200 bg-amber-50 px-4 py-2 text-[11px] leading-5 text-amber-800">
+          已降级为仅检测：{tool.warnings[0] ?? "根目录指向敏感位置"}。该工具不提供任何清理入口。
+        </p>
+      ) : null}
+
       <div className="h-[3px] w-full bg-slate-200/60" aria-hidden="true">
         <div
           className="h-[3px] rounded-full transition-[width] duration-300"
@@ -172,7 +181,9 @@ export default function ToolCacheCard({
               ))}
             </>
           ) : (
-            <p className="px-4 py-3 text-sm text-slate-500">已检测到 · 暂无可清理缓存</p>
+            <p className="px-4 py-3 text-sm text-slate-500">
+              {tool.cleanable ? "已检测到 · 暂无可清理缓存" : "该工具已降级为仅检测，不提供清理"}
+            </p>
           )}
 
           {readonlyCategories.length > 0 ? (
@@ -194,6 +205,16 @@ export default function ToolCacheCard({
                 />
               ))}
             </>
+          ) : null}
+
+          {protectedItems.length > 0 ? (
+            <p
+              className="px-4 py-2 text-[11px] leading-5 text-slate-400"
+              title={protectedItems.join("、")}
+            >
+              受保护（不清理）：{protectedItems.slice(0, 8).join("、")}
+              {protectedItems.length > 8 ? ` 等 ${protectedItems.length} 项` : ""}
+            </p>
           ) : null}
 
           {tool.warnings.length > 0 ? (

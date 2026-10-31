@@ -1,9 +1,10 @@
 //! AI 智能体缓存清理（feat/ai-cache-clean）验收测试（Tester / QA）。
 //!
-//! 对应当前实现（HEAD `b8d6bf3` / spec v1.1）：
+//! 对应最终实现（**最终 HEAD `e991341`** / spec v1.3）：
 //! - A 类（可清理）= `Cache` + `Logs`：`image-cache` / `plans` / `backups` / `debug` …
 //! - B 类（只读）= `Sessions` + `ModelCache`：`paste-cache` / `usage-data` / `projects` …（含惰性计算）
-//! - 覆盖 spec §7 的 AC-02/03/04/05/06/07/08/09/10/11/12/13/14/15/16/17/19/21/22 + R3（B1）回归
+//! - 覆盖 spec v1.3 §7 的 AC-02/03/04/05/06/07/08/09/10/11/12/13/14/15/16/17/19/21/22 + R3（B1）回归
+//! - 另含 D1（paste-cache/usage-data 只展示）、D5（Claude Desktop 敏感项）、S5（进度）回归
 //!
 //! 运行方式（必须串行，避免真实 env 读取用例互相干扰）：
 //! ```text

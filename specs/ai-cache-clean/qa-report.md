@@ -3,7 +3,7 @@
 - 执行人：Tester（测试）
 - 时间：2026-10-31（Asia/Shanghai）
 - 验收基线：**spec v1.3（已提交 `c840ded`，D4 延后到 v1.1 backlog；AC-01~AC-22）**
-- 代码基线：`feat/ai-cache-clean` @ `89dac87`（代码；D1 修复）+ `b8d6bf3`（B1/惰性计算/降级/分批），此后仅 docs 提交
+- 代码基线：`feat/ai-cache-clean` @ **`e991341`（最终 HEAD）**——含 `89dac87`（D1）、`b8d6bf3`（B1/惰性计算/降级/分批）、`e991341`（heavy 扫描并发口 + 文件系统根降级文案）；此前有 4 笔 docs 提交（spec v1.3 等）
 - 验证环境：macOS（Darwin，Apple Silicon）、rustc/cargo 1.99.1、Node v24.21.0
 - 验收方式：Rust 集成测试（真实实现 + 临时夹具 + 注入 env），前端 lint/build + 关键交互代码核对
 
@@ -30,7 +30,13 @@
 | **D4**：系统缓存根不进 v1 | ✅ 符合基线（不计验收） | `catalog.rs` 中无 `claude-cli-nodejs` 等系统缓存根（grep 0 命中），与 v1.3「不进 v1」一致；原 AC-23 已移 backlog |
 | **D5**：9 工具矩阵保留；Claude Desktop 敏感项受保护/仅展示 | ✅ 通过（1 处展示清单小缺口） | 9 工具均在 catalog；Claude Desktop 的 `claude_desktop_config.json` / `Preferences` / `Cookies` / `Network` / `extensions` / `config.json` / `state*` **逐项实测清理被拒且文件零变化**，扫描中不作为可清理项返回；仅 `protected` 展示清单缺少 `extensions`/`config.json`/`state*`（见 N5，无删除风险） |
 
-### 0.3 质量门（本轮在 docs 提交后的 HEAD 实测）
+### 0.2.1 D1 页面回归：「仅展示」区仍可见且可「计算占用」（不静默消失）
+
+- 后端数据：scan 在未计算时也把两目录列在 `Sessions.paths`（供展开 / 「打开目录」），`measured=false`；heavy 扫描后两目录 `bytes>0`（D1 用例断言合计 4,000 B）。
+- 前端（静态核对 + build）：`tool-cache-card.tsx:45` 按 `cleanable` 拆分 `readonlyCategories`，`:189-205` 渲染「会话与模型数据（仅展示，不清理）」区块；`category-section.tsx:97-119` 对不可清理类别显示「仅展示」徽标与「计算占用」按钮；`page.tsx:540-575` 计算占用时调 `scanAiCacheUsage([toolId], true)` 并把结果合并回卡片（`:810` 绑定）；`e991341` 起 heavy 计算期间禁用重新扫描，避免两路进度混入同一条进度条。
+- 未验：真实 Tauri 页面点按（需开窗应用），按 §4 记为「无法验证」。
+
+### 0.3 质量门（最终 HEAD `e991341` 实测）
 
 ```
 cargo fmt --check                                   → exit 0
@@ -53,7 +59,7 @@ npm run build                                       → exit 0（静态导出含
 | AC-03 | 环境变量根 | ✅ 通过 | `CLAUDE_CONFIG_DIR=<tmp>/custom-claude`：检测根切换，清理只删其中 `debug/`，默认 `~/.claude` 未被创建 |
 | AC-04 | 体积准确性 vs `du -sk` ≤5% | ✅ 通过 | 合计 2,090,000 B vs 2,097,152 B，偏差 **0.34%**；单项最大 0.54%；B 类 5 MB 不计入 |
 | AC-05 | 扫描性能 ≤5 s | ⚠️ **无法验证** | 原因：本机无真实 AI 工具目录，无法构造 "A 类合计 <5 GB + 冷缓存" 场景；仅 800 文件/100 MB 夹具实测 ≈1 ms（只做元数据遍历）。B 类已惰性（主扫描不遍历 GB 级 sessions/models），风险已下降，但真实性能未验 |
-| AC-06 | 分级展示 + B 类按需计算 | ✅ 通过 | 主扫描 sessions `measured=false`、bytes=0、`cleanable=false`、`totalDisplayOnlyBytes=0`；heavy 扫描 → measured=true、61,000 B；Sessions/ModelCache 清理命令级拒绝；UI「计算占用」按钮 + 合并回卡片（代码核对） |
+| AC-06 | 分级展示 + B 类按需计算 | ✅ 通过 | 主扫描 sessions `measured=false`、bytes=0、`cleanable=false`、`totalDisplayOnlyBytes=0`；heavy 扫描 → measured=true、61,000 B；Sessions/ModelCache 清理命令级拒绝；UI「计算占用」按钮 + 合并回卡片（代码核对）；**AC-06b 10 万 B 类文件证据**：`projects/` 下 100×1,000 个 8 B 文件（合计 800,000 B），主扫描 duration=0ms / displayOnly=0 / cleanable=1,000 B，heavy 281ms / displayOnly=800,000 B——主扫描确实不遍历 B 类 |
 | AC-07 | 预览 + 确认 | ✅ 通过 | 缺省 `dryRun=true`；dry-run 前后目录树 SHA-256 完全一致；前端先 dry-run 预览再弹窗（逐条绝对路径 + 合计 + 「清理后无法恢复」+ 默认焦点「取消」） |
 | AC-08 | 释放量 | ✅ 通过 | 清理前 500,000 B = freed 500,000 B，误差 0.00% |
 | AC-09 | 清理后重扫 | ✅ 通过 | 重扫 cleanable=0 B；目录类与文件类目标均验证（`logs_1.sqlite` 删除后文件不存在）；UI 800ms 自动重扫（代码核对） |
@@ -99,13 +105,13 @@ npm run build                                       → exit 0（静态导出含
 | # | 级别 | 内容 | 建议 |
 |---|---|---|---|
 | N1 | 低 | AC-21 文案：spec 写 `TOOL_DOWNGRADED`，实现返回 `TOOL_DISABLED`（前端只展示中文，功能等价） | 统一 spec 或代码错误码 |
-| N2 | 低 | `ROOT_PROTECTED` 分支不可达：传工具根/主目录时先被白名单拒绝（`PATH_NOT_ALLOWED`），保护效果成立但错误码语义不准 | 把根判定前移，或接受现状并注明 |
+| N2 | 低 | ~~`ROOT_PROTECTED` 分支不可达~~ 根/主目录仍由白名单先拒（`PATH_NOT_ALLOWED`），保护效果成立；另：**「`/` 降级文案误写为主目录上级」已在最终 HEAD `e991341` 修复**（先判文件系统根，warning 现为「根目录指向文件系统根…」） | 错误码语义如需精确可后续统一 |
 | N3 | 低 | 无权限目录 warning 为「部分内容无法读取（N 项）」，spec 要求「无权限读取」；AC-17 UI 文案未真机验 | 统一文案后补 UI 走查 |
 | N4 | 低 | 工具卡排序在前端实现，后端 `<scan>` 返回 catalog 顺序；AC-02 在 UI 层满足 | 文档注明或后端排序 |
 | N5 | 低 | Claude Desktop `protected` 展示清单缺少 `extensions` / `config.json` / `state*`（spec §4.2.2 列为「仅展示/受保护」）；三者**不可清理、清理被拒**，仅 UI 不展示 | 补 protected 条目（1 行配置） |
 | N6 | 文档 | **spec v1.3 §4.2.1 的 A 类表仍列 `paste-cache`、`usage-data`**（第 192 行），与 D1 裁决（只展示）及实现（`89dac87` 已移入 Sessions）相反 | Product 修这一行，避免后续按 spec 文本误判 |
 
-> 以上 6 项均为低危/文档类，**不构成 AC 失败**，不阻塞 v1 验收。
+> 以上均为低危/文档类，**不构成 AC 失败**，不阻塞 v1 验收。其中 **N2（`/` 降级文案）已由 `e991341` 修复并回归**（`ac21_*` 现在打印「根目录指向文件系统根，已降级为仅检测」）；`e991341` 同时堵住「计算占用」进行中仍可重新扫描的并发口（Reviewer ④，`page.tsx` disabled 增加 `heavyLoading.size > 0`）。
 
 ---
 
@@ -143,7 +149,7 @@ AC-13 B/C 类文件数 before=11 after=11 含 SHA-256 的文件数=11
 AC-15 失败原因：DELETE_FAILED: 删除失败：Permission denied (os error 13)
 AC-19 第二次 freed=0 deleted=0 skipped=1 failed=0
 AC-21 $HOME 本身 清理拒绝：TOOL_DISABLED: 工具 Claude Code 根目录指向用户主目录…
-AC-21 文件系统根 /：cleanable=false，清理命令级拒绝
+AC-21 文件系统根 /：cleanable=false，warning=「根目录指向文件系统根，已降级为仅检测」（e991341 修复 N2），清理命令级拒绝
 AC-22 64 项 dry-run 接受；65 项拒绝（单次清理最多 64 项）
 B1 扫描 logs 项：["logs_1.sqlite"]；同名目录被排除
 B1 清理同名目录 deleted=0 failed=1（PATH_NOT_ALLOWED: 通配白名单项只允许删除普通文件）
@@ -160,7 +166,7 @@ S5 最后事件 processed=2 freed=100（processed = deleted+skipped+failed）
 | `ac04_scan_bytes_match_du_within_5_percent` | AC-04 |
 | `ac05_scan_is_fast_on_fixture` | AC-05（夹具量级） |
 | `ac06_b_class_is_display_only_and_measured_lazily` | AC-06 |
-| `ac06b_main_scan_does_not_traverse_b_class` | 主扫描惰性约束 |
+| `ac06b_main_scan_does_not_traverse_b_class` | AC-06 惰性（10 万 B 类文件：主扫描 0ms / displayOnly=0；heavy 281ms / 800,000 B） |
 | `ac07_dry_run_defaults_true_and_deletes_nothing` | AC-07 |
 | `ac08_ac09_freed_bytes_and_rescan` | AC-08/09 |
 | `ac10_11_16_reject_forged_and_out_of_scope_targets` | AC-10/11/16 |
@@ -188,6 +194,6 @@ S5 最后事件 processed=2 freed=100（processed = deleted+skipped+failed）
 
 ## 6. 签署
 
-**结论：spec v1.3 口径下 通过 19 条 / 失败 0 条 / 无法验证 3 条（本机无 GUI 走查与真实 5 GB 场景）；必测 8/8 通过；质量门全绿。** D1、D5 已按裁决验证通过，D4 已按裁决排除（backlog）。建议：Product 修 spec §4.2.1 的 `paste-cache`/`usage-data` 一行（N6）与顺手处理 N1–N5 文案/展示项；真机 UI 走查由有 GUI 的机器补 7 状态截图后即可交付。
+**结论（最终 HEAD `e991341`）：spec v1.3 口径下 通过 19 条 / 失败 0 条 / 无法验证 3 条（本机无 GUI 走查与真实 5 GB 场景）；必测 8/8 通过；质量门全绿。** D1、D5 已按裁决验证通过，D4 已按裁决排除（backlog）。建议：Product 修 spec §4.2.1 的 `paste-cache`/`usage-data` 一行（N6）与顺手处理 N1–N5 文案/展示项；真机 UI 走查由有 GUI 的机器补 7 状态截图后即可交付。
 
 Tester · 2026-10-31

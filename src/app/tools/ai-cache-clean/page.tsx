@@ -143,18 +143,44 @@ type CleanBatchHooks = {
   onBatchDone?: (done: number, merged: AiCacheCleanResult) => void;
 };
 
+type CleanBatchFailure = {
+  batchIndex: number;
+  batchTotal: number;
+  message: string;
+};
+
+type CleanBatchOutcome = {
+  /** 已完成批次合并后的结果（失败批次不包含在计数里）。 */
+  result: AiCacheCleanResult;
+  /** 某一批命令级失败时非空；此时前面批次已经真实生效。 */
+  failure: CleanBatchFailure | null;
+};
+
 async function runCleanBatches(
   targets: AiCacheCleanTarget[],
   dryRun: boolean,
   hooks: CleanBatchHooks = {},
-): Promise<AiCacheCleanResult> {
+): Promise<CleanBatchOutcome> {
   const batches = chunkTargets(targets, CLEAN_BATCH_SIZE);
   let merged = emptyCleanResult(dryRun);
   let done = 0;
   for (let index = 0; index < batches.length; index += 1) {
     const batch = batches[index];
     hooks.onBatchStart?.(index + 1, batches.length);
-    const result = await cleanAiCaches({ targets: batch, dryRun });
+    let result: AiCacheCleanResult;
+    try {
+      result = await cleanAiCaches({ targets: batch, dryRun });
+    } catch (error) {
+      // 命令级失败：保留前面批次已经产生的释放量，交给调用方兜底展示。
+      return {
+        result: merged,
+        failure: {
+          batchIndex: index + 1,
+          batchTotal: batches.length,
+          message: extractErrorMessage(error, "清理批次失败"),
+        },
+      };
+    }
     merged = {
       ...merged,
       freedBytes: merged.freedBytes + result.freedBytes,
@@ -167,7 +193,7 @@ async function runCleanBatches(
     done += batch.length;
     hooks.onBatchDone?.(done, merged);
   }
-  return merged;
+  return { result: merged, failure: null };
 }
 
 function Stat({
@@ -249,6 +275,8 @@ export default function AiCacheCleanPage() {
   const [cleaning, setCleaning] = useState(false);
   const [cleanProgress, setCleanProgress] = useState<AiCacheCleanProgressEvent | null>(null);
   const [cleanResult, setCleanResult] = useState<AiCacheCleanResult | null>(null);
+  /** 部分批次命令级失败时的提示（明确告知前几批已生效）。 */
+  const [cleanFailureNotice, setCleanFailureNotice] = useState("");
   const [cleanTotal, setCleanTotal] = useState(0);
   /** 已完成批次的项数（含跳过/失败），与当前批已处理数相加作为进度分子。 */
   const [cleanDone, setCleanDone] = useState(0);
@@ -538,6 +566,11 @@ export default function AiCacheCleanPage() {
 
   /** 「计算占用」：只对该工具补扫展示类别（sessions / model_cache），结果合并回原卡。 */
   const handleMeasureHeavy = useCallback(async (toolId: string) => {
+    // 后端扫描不可中断：旧任务结束前不再发起新的扫描请求，避免并发扫描。
+    if (scanTaskPendingRef.current) {
+      setNotice("后台扫描仍在进行，完成前无法计算占用。");
+      return;
+    }
     const token = scanTokenRef.current;
     setError("");
     setHeavyLoading((current) => new Set(current).add(toolId));
@@ -574,10 +607,14 @@ export default function AiCacheCleanPage() {
     setError("");
     setPreviewLoading(true);
     try {
-      const result = await runCleanBatches(selectedTargets, true);
-      setPreview(result);
-    } catch (previewError) {
-      setError(extractErrorMessage(previewError, "生成清理预览失败"));
+      const outcome = await runCleanBatches(selectedTargets, true);
+      if (outcome.failure) {
+        setError(
+          `第 ${outcome.failure.batchIndex}/${outcome.failure.batchTotal} 批预览失败，未执行任何删除：${outcome.failure.message}`,
+        );
+        return;
+      }
+      setPreview(outcome.result);
     } finally {
       setPreviewLoading(false);
     }
@@ -597,20 +634,30 @@ export default function AiCacheCleanPage() {
     setCleanTotal(targets.length);
     setCleanDone(0);
     setCleanBatch(null);
+    setCleanFailureNotice("");
     setError("");
     const startedAt = Date.now();
 
     try {
-      const result = await runCleanBatches(targets, false, {
+      const outcome = await runCleanBatches(targets, false, {
         onBatchStart: (batchIndex, batchTotal) => {
           setCleanProgress(null);
           setCleanBatch({ index: batchIndex, total: batchTotal });
         },
         onBatchDone: (done) => setCleanDone(done),
       });
-      setCleanResult(result);
+      // 无论中途是否失败，已完成的批次都真实生效：先合并展示，再给出失败说明。
+      setCleanResult(outcome.result);
       setCleanDurationMs(Date.now() - startedAt);
       setSelected(new Set());
+      if (outcome.failure) {
+        const doneBatches = outcome.failure.batchIndex - 1;
+        setCleanFailureNotice(
+          `第 ${outcome.failure.batchIndex}/${outcome.failure.batchTotal} 批清理失败，前 ${doneBatches} 批已生效：${outcome.failure.message}`,
+        );
+      } else {
+        setCleanFailureNotice("");
+      }
       if (refreshTimerRef.current) window.clearTimeout(refreshTimerRef.current);
       refreshTimerRef.current = window.setTimeout(() => {
         void runScan("refresh");
@@ -680,7 +727,9 @@ export default function AiCacheCleanPage() {
             <p className="text-[11px] text-slate-400">停止显示只影响界面，后端扫描仍会完成</p>
           ) : null}
           {scanTaskPending && !scanning ? (
-            <p className="text-[11px] text-amber-600">后台扫描仍在进行，完成前无法重新扫描。</p>
+            <p className="text-[11px] text-amber-600">
+              后台扫描仍在进行，完成前无法重新扫描或计算占用。
+            </p>
           ) : null}
           <p className="text-[11px] text-slate-400">
             {lastScanAt > 0 ? `上次扫描 ${formatClock(lastScanAt)}` : "尚未扫描"}
@@ -695,8 +744,12 @@ export default function AiCacheCleanPage() {
             result={cleanResult}
             toolNameById={toolNameById}
             durationMs={cleanDurationMs}
+            failureNotice={cleanFailureNotice}
             onRescan={() => void runScan("manual")}
-            onDismiss={() => setCleanResult(null)}
+            onDismiss={() => {
+              setCleanResult(null);
+              setCleanFailureNotice("");
+            }}
           />
         ) : null}
 
@@ -802,6 +855,7 @@ export default function AiCacheCleanPage() {
             busy={busy}
             color={TOOL_COLORS[tool.id] ?? DEFAULT_TOOL_COLOR}
             heavyLoading={heavyLoading.has(tool.id)}
+            scanPending={scanTaskPending}
             protectedItems={protectedByTool[tool.id] ?? []}
             onToggleTool={setPathsSelection}
             onToggleCategory={setPathsSelection}

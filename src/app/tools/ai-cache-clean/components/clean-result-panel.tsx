@@ -8,6 +8,8 @@ type CleanResultPanelProps = {
   result: AiCacheCleanResult;
   toolNameById: Record<string, string>;
   durationMs: number;
+  /** 分批清理中途命令级失败时的诚实提示（前几批已生效）。 */
+  failureNotice?: string;
   onRescan: () => void;
   onDismiss: () => void;
 };
@@ -17,6 +19,7 @@ export default function CleanResultPanel({
   result,
   toolNameById,
   durationMs,
+  failureNotice,
   onRescan,
   onDismiss,
 }: CleanResultPanelProps) {
@@ -74,6 +77,12 @@ export default function CleanResultPanel({
           </svg>
         </button>
       </div>
+
+      {failureNotice ? (
+        <div className="mt-3 rounded-xl border border-amber-300 bg-amber-50 px-3 py-2 text-xs leading-5 text-amber-800">
+          {failureNotice}
+        </div>
+      ) : null}
 
       {failed.length > 0 ? (
         <div className="mt-3 rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-xs leading-5 text-amber-800">

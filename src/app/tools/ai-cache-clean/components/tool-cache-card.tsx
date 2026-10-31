@@ -12,6 +12,8 @@ type ToolCacheCardProps = {
   busy: boolean;
   color: string;
   heavyLoading: boolean;
+  /** 后端扫描任务未结束：禁用「计算占用」，避免并发扫描。 */
+  scanPending: boolean;
   /** 该工具的受保护项（只读展示，永不清理）。 */
   protectedItems: string[];
   onToggleTool: (paths: string[], selectAll: boolean) => void;
@@ -29,6 +31,7 @@ export default function ToolCacheCard({
   busy,
   color,
   heavyLoading,
+  scanPending,
   protectedItems,
   onToggleTool,
   onToggleCategory,
@@ -177,6 +180,7 @@ export default function ToolCacheCard({
                   onOpenPath={onOpenPath}
                   onMeasureHeavy={onMeasureHeavy}
                   heavyLoading={heavyLoading}
+                  heavyBlocked={scanPending}
                 />
               ))}
             </>
@@ -202,6 +206,7 @@ export default function ToolCacheCard({
                   onOpenPath={onOpenPath}
                   onMeasureHeavy={onMeasureHeavy}
                   heavyLoading={heavyLoading}
+                  heavyBlocked={scanPending}
                 />
               ))}
             </>

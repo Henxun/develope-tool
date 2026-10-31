@@ -463,3 +463,90 @@ rm -rf /Users/henxun/.dsh/bot/workspace/develope-tool/node_modules \
 2. **`npm run tauri:build` 出 .app/.dmg** 只在本机验证可用性；未签名不能分发，正式发布仍走 tag 触发的 GitHub Actions。
 3. **可选清理**：`package-lock.json` 里 41 个 `registry.npmmirror.com` 的 resolved 建议统一回 npmjs，避免换 npm 12 的人再撞 `EALLOWREMOTE`（另开任务，不阻塞本 feature）。
 4. **CI 提示**：`.github/workflows/build.yml` 用的是 `node-version: 20` + `npm ci`，与本机 node 24 不同；本机验证通过意味着 Next 16 构建无问题，但如果 CI 出现 node 20 相关的 edge case，可以对齐到 22/24。
+
+---
+
+## 10. Windows 交叉类型检查（2026-10-31 20:0x 追加）
+
+**目的**：Windows-only 代码（`#[cfg(windows)]`）在 macOS 上从不参与编译，等于从未被验证。加装 Windows target 后，至少能保证**类型正确、API 用对**。
+
+### 10.1 装了多大
+
+| 项 | 体积 |
+|---|---|
+| `rust-std` for `x86_64-pc-windows-msvc`（`rustup target add`） | **+118 MB** |
+| 编译产物 `src-tauri/target/x86_64-pc-windows-msvc/` | 257 MB（gitignore 内） |
+| `.ops/rust` 合计（含镜像依赖缓存） | 1.4 GB |
+
+安装 3.9 秒（USTC 镜像），全程在 `.ops/rust` 内，`~/.rustup`、`~/.cargo` 仍不存在。
+
+### 10.2 直接跑 `cargo check` 会失败（两处，都不是代码问题）
+
+**① `lzma-sys` 的 C 源码（xz2 依赖）**
+
+```
+cc ... --target=x86_64-pc-windows-msvc ... -c xz-5.2/src/liblzma/simple/x86.c
+xz-5.2/src/common/sysdefs.h:127:10: fatal error: 'stdlib.h' file not found
+error occurred in cc-rs: command did not execute successfully ... exit status: 1
+```
+
+macOS 的 clang 交叉编到 MSVC 目标时找不到 Windows SDK 的 C 头文件。**注意：这一步发生在依赖阶段，我们自己的代码根本没被检查到。**
+
+附带踩的坑：官方 `static.crates.io` 本机实测 **65 KB/s 且会整段阻塞**（`Downloading crates ...` 停 11 分钟零字节增长）。已切 USTC 镜像（配置写在 `.ops/rust/cargo/config.toml`，不碰项目）：下载 54 MB 只用 **21 秒**。
+
+**② `tauri-build` → `tauri-winres` 找不到 `llvm-rc`**
+
+```
+thread 'main' panicked at tauri-winres-0.3.5/src/lib.rs:536:
+called `Result::unwrap()` on an `Err` value: NotAttempted("llvm-rc")
+```
+
+给 Windows exe 嵌图标/版本信息资源用的资源编译器，本机没有（属于 LLVM 工具链）。
+
+### 10.3 绕法：假 C 工具链（**只用于 check，绝不能用于 build/链接**）
+
+在 `.ops/fakecc/` 提供 `cc` / `ar` / `llvm-rc` / `llvm-lib` 四个空壳（创建占位输出、退出 0），通过环境变量注入，仅当次命令生效：
+
+```bash
+. /Users/henxun/.dsh/bot/workspace/.ops/env.sh
+F=/Users/henxun/.dsh/bot/workspace/.ops/fakecc
+export PATH="$F:$PATH"
+export CC_x86_64_pc_windows_msvc="$F/cc" AR_x86_64_pc_windows_msvc="$F/ar"
+cargo check --manifest-path src-tauri/Cargo.toml --target x86_64-pc-windows-msvc --locked
+```
+
+原理：`cargo check` 只做类型检查、不链接，C 目标文件是否真实存在不影响结论；Rust 侧（含 `windows-sys` / `winreg` 的 API 绑定）照常完整编译。
+
+### 10.4 结果
+
+```
+    Checking lzma-sys v0.1.20
+    Checking tauri-plugin-os v2.3.2
+    Checking xz2 v0.1.7
+    Checking zip v0.6.6
+    Compiling devetool v0.1.0 (.../src-tauri)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 1.03s
+exit=0
+```
+
+| 检查 | 结果 |
+|---|---|
+| `cargo check --target x86_64-pc-windows-msvc`（整 crate） | ✅ **通过**，`libdevetool_lib-*.rmeta` 574 KB |
+| Windows-only 代码覆盖面 | `lib.rs` 46 处 `cfg(windows)` + `ai_cache/links.rs` 3 处 + `tests.rs` 4 处，**全部参与编译** |
+| 隔离 crate `clippy --target x86_64-pc-windows-msvc -- -D warnings`（只装 `links.rs` 的 junction 模块） | ✅ **通过，零告警** |
+| 项目文件改动 | **零**（`git status` 干净，`Cargo.lock` 0 行 diff） |
+
+结论：**junction 检测等 Windows 专属代码在类型/API 层面是正确的**，Coder 报告的 `links.rs` 窗口代码没有类型错误。
+
+### 10.5 这次检查**没有**证明什么（重要）
+
+- ❌ C 依赖（lzma/bzip2/zstd）**没有真正为目标平台编译**，只做了 Rust 层类型检查 → 真实 Windows 上 `cc` 能否编过仍未验证。
+- ❌ **没有链接**（无 MSVC/mingw 链接器），也没有任何 `windows-sys` 调用的运行时行为验证（`CreateFileW` 参数、reparse tag 取值等只能靠代码审查 + 真机测试）。
+- ❌ `tauri build` 的 Windows 打包（图标/清单嵌入）未验证。
+
+**因此：类型层面可信，行为层面必须在 Windows 上验证。** 建议在 `.github/workflows/build.yml` 里加一个 `windows-latest` 的 `cargo check --target x86_64-pc-windows-msvc` + `cargo test` 轻量 job（真 MSVC，秒级拿到答案），而不是依赖 macOS 上的假工具链。
+
+### 10.6 为什么没试 `x86_64-pc-windows-gnu`
+
+msvc 目标的类型检查已经通过，换 gnu 不会改变类型层面的结论（`cfg(windows)` 对两者都成立，代码只依赖 `windows-sys` 的 API）。而且 gnu 同样要为 `lzma-sys` 提供 mingw 的 C 编译器（本机无 `x86_64-w64-mingw32-gcc`），一样要造假工具链，收益是零。
+
